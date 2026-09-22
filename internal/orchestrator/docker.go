@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 )
 
@@ -66,15 +69,39 @@ func (d *DockerEngine) Deploy(ctx context.Context, env Environment) error {
 	return nil
 }
 
-// Destroy aggressively terminates and removes the container and associated volumes.
+// ProvisionNetwork creates a dedicated bridge network for the pull request.
+func (d *DockerEngine) ProvisionNetwork(ctx context.Context, envID string) error {
+	netName := fmt.Sprintf("%s-net", envID)
+	opts := network.CreateOptions{
+		Driver: "bridge",
+	}
+	_, err := d.client.NetworkCreate(ctx, netName, opts)
+	if err != nil {
+		return fmt.Errorf("failed to provision isolated network %s: %w", netName, err)
+	}
+	return nil
+}
+
+// Destroy aggressively terminates the container, purges the image, and removes the network.
 func (d *DockerEngine) Destroy(ctx context.Context, id string) error {
 	opts := container.RemoveOptions{
 		Force:         true,
 		RemoveVolumes: true,
 	}
-	if err := d.client.ContainerRemove(ctx, id, opts); err != nil {
-		return fmt.Errorf("failed to destroy environment container %s: %w", id, err)
+	if err := d.client.ContainerRemove(ctx, id, opts); err != nil && !errdefs.IsNotFound(err) {
+		return fmt.Errorf("container teardown failed: %w", err)
 	}
+
+	netName := fmt.Sprintf("%s-net", id)
+	if err := d.client.NetworkRemove(ctx, netName); err != nil && !errdefs.IsNotFound(err) {
+		return fmt.Errorf("network teardown failed: %w", err)
+	}
+
+	imgName := fmt.Sprintf("%s:latest", id)
+	if _, err := d.client.ImageRemove(ctx, imgName, image.RemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
+		return fmt.Errorf("image teardown failed: %w", err)
+	}
+
 	return nil
 }
 

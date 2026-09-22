@@ -35,6 +35,9 @@ EOF
 # repomix output
 repomix-output.xml
 
+# vulnerability report
+vuln-report.txt
+
 # IntelliJ project files
 .idea
 *.iml
