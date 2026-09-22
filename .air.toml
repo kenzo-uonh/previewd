@@ -1,0 +1,32 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+bin = "./bin/previewd"
+cmd = "go build -o ./bin/previewd ./cmd/previewd"
+delay = 500
+exclude_dir = ["bin", "deployments", "scripts", "tmp"]
+exclude_file = []
+exclude_regex = ["_test\\.go", ".*\\.sqlite.*"]
+exclude_unchanged = false
+follow_symlink = false
+full_bin = ""
+include_ext = ["go"]
+kill_delay = "2s"
+log = "build-errors.log"
+send_interrupt = true
+stop_on_error = true
+
+[color]
+app = ""
+build = "yellow"
+main = "magenta"
+runner = "green"
+watcher = "cyan"
+
+[log]
+main_only = false
+time = false
+
+[misc]
+clean_on_exit = true

@@ -24,8 +24,16 @@ go.work.sum
 # Build directories
 bin/
 
-# Database files
-*.sqlite
+# Air live-reload temporary artifacts
+tmp/
+build-errors.log
+
+# SQLite lock and journal files
+*.sqlite*
+EOF
+
+# repomix output
+repomix-output.xml
 
 # IntelliJ project files
 .idea
