@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/kenzo-uonh/previewd/internal/api"
 	"github.com/kenzo-uonh/previewd/internal/config"
 	"github.com/kenzo-uonh/previewd/internal/orchestrator"
 	"github.com/kenzo-uonh/previewd/internal/store"
@@ -66,6 +70,33 @@ func main() {
 
 	logger.Info("Docker engine initialized and connected successfully")
 
+	apiServer := api.NewServer(logger, cfg, db, engine)
+	httpServer := &http.Server{
+		Addr:              fmt.Sprintf(":%d", cfg.APIPort),
+		Handler:           apiServer.Routes(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	go func() {
+		logger.Info("Ingress HTTP server running", "addr", httpServer.Addr)
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("HTTP server crash", "error", err)
+			os.Exit(1)
+		}
+	}()
+
 	<-ctx.Done()
-	logger.Info("Shutdown signal received, draining connections...")
+	logger.Info("Shutdown signal received, draining HTTP server and database...")
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		logger.Error("HTTP server graceful shutdown failed", "error", err)
+	}
+
+	logger.Info("Agent exited cleanly.")
 }

@@ -12,6 +12,7 @@ type Config struct {
 	DBPath        string
 	DockerHost    string
 	TraefikDomain string
+	WebhookSecret string
 }
 
 // Load extracts configuration from the host environment with strict fallback defaults.
@@ -40,10 +41,13 @@ func Load() (*Config, error) {
 		traefikDomain = "local.previewd"
 	}
 
+	webhookSecret := os.Getenv("PREVIEWD_WEBHOOK_SECRET")
+
 	return &Config{
 		APIPort:       apiPort,
 		DBPath:        dbPath,
 		DockerHost:    dockerHost,
 		TraefikDomain: traefikDomain,
+		WebhookSecret: webhookSecret,
 	}, nil
 }
