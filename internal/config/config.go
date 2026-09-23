@@ -8,12 +8,13 @@ import (
 
 // Config models all operational runtime flags for the sovereign daemon.
 type Config struct {
-	APIPort       int
-	DBPath        string
-	DockerHost    string
-	TraefikDomain string
-	WebhookSecret string
-	SecretsPath   string
+	APIPort             int
+	DBPath              string
+	DockerHost          string
+	TraefikDomain       string
+	WebhookSecret       string
+	SecretsPath         string
+	MaxConcurrentBuilds int
 }
 
 // Load extracts configuration from the host environment with strict fallback defaults.
@@ -49,12 +50,20 @@ func Load() (*Config, error) {
 		secretsPath = "secrets.env"
 	}
 
+	maxBuilds := 2
+	if mbStr := os.Getenv("PREVIEWD_MAX_BUILDS"); mbStr != "" {
+		if mb, err := strconv.Atoi(mbStr); err == nil && mb > 0 {
+			maxBuilds = mb
+		}
+	}
+
 	return &Config{
-		APIPort:       apiPort,
-		DBPath:        dbPath,
-		DockerHost:    dockerHost,
-		TraefikDomain: traefikDomain,
-		WebhookSecret: webhookSecret,
-		SecretsPath:   secretsPath,
+		APIPort:             apiPort,
+		DBPath:              dbPath,
+		DockerHost:          dockerHost,
+		TraefikDomain:       traefikDomain,
+		WebhookSecret:       webhookSecret,
+		SecretsPath:         secretsPath,
+		MaxConcurrentBuilds: maxBuilds,
 	}, nil
 }

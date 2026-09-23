@@ -20,8 +20,8 @@ func FetchRepository(ctx context.Context, cloneURL, commitSHA, destDir string) e
 	}
 
 	parsedURL, err := url.ParseRequestURI(cloneURL)
-	if err != nil || (parsedURL.Scheme != "https" && parsedURL.Scheme != "http") {
-		return fmt.Errorf("invalid or non-HTTP(S) repository clone URL")
+	if err != nil || (parsedURL.Scheme != "https" && parsedURL.Scheme != "http" && parsedURL.Scheme != "file") {
+		return fmt.Errorf("invalid repository clone URL scheme")
 	}
 
 	if err := os.MkdirAll(destDir, 0750); err != nil {

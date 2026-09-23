@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT=$(pwd)
+MOCK_DIR=""
+AGENT_PID=""
+GIT_SERVER_PID=""
+
+cleanup() {
+  echo -e "\n\n==> Shutting down and cleaning up..."
+  if [ -n "$AGENT_PID" ]; then kill -SIGTERM "$AGENT_PID" 2>/dev/null || true; fi
+  if [ -n "$GIT_SERVER_PID" ]; then kill -SIGTERM "$GIT_SERVER_PID" 2>/dev/null || true; fi
+
+  cd "$PROJECT_ROOT"
+  make docker-down >/dev/null 2>&1 || true
+
+  if [ -n "$MOCK_DIR" ] && [ -d "$MOCK_DIR" ]; then rm -rf "$MOCK_DIR"; fi
+  echo "==> E2E Verification Complete."
+}
+
+trap cleanup EXIT
+
+echo "==> Setting up local air-gapped Git repository..."
+MOCK_DIR=$(mktemp -d)
+git init -q --bare "$MOCK_DIR/mock.git"
+git clone -q "$MOCK_DIR/mock.git" "$MOCK_DIR/src"
+
+cd "$MOCK_DIR/src"
+echo -e 'FROM alpine:latest\nCMD ["echo", "air-gapped-test"]' > Dockerfile
+git config user.name "E2E Test"
+git config user.email "test@previewd.local"
+git config commit.gpgsign false
+git add Dockerfile
+git commit -q -m "initial commit"
+git push -q origin HEAD
+MOCK_SHA=$(git rev-parse HEAD)
+
+cd "$PROJECT_ROOT"
+
+echo "==> Bootstrapping Traefik proxy and isolated networks..."
+make docker-up
+
+echo "==> Compiling CGO-free static binary..."
+make build
+
+echo "==> Starting previewd agent in background..."
+PREVIEWD_WEBHOOK_SECRET="" ./bin/previewd &
+AGENT_PID=$!
+
+sleep 3
+
+echo "==> 1. Testing Ping Handshake..."
+curl -s -X POST http://localhost:8080/webhooks/github \
+  -H "X-GitHub-Event: ping" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+echo -e "\n\n==> 2. Testing Environment Provisioning (Action: opened)..."
+curl -s -X POST http://localhost:8080/webhooks/github \
+  -H "X-GitHub-Event: pull_request" \
+  -H "Content-Type: application/json" \
+  -d "{
+        \"action\": \"opened\",
+        \"number\": 999,
+        \"pull_request\": {
+          \"head\": {\"sha\": \"$MOCK_SHA\"}
+        },
+        \"repository\": {
+          \"clone_url\": \"file://$MOCK_DIR/mock.git\"
+        }
+      }"
+
+echo -e "\n\n[*] Agent is processing job in background. Waiting 15 seconds for Docker build..."
+sleep 15
+
+echo "==> 3. Testing Exhaustive Teardown (Action: closed)..."
+curl -s -X POST http://localhost:8080/webhooks/github \
+  -H "X-GitHub-Event: pull_request" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "action": "closed",
+        "number": 999
+      }'

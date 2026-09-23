@@ -73,7 +73,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	pool := orchestrator.NewWorkerPool(10, logger)
+	// Enforce bounded deployment concurrency based on configuration
+	pool := orchestrator.NewWorkerPool(cfg.MaxConcurrentBuilds, logger)
 	pool.Start(ctx, func(jobCtx context.Context, job orchestrator.Job) error {
 		return orchestrator.ProcessJob(jobCtx, job, cfg, db, engine, injector)
 	})

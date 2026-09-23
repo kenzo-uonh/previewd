@@ -1,4 +1,4 @@
-.PHONY: all build run dev clean fmt vet lint test sec deps check fmt-check repomix vuln docker-up docker-down help
+.PHONY: all build run dev clean fmt vet lint test sec deps check fmt-check repomix vuln docker-up docker-down help e2e
 
 APP_NAME    := previewd
 BIN_DIR     := bin
@@ -7,12 +7,6 @@ GOPATH_BIN  := $(shell go env GOPATH)/bin
 
 # Inject build metadata
 VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
-COMMIT      ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-BUILD_TIME  ?= $(shell date -u +'%Y-%m-%dT%H:%M:%SZ')
-LDFLAGS     := -w -s -extldflags '-static' \
-               -X 'main.Version=$(VERSION)' \
-               -X 'main.Commit=$(COMMIT)' \
-               -X 'main.BuildTime=$(BUILD_TIME)'
 
 # Default target
 .DEFAULT_GOAL := help
@@ -24,10 +18,16 @@ help: ## Display this help message
 ##@ Development & Quality Checks
 
 check: deps fmt-check vet lint sec vuln test ## Run all verification checks and test suite
-build: ## Compile a statically linked binary
+
+build: ## Compile a statically linked binary using the build script
 	@echo "Compiling statically linked binary ($(VERSION))..."
-	@mkdir -p $(BIN_DIR)
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="$(LDFLAGS)" -o $(BIN_DIR)/$(APP_NAME) $(MAIN_PKG)
+	@chmod +x scripts/build.sh
+	@VERSION=$(VERSION) ./scripts/build.sh
+
+e2e: ## Run end-to-end operational verification
+	@echo "Executing air-gapped E2E test suite..."
+	@chmod +x scripts/verify-e2e.sh
+	@./scripts/verify-e2e.sh
 
 run: build ## Compile and start the previewd daemon
 	@echo "Starting daemon..."
