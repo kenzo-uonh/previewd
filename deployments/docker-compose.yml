@@ -1,2 +1,22 @@
 services:
-  
+  traefik:
+    image: traefik:v3.7
+    container_name: traefik-proxy
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+    ports:
+      - "80:80"
+      - "8080:8080"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    networks:
+      - previewd-proxy
+    restart: unless-stopped
+
+networks:
+  previewd-proxy:
+    name: previewd-proxy
+    driver: bridge

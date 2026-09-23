@@ -18,7 +18,7 @@ import (
 	"github.com/kenzo-uonh/previewd/internal/vcs"
 )
 
-func processJob(ctx context.Context, job orchestrator.Job, db *store.Store, engine orchestrator.Engine) error {
+func processJob(ctx context.Context, job orchestrator.Job, cfg *config.Config, db *store.Store, engine orchestrator.Engine) error {
 	buildDir := fmt.Sprintf("/tmp/previewd-builds/%s", job.EnvID)
 	defer func() {
 		_ = os.RemoveAll(buildDir)
@@ -51,6 +51,7 @@ func processJob(ctx context.Context, job orchestrator.Job, db *store.Store, engi
 		ID:      job.EnvID,
 		Image:   tag,
 		Port:    8080,
+		Domain:  cfg.TraefikDomain,
 		Secrets: map[string]string{},
 	}
 	if err := engine.Deploy(ctx, env); err != nil {
@@ -117,7 +118,7 @@ func main() {
 
 	pool := orchestrator.NewWorkerPool(10, logger)
 	pool.Start(ctx, func(jobCtx context.Context, job orchestrator.Job) error {
-		return processJob(jobCtx, job, db, engine)
+		return processJob(jobCtx, job, cfg, db, engine)
 	})
 
 	apiServer := api.NewServer(logger, cfg, db, engine, pool)

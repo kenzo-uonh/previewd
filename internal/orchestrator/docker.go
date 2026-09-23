@@ -16,6 +16,7 @@ import (
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
+	"github.com/kenzo-uonh/previewd/internal/proxy"
 )
 
 // DockerEngine implements Engine using the local Docker API.
@@ -140,23 +141,17 @@ func (d *DockerEngine) ProvisionNetwork(ctx context.Context, envID string) error
 	return nil
 }
 
-// Deploy provisions a container with dynamic routing labels and in-memory secrets.
+// Deploy provisions a container with dynamic routing labels and attaches it to proxy/isolated networks.
 func (d *DockerEngine) Deploy(ctx context.Context, env Environment) error {
 	envVars := make([]string, 0, len(env.Secrets))
 	for k, v := range env.Secrets {
 		envVars = append(envVars, fmt.Sprintf("%s=%s", k, v))
 	}
 
-	labels := map[string]string{
-		"traefik.enable": "true",
-		fmt.Sprintf("traefik.http.routers.%s.rule", env.ID):                      fmt.Sprintf("Host(`%s.local`)", env.ID),
-		fmt.Sprintf("traefik.http.services.%s.loadbalancer.server.port", env.ID): fmt.Sprintf("%d", env.Port),
-	}
-
 	cfg := &container.Config{
 		Image:  env.Image,
 		Env:    envVars,
-		Labels: labels,
+		Labels: proxy.GenerateLabels(env.ID, env.Port, env.Domain),
 	}
 
 	netName := fmt.Sprintf("%s-net", env.ID)
@@ -168,6 +163,10 @@ func (d *DockerEngine) Deploy(ctx context.Context, env Environment) error {
 	resp, err := d.client.ContainerCreate(ctx, cfg, hostCfg, nil, nil, env.ID)
 	if err != nil {
 		return fmt.Errorf("failed to create environment container %s: %w", env.ID, err)
+	}
+
+	if err := d.client.NetworkConnect(ctx, "previewd-proxy", resp.ID, nil); err != nil {
+		return fmt.Errorf("failed to connect container to ingress proxy network: %w", err)
 	}
 
 	if err := d.client.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {

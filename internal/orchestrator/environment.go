@@ -5,5 +5,6 @@ type Environment struct {
 	ID      string
 	Image   string
 	Port    int
+	Domain  string
 	Secrets map[string]string // Injected purely into memory; never written to SQLite or disk.
 }
