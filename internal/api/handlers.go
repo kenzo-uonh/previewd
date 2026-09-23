@@ -18,15 +18,23 @@ type Server struct {
 	cfg    *config.Config
 	store  *store.Store
 	engine orchestrator.Engine
+	pool   *orchestrator.WorkerPool
 }
 
 // NewServer initializes the HTTP API controller.
-func NewServer(logger *slog.Logger, cfg *config.Config, store *store.Store, engine orchestrator.Engine) *Server {
+func NewServer(
+	logger *slog.Logger,
+	cfg *config.Config,
+	store *store.Store,
+	engine orchestrator.Engine,
+	pool *orchestrator.WorkerPool,
+) *Server {
 	return &Server{
 		logger: logger,
 		cfg:    cfg,
 		store:  store,
 		engine: engine,
+		pool:   pool,
 	}
 }
 
@@ -87,14 +95,21 @@ func (s *Server) handleGitHubWebhook() http.HandlerFunc {
 
 		switch payload.Action {
 		case vcs.ActionOpened, vcs.ActionReopened, vcs.ActionSynchronize:
-			s.logger.Info("Triggering environment deployment",
+			s.logger.Info("Queueing environment deployment",
 				"environment_id", envID,
 				"pr_number", payload.Number,
 				"action", payload.Action,
 				"commit_sha", payload.PullRequest.Head.SHA,
 			)
 
-			s.respond(w, http.StatusAccepted, fmt.Sprintf(`{"status":"provisioning","environment_id":"%s"}`, envID))
+			s.pool.Submit(orchestrator.Job{
+				EnvID:    envID,
+				PRNumber: payload.Number,
+				CloneURL: payload.Repository.CloneURL,
+				Commit:   payload.PullRequest.Head.SHA,
+			})
+
+			s.respond(w, http.StatusAccepted, fmt.Sprintf(`{"status":"queued","environment_id":"%s"}`, envID))
 
 		case vcs.ActionClosed:
 			s.logger.Info("Triggering environment teardown",
@@ -104,6 +119,9 @@ func (s *Server) handleGitHubWebhook() http.HandlerFunc {
 
 			if err := s.engine.Destroy(r.Context(), envID); err != nil {
 				s.logger.Error("Failed to destroy environment on PR close", "environment_id", envID, "error", err)
+			}
+			if err := s.store.DeleteEnvironment(r.Context(), envID); err != nil {
+				s.logger.Error("Failed to delete store record on PR close", "environment_id", envID, "error", err)
 			}
 
 			s.respond(w, http.StatusOK, fmt.Sprintf(`{"status":"terminated","environment_id":"%s"}`, envID))

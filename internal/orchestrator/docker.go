@@ -1,11 +1,17 @@
 package orchestrator
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
 
 	"github.com/containerd/errdefs"
+	"github.com/docker/docker/api/types/build"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
@@ -34,6 +40,106 @@ func (d *DockerEngine) Ping(ctx context.Context) error {
 	return nil
 }
 
+// Build creates an in-memory tarball of the context directory and streams it to the Docker daemon.
+func (d *DockerEngine) Build(ctx context.Context, buildDir, tag string) error {
+	tarBuffer := new(bytes.Buffer)
+	tw := tar.NewWriter(tarBuffer)
+	defer func() {
+		_ = tw.Close()
+	}()
+
+	root, err := os.OpenRoot(buildDir)
+	if err != nil {
+		return fmt.Errorf("failed to open secure root for build directory: %w", err)
+	}
+	defer func() {
+		_ = root.Close()
+	}()
+
+	err = fs.WalkDir(root.FS(), ".", func(path string, dEntry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == "." {
+			return nil
+		}
+
+		info, err := dEntry.Info()
+		if err != nil {
+			return fmt.Errorf("failed to retrieve file info: %w", err)
+		}
+
+		header, err := tar.FileInfoHeader(info, info.Name())
+		if err != nil {
+			return fmt.Errorf("failed to create tar header: %w", err)
+		}
+		header.Name = filepath.ToSlash(path)
+
+		if err := tw.WriteHeader(header); err != nil {
+			return fmt.Errorf("failed to write tar header: %w", err)
+		}
+
+		if dEntry.IsDir() {
+			return nil
+		}
+
+		file, err := root.Open(path)
+		if err != nil {
+			return fmt.Errorf("failed to securely open file for tar: %w", err)
+		}
+		defer func() {
+			_ = file.Close()
+		}()
+
+		if _, err := io.Copy(tw, file); err != nil {
+			return fmt.Errorf("failed to copy file contents to tar: %w", err)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("tar context creation failed: %w", err)
+	}
+
+	if err := tw.Close(); err != nil {
+		return fmt.Errorf("tar writer close failure: %w", err)
+	}
+
+	opts := build.ImageBuildOptions{
+		Dockerfile: "Dockerfile",
+		Tags:       []string{tag},
+		Remove:     true,
+	}
+
+	res, err := d.client.ImageBuild(ctx, bytes.NewReader(tarBuffer.Bytes()), opts)
+	if err != nil {
+		return fmt.Errorf("docker image build failed: %w", err)
+	}
+	defer func() {
+		_ = res.Body.Close()
+	}()
+
+	if _, err := io.Copy(io.Discard, res.Body); err != nil {
+		return fmt.Errorf("failed to drain build output: %w", err)
+	}
+
+	return nil
+}
+
+// ProvisionNetwork creates a dedicated bridge network for the pull request.
+func (d *DockerEngine) ProvisionNetwork(ctx context.Context, envID string) error {
+	netName := fmt.Sprintf("%s-net", envID)
+	opts := network.CreateOptions{
+		Driver: "bridge",
+	}
+	_, err := d.client.NetworkCreate(ctx, netName, opts)
+	if err != nil && !errdefs.IsConflict(err) {
+		return fmt.Errorf("failed to provision isolated network %s: %w", netName, err)
+	}
+	return nil
+}
+
 // Deploy provisions a container with dynamic routing labels and in-memory secrets.
 func (d *DockerEngine) Deploy(ctx context.Context, env Environment) error {
 	envVars := make([]string, 0, len(env.Secrets))
@@ -53,8 +159,10 @@ func (d *DockerEngine) Deploy(ctx context.Context, env Environment) error {
 		Labels: labels,
 	}
 
+	netName := fmt.Sprintf("%s-net", env.ID)
 	hostCfg := &container.HostConfig{
-		AutoRemove: false, // Managed explicitly by Destroy for lifecycle compliance.
+		NetworkMode: container.NetworkMode(netName),
+		AutoRemove:  false,
 	}
 
 	resp, err := d.client.ContainerCreate(ctx, cfg, hostCfg, nil, nil, env.ID)
@@ -66,19 +174,6 @@ func (d *DockerEngine) Deploy(ctx context.Context, env Environment) error {
 		return fmt.Errorf("failed to start environment container %s: %w", env.ID, err)
 	}
 
-	return nil
-}
-
-// ProvisionNetwork creates a dedicated bridge network for the pull request.
-func (d *DockerEngine) ProvisionNetwork(ctx context.Context, envID string) error {
-	netName := fmt.Sprintf("%s-net", envID)
-	opts := network.CreateOptions{
-		Driver: "bridge",
-	}
-	_, err := d.client.NetworkCreate(ctx, netName, opts)
-	if err != nil {
-		return fmt.Errorf("failed to provision isolated network %s: %w", netName, err)
-	}
 	return nil
 }
 
