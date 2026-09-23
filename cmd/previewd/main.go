@@ -14,58 +14,9 @@ import (
 	"github.com/kenzo-uonh/previewd/internal/api"
 	"github.com/kenzo-uonh/previewd/internal/config"
 	"github.com/kenzo-uonh/previewd/internal/orchestrator"
+	"github.com/kenzo-uonh/previewd/internal/secrets"
 	"github.com/kenzo-uonh/previewd/internal/store"
-	"github.com/kenzo-uonh/previewd/internal/vcs"
 )
-
-func processJob(ctx context.Context, job orchestrator.Job, cfg *config.Config, db *store.Store, engine orchestrator.Engine) error {
-	buildDir := fmt.Sprintf("/tmp/previewd-builds/%s", job.EnvID)
-	defer func() {
-		_ = os.RemoveAll(buildDir)
-	}()
-
-	_ = db.UpsertEnvironment(ctx, store.EnvironmentRecord{
-		ID:        job.EnvID,
-		PRNumber:  job.PRNumber,
-		Status:    "building",
-		CreatedAt: time.Now().UTC(),
-	})
-
-	if err := vcs.FetchRepository(ctx, job.CloneURL, job.Commit, buildDir); err != nil {
-		_ = db.UpsertEnvironment(ctx, store.EnvironmentRecord{ID: job.EnvID, Status: "failed"})
-		return fmt.Errorf("fetch step failed: %w", err)
-	}
-
-	if err := engine.ProvisionNetwork(ctx, job.EnvID); err != nil {
-		_ = db.UpsertEnvironment(ctx, store.EnvironmentRecord{ID: job.EnvID, Status: "failed"})
-		return fmt.Errorf("network step failed: %w", err)
-	}
-
-	tag := fmt.Sprintf("%s:latest", job.EnvID)
-	if err := engine.Build(ctx, buildDir, tag); err != nil {
-		_ = db.UpsertEnvironment(ctx, store.EnvironmentRecord{ID: job.EnvID, Status: "failed"})
-		return fmt.Errorf("build step failed: %w", err)
-	}
-
-	env := orchestrator.Environment{
-		ID:      job.EnvID,
-		Image:   tag,
-		Port:    8080,
-		Domain:  cfg.TraefikDomain,
-		Secrets: map[string]string{},
-	}
-	if err := engine.Deploy(ctx, env); err != nil {
-		_ = db.UpsertEnvironment(ctx, store.EnvironmentRecord{ID: job.EnvID, Status: "failed"})
-		return fmt.Errorf("deploy step failed: %w", err)
-	}
-
-	return db.UpsertEnvironment(ctx, store.EnvironmentRecord{
-		ID:        job.EnvID,
-		PRNumber:  job.PRNumber,
-		Status:    "running",
-		CreatedAt: time.Now().UTC(),
-	})
-}
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -85,6 +36,12 @@ func main() {
 		"domain", cfg.TraefikDomain,
 		"docker_host", cfg.DockerHost,
 	)
+
+	injector, err := secrets.NewInjector(cfg.SecretsPath)
+	if err != nil {
+		logger.Error("Secrets injector initialization failure", "error", err)
+		os.Exit(1)
+	}
 
 	db, err := store.NewStore(ctx, cfg.DBPath)
 	if err != nil {
@@ -118,7 +75,7 @@ func main() {
 
 	pool := orchestrator.NewWorkerPool(10, logger)
 	pool.Start(ctx, func(jobCtx context.Context, job orchestrator.Job) error {
-		return processJob(jobCtx, job, cfg, db, engine)
+		return orchestrator.ProcessJob(jobCtx, job, cfg, db, engine, injector)
 	})
 
 	apiServer := api.NewServer(logger, cfg, db, engine, pool)
