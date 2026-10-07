@@ -18,6 +18,7 @@ type Server struct {
 	cfg    *config.Config
 	store  *store.Store
 	engine orchestrator.Engine
+	stager orchestrator.SecretStager
 	pool   *orchestrator.WorkerPool
 }
 
@@ -27,6 +28,7 @@ func NewServer(
 	cfg *config.Config,
 	store *store.Store,
 	engine orchestrator.Engine,
+	stager orchestrator.SecretStager,
 	pool *orchestrator.WorkerPool,
 ) *Server {
 	return &Server{
@@ -34,6 +36,7 @@ func NewServer(
 		cfg:    cfg,
 		store:  store,
 		engine: engine,
+		stager: stager,
 		pool:   pool,
 	}
 }
@@ -117,7 +120,7 @@ func (s *Server) handleGitHubWebhook() http.HandlerFunc {
 				"pr_number", payload.Number,
 			)
 
-			if err := s.engine.Destroy(r.Context(), envID); err != nil {
+			if err := orchestrator.Teardown(r.Context(), s.engine, s.stager, envID); err != nil {
 				s.logger.Error("Failed to destroy environment on PR close", "environment_id", envID, "error", err)
 			}
 			if err := s.store.DeleteEnvironment(r.Context(), envID); err != nil {

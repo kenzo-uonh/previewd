@@ -14,8 +14,14 @@ type Config struct {
 	TraefikDomain       string
 	WebhookSecret       string
 	SecretsPath         string
+	SecretsStagingDir   string
+	AllowTmpfsSecrets   bool
 	MaxConcurrentBuilds int
 }
+
+// defaultStagingDir mirrors secrets.DefaultStagingDir; config imports
+// no internal package.
+const defaultStagingDir = "/run/previewd/secrets"
 
 // Load extracts configuration from the host environment with strict fallback defaults.
 func Load() (*Config, error) {
@@ -50,6 +56,21 @@ func Load() (*Config, error) {
 		secretsPath = "secrets.env"
 	}
 
+	stagingDir := os.Getenv("PREVIEWD_SECRETS_STAGING_DIR")
+	if stagingDir == "" {
+		stagingDir = defaultStagingDir
+	}
+
+	// Opt-ins are exact: only "1" enables, any other non-empty value is an error.
+	allowTmpfs := false
+	switch v := os.Getenv("PREVIEWD_ALLOW_TMPFS_SECRETS"); v {
+	case "":
+	case "1":
+		allowTmpfs = true
+	default:
+		return nil, fmt.Errorf("invalid PREVIEWD_ALLOW_TMPFS_SECRETS %q: set exactly 1 or leave unset", v)
+	}
+
 	maxBuilds := 2
 	if mbStr := os.Getenv("PREVIEWD_MAX_BUILDS"); mbStr != "" {
 		if mb, err := strconv.Atoi(mbStr); err == nil && mb > 0 {
@@ -64,6 +85,8 @@ func Load() (*Config, error) {
 		TraefikDomain:       traefikDomain,
 		WebhookSecret:       webhookSecret,
 		SecretsPath:         secretsPath,
+		SecretsStagingDir:   stagingDir,
+		AllowTmpfsSecrets:   allowTmpfs,
 		MaxConcurrentBuilds: maxBuilds,
 	}, nil
 }

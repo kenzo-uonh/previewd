@@ -1,4 +1,7 @@
 # previewd architectural guardrails (docs/specs/phase4_ci_architecture.md §3).
+# Path rules match literals and same-file constants (constant propagation).
+# A path built at runtime or from another file's constant is invisible to
+# them; internal/orchestrator/docker_test.go asserts the real secrets mount.
 # Run offline: semgrep scan --config .semgrep/ --metrics=off --error
 # Rule self-test: semgrep --test .semgrep/  (fixture: previewd-rules.go)
 rules:
@@ -86,6 +89,8 @@ rules:
     patterns:
       - pattern-inside: "container.HostConfig{..., Binds: $B, ...}"
       - pattern: '"$S"'
+      # `bind + ":ro"`: "$S" would otherwise match the left operand alone.
+      - pattern-not-inside: '$A + ":ro"'
       - metavariable-regex:
           metavariable: $S
           regex: (?i)^(?=.*secret)(?!.*:ro(,[a-zA-Z]+)*$).*$

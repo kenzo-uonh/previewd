@@ -13,8 +13,13 @@ import (
 	"github.com/containerd/errdefs"
 	"github.com/kenzo-uonh/previewd/internal/proxy"
 	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/client"
 )
+
+// SecretsMountTarget is where an environment's staged secrets appear inside
+// its container, one read-only file per key.
+const SecretsMountTarget = "/run/secrets"
 
 // DockerEngine implements Engine using the local Docker API.
 type DockerEngine struct {
@@ -138,16 +143,17 @@ func (d *DockerEngine) ProvisionNetwork(ctx context.Context, envID string) error
 	return nil
 }
 
-// Deploy provisions a container with dynamic routing labels and attaches it to proxy/isolated networks.
-func (d *DockerEngine) Deploy(ctx context.Context, env Environment) error {
-	envVars := make([]string, 0, len(env.Secrets))
-	for k, v := range env.Secrets {
-		envVars = append(envVars, fmt.Sprintf("%s=%s", k, v))
+// containerSpec builds the container configuration for env. Secrets are never
+// part of it: the container receives the host directory staged on ramfs as a
+// read-only bind mount, so no secret value reaches the Docker API, the
+// daemon's on-disk container config, or `docker inspect`.
+func containerSpec(env Environment) (*container.Config, *container.HostConfig, error) {
+	if env.SecretsDir == "" || !filepath.IsAbs(env.SecretsDir) {
+		return nil, nil, fmt.Errorf("environment %s: staged secrets dir %q must be an absolute path", env.ID, env.SecretsDir)
 	}
 
 	cfg := &container.Config{
 		Image:  env.Image,
-		Env:    envVars,
 		Labels: proxy.GenerateLabels(env.ID, env.Port, env.Domain),
 	}
 
@@ -155,6 +161,28 @@ func (d *DockerEngine) Deploy(ctx context.Context, env Environment) error {
 	hostCfg := &container.HostConfig{
 		NetworkMode: container.NetworkMode(netName),
 		AutoRemove:  false,
+		Mounts: []mount.Mount{
+			{
+				Type:     mount.TypeBind,
+				Source:   env.SecretsDir,
+				Target:   SecretsMountTarget,
+				ReadOnly: true,
+				BindOptions: &mount.BindOptions{
+					// Never pick up mounts made under the staging dir later.
+					Propagation:  mount.PropagationRPrivate,
+					NonRecursive: true,
+				},
+			},
+		},
+	}
+	return cfg, hostCfg, nil
+}
+
+// Deploy provisions a container with dynamic routing labels and attaches it to proxy/isolated networks.
+func (d *DockerEngine) Deploy(ctx context.Context, env Environment) error {
+	cfg, hostCfg, err := containerSpec(env)
+	if err != nil {
+		return err
 	}
 
 	resp, err := d.client.ContainerCreate(ctx, client.ContainerCreateOptions{

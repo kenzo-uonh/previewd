@@ -81,7 +81,7 @@ airgap-check: ## Fail if the binary links telemetry SDKs/exporters, gRPC, cloud 
 
 sec: ## Run gosec AST security scanner
 	@echo "Running AST security scanner..."
-	@which gosec > /dev/null 2>&1 && gosec -quiet ./... || $(GOPATH_BIN)/gosec -quiet ./...
+	@which gosec > /dev/null 2>&1 && gosec -quiet -exclude-dir=.semgrep ./... || $(GOPATH_BIN)/gosec -quiet -exclude-dir=.semgrep ./...
 
 vuln: ## Scan dependencies for known vulnerabilities
 	@echo "Checking known vulnerabilities with govulncheck..."

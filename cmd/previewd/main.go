@@ -43,6 +43,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	if cfg.AllowTmpfsSecrets {
+		logger.Error("Opt-in active: secrets staged on tmpfs, whose pages can be swapped to disk",
+			"opt_in", "PREVIEWD_ALLOW_TMPFS_SECRETS",
+			"staging_dir", cfg.SecretsStagingDir,
+		)
+	}
+
+	stager, err := secrets.NewStager(cfg.SecretsStagingDir, cfg.AllowTmpfsSecrets)
+	if err != nil {
+		logger.Error("Secret staging directory refused", "staging_dir", cfg.SecretsStagingDir, "error", err)
+		os.Exit(1)
+	}
+
 	db, err := store.NewStore(ctx, cfg.DBPath)
 	if err != nil {
 		logger.Error("Database initialization failure", "error", err)
@@ -76,10 +89,10 @@ func main() {
 	// Enforce bounded deployment concurrency based on configuration
 	pool := orchestrator.NewWorkerPool(cfg.MaxConcurrentBuilds, logger)
 	pool.Start(ctx, func(jobCtx context.Context, job orchestrator.Job) error {
-		return orchestrator.ProcessJob(jobCtx, job, cfg, db, engine, injector)
+		return orchestrator.ProcessJob(jobCtx, job, cfg, db, engine, injector, stager)
 	})
 
-	apiServer := api.NewServer(logger, cfg, db, engine, pool)
+	apiServer := api.NewServer(logger, cfg, db, engine, stager, pool)
 	httpServer := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.APIPort),
 		Handler:           apiServer.Routes(),

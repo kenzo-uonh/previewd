@@ -8,7 +8,7 @@
 *   **Orchestration:** Docker API (`github.com/moby/moby/client`) for isolated bridge networks and container lifecycles.
 *   **Ingress & Routing:** Traefik reverse proxy bound to the local Docker socket, configured dynamically via runtime container labels.
 *   **Persistence:** CGO-free SQLite (`modernc.org/sqlite`) storing minimal environment metadata to ensure crash recovery.
-*   **Security Context:** Secrets are injected strictly into memory from a local vault file and never written to disk.
+*   **Security Context:** Secrets are loaded into memory from a local secrets file. For each environment they are staged on a host ramfs directory (`/run/previewd/secrets/<env-id>/`, one file per key) and bind-mounted read-only into the container at `/run/secrets`. They never pass through container environment variables, the Docker API, `docker inspect`, image layers or disk.
 
 ## Codebase Structure
 
@@ -34,7 +34,8 @@
 │   ├── proxy/
 │   │   └── labels.go              # Dynamic routing configuration and Docker label assignment.
 │   ├── secrets/
-│   │   └── injector.go            # In-memory secret mapping and container injection.
+│   │   ├── injector.go            # Loads the secrets file into memory.
+│   │   └── stager*.go             # ramfs staging: fs-type, owner and mode checks, one file per key.
 │   ├── store/
 │   │   ├── db.go                  # modernc.org/sqlite connection pool (No CGO).
 │   │   └── queries.go             # Agent persistence for active environment states.
@@ -151,4 +152,28 @@ Operational parameters enforce hardware boundaries and are managed exclusively v
 * `PREVIEWD_SECRETS_PATH`: Path to the local air-gapped secrets file (default: secrets.env).
 
 
+* `PREVIEWD_SECRETS_STAGING_DIR`: Host directory where each environment's secrets are staged (default: `/run/previewd/secrets`). Must be on **ramfs**, owned by the previewd user, mode `0700`. The daemon refuses to start otherwise and re-checks the filesystem type before every job.
+
+
+* `PREVIEWD_ALLOW_TMPFS_SECRETS`: Set exactly `1` to accept a tmpfs staging directory. tmpfs pages can be swapped to disk, so use it only on hosts without swap. The opt-in is logged as an error at every start, and any other value is a configuration error.
+
+
 * `PREVIEWD_DB_PATH`: SQLite database path (default: previewd.sqlite).
+
+## Secret Staging
+
+Secrets reach a preview container only as read-only files:
+
+1. At deploy, previewd writes each key to `$PREVIEWD_SECRETS_STAGING_DIR/<env-id>/<KEY>`. Directories are `0555` and files `0444`. Keys must match `[A-Za-z_][A-Za-z0-9_]*`, and a bad key refuses the job before anything is written.
+2. The container gets that directory at `/run/secrets` as a `bind` mount with `ReadOnly`, `rprivate` propagation and no recursion. Its config holds no secret, so `docker inspect` and the daemon's on-disk container state show only the host path.
+3. Teardown (PR closed) removes the container, then the staged directory, even when Docker teardown fails. A failed deploy removes its staging too.
+
+The staging root lives in memory. Mount it before starting previewd:
+
+```bash
+sudo mkdir -p /run/previewd/secrets
+sudo mount -t ramfs -o mode=0700,nosuid,nodev,noexec ramfs /run/previewd/secrets
+sudo chown previewd:previewd /run/previewd/secrets
+```
+
+ramfs is never swapped. A reboot discards it, together with every staged secret.
