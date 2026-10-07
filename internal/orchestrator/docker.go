@@ -11,12 +11,9 @@ import (
 	"path/filepath"
 
 	"github.com/containerd/errdefs"
-	"github.com/docker/docker/api/types/build"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
 	"github.com/kenzo-uonh/previewd/internal/proxy"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 )
 
 // DockerEngine implements Engine using the local Docker API.
@@ -26,7 +23,7 @@ type DockerEngine struct {
 
 // NewDockerEngine initializes a connection to the local host's Docker daemon.
 func NewDockerEngine() (*DockerEngine, error) {
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize docker client: %w", err)
 	}
@@ -35,7 +32,7 @@ func NewDockerEngine() (*DockerEngine, error) {
 
 // Ping verifies daemon reachability.
 func (d *DockerEngine) Ping(ctx context.Context) error {
-	if _, err := d.client.Ping(ctx); err != nil {
+	if _, err := d.client.Ping(ctx, client.PingOptions{}); err != nil {
 		return fmt.Errorf("docker daemon ping failed: %w", err)
 	}
 	return nil
@@ -107,7 +104,7 @@ func (d *DockerEngine) Build(ctx context.Context, buildDir, tag string) error {
 		return fmt.Errorf("tar writer close failure: %w", err)
 	}
 
-	opts := build.ImageBuildOptions{
+	opts := client.ImageBuildOptions{
 		Dockerfile: "Dockerfile",
 		Tags:       []string{tag},
 		Remove:     true,
@@ -131,7 +128,7 @@ func (d *DockerEngine) Build(ctx context.Context, buildDir, tag string) error {
 // ProvisionNetwork creates a dedicated bridge network for the pull request.
 func (d *DockerEngine) ProvisionNetwork(ctx context.Context, envID string) error {
 	netName := fmt.Sprintf("%s-net", envID)
-	opts := network.CreateOptions{
+	opts := client.NetworkCreateOptions{
 		Driver: "bridge",
 	}
 	_, err := d.client.NetworkCreate(ctx, netName, opts)
@@ -160,16 +157,20 @@ func (d *DockerEngine) Deploy(ctx context.Context, env Environment) error {
 		AutoRemove:  false,
 	}
 
-	resp, err := d.client.ContainerCreate(ctx, cfg, hostCfg, nil, nil, env.ID)
+	resp, err := d.client.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config:     cfg,
+		HostConfig: hostCfg,
+		Name:       env.ID,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to create environment container %s: %w", env.ID, err)
 	}
 
-	if err := d.client.NetworkConnect(ctx, "previewd-proxy", resp.ID, nil); err != nil {
+	if _, err := d.client.NetworkConnect(ctx, "previewd-proxy", client.NetworkConnectOptions{Container: resp.ID}); err != nil {
 		return fmt.Errorf("failed to connect container to ingress proxy network: %w", err)
 	}
 
-	if err := d.client.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+	if _, err := d.client.ContainerStart(ctx, resp.ID, client.ContainerStartOptions{}); err != nil {
 		return fmt.Errorf("failed to start environment container %s: %w", env.ID, err)
 	}
 
@@ -178,21 +179,21 @@ func (d *DockerEngine) Deploy(ctx context.Context, env Environment) error {
 
 // Destroy aggressively terminates the container, purges the image, and removes the network.
 func (d *DockerEngine) Destroy(ctx context.Context, id string) error {
-	opts := container.RemoveOptions{
+	opts := client.ContainerRemoveOptions{
 		Force:         true,
 		RemoveVolumes: true,
 	}
-	if err := d.client.ContainerRemove(ctx, id, opts); err != nil && !errdefs.IsNotFound(err) {
+	if _, err := d.client.ContainerRemove(ctx, id, opts); err != nil && !errdefs.IsNotFound(err) {
 		return fmt.Errorf("container teardown failed: %w", err)
 	}
 
 	netName := fmt.Sprintf("%s-net", id)
-	if err := d.client.NetworkRemove(ctx, netName); err != nil && !errdefs.IsNotFound(err) {
+	if _, err := d.client.NetworkRemove(ctx, netName, client.NetworkRemoveOptions{}); err != nil && !errdefs.IsNotFound(err) {
 		return fmt.Errorf("network teardown failed: %w", err)
 	}
 
 	imgName := fmt.Sprintf("%s:latest", id)
-	if _, err := d.client.ImageRemove(ctx, imgName, image.RemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
+	if _, err := d.client.ImageRemove(ctx, imgName, client.ImageRemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
 		return fmt.Errorf("image teardown failed: %w", err)
 	}
 
@@ -201,7 +202,7 @@ func (d *DockerEngine) Destroy(ctx context.Context, id string) error {
 
 // Logs returns the standard output and error streams.
 func (d *DockerEngine) Logs(ctx context.Context, id string) (io.ReadCloser, error) {
-	opts := container.LogsOptions{
+	opts := client.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     true,

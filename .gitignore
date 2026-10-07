@@ -12,7 +12,8 @@
 *.out
 
 # Dependency directories (remove the comment below to include it)
-# vendor/
+# Vendored modules are produced by CI (networked phase), never committed
+vendor/
 
 # Go workspace file
 go.work
@@ -56,6 +57,9 @@ claude.json
 
 # vulnerability report
 vuln-report.txt
+
+# Internal documentation
+docs/specs/
 
 # IntelliJ project files
 .idea/

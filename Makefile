@@ -1,4 +1,4 @@
-.PHONY: all build run dev clean fmt vet lint test sec deps check fmt-check repomix vuln docker-up docker-down help e2e
+.PHONY: all build run dev clean fmt vet lint test sec deps deps-check vendor-check check verify airgap-check fmt-check repomix vuln docker-up docker-down help e2e
 
 APP_NAME    := previewd
 BIN_DIR     := bin
@@ -7,6 +7,17 @@ GOPATH_BIN  := $(shell go env GOPATH)/bin
 
 # Inject build metadata
 VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+
+# Dependency gate used by `check`: deps-check (module cache, networked) or
+# vendor-check (vendor/ only, air-gapped).
+DEPS_GATE   ?= deps-check
+# Vulnerability database. Air-gapped: GOVULNDB=file:///path/to/vulndb
+GOVULNDB    ?= https://vuln.go.dev # airgap:allow overridable default; air-gapped hosts pass GOVULNDB=file:///... (README)
+# Fixed rapid seed for the deterministic gate (make check); never 0 (= random)
+RAPID_SEED  ?= 1
+# Deep verification budgets (make verify, random rapid seed)
+RAPID_CHECKS ?= 10000
+FUZZTIME    ?= 60s
 
 # Default target
 .DEFAULT_GOAL := help
@@ -17,7 +28,11 @@ help: ## Display this help message
 
 ##@ Development & Quality Checks
 
-check: deps fmt-check vet lint sec vuln test ## Run all verification checks and test suite
+check: $(DEPS_GATE) fmt-check vet lint sec vuln airgap-check test ## Run all verification checks and test suite (deterministic gate)
+
+verify: ## Deep verification: rapid PBT (RAPID_CHECKS=10000) + every native fuzz target (FUZZTIME per target)
+	@chmod +x scripts/verify.sh scripts/rapid-packages.sh
+	@RAPID_CHECKS=$(RAPID_CHECKS) FUZZTIME=$(FUZZTIME) ./scripts/verify.sh
 
 build: ## Compile a statically linked binary using the build script
 	@echo "Compiling statically linked binary ($(VERSION))..."
@@ -43,7 +58,9 @@ fmt: ## Format source files using go fmt
 
 fmt-check: ## Verify source code formatting compliance
 	@echo "Checking formatting compliance..."
-	@test -z "$$(gofmt -l .)" || (echo "Unformatted files exist. Run 'make fmt':" && gofmt -l . && exit 1)
+	@files="$$(find . -name '*.go' -not -path './vendor/*' -not -path './.git/*' -print)"; \
+	unformatted="$$(gofmt -l $$files)"; \
+	test -z "$$unformatted" || { echo "Unformatted files exist. Run 'make fmt':"; echo "$$unformatted"; exit 1; }
 
 vet: ## Run standard go vet static analysis
 	@echo "Running standard static analysis..."
@@ -53,9 +70,14 @@ lint: ## Run golangci-lint static checks
 	@echo "Running golangci-lint..."
 	@which golangci-lint > /dev/null 2>&1 && golangci-lint run ./... || $(GOPATH_BIN)/golangci-lint run ./...
 
-test: ## Execute the unit test suite
+test: ## Execute the unit test suite (rapid packages use the fixed RAPID_SEED)
 	@echo "Executing test suite..."
-	CGO_ENABLED=0 go test -v -coverprofile=coverage.out ./...
+	@chmod +x scripts/test.sh scripts/rapid-packages.sh
+	@RAPID_SEED=$(RAPID_SEED) ./scripts/test.sh
+
+airgap-check: ## Fail if the binary links telemetry SDKs/exporters, gRPC, cloud SDKs or docker/docker
+	@chmod +x scripts/airgap-check.sh
+	@./scripts/airgap-check.sh
 
 sec: ## Run gosec AST security scanner
 	@echo "Running AST security scanner..."
@@ -64,12 +86,22 @@ sec: ## Run gosec AST security scanner
 vuln: ## Scan dependencies for known vulnerabilities
 	@echo "Checking known vulnerabilities with govulncheck..."
 	@which govulncheck > /dev/null 2>&1 || (echo "FATAL: govulncheck not found. Pre-provision in air-gapped env." && exit 1)
-	@govulncheck ./... > vuln-report.txt 2>&1 || echo "Vulnerability scan completed with warnings (see vuln-report.txt)"
+	@govulncheck -db "$(strip $(GOVULNDB))" ./... > vuln-report.txt 2>&1 || { cat vuln-report.txt; echo "FATAL: govulncheck failed (findings or unreachable database $(strip $(GOVULNDB)))"; exit 1; }
 
-deps: ## Tidy and verify Go modules
+deps: ## Tidy and verify Go modules (mutates go.mod/go.sum)
 	@echo "Tidying and verifying dependencies..."
 	go mod tidy
 	go mod verify
+
+deps-check: ## Fail if go.mod/go.sum are untidy or module hashes mismatch (no mutation)
+	@echo "Checking module tidiness and hashes..."
+	go mod tidy -diff
+	go mod verify
+
+vendor-check: ## Fail if vendor/ is missing or inconsistent with go.mod (offline)
+	@echo "Checking vendor/ consistency..."
+	@test -f vendor/modules.txt || (echo "FATAL: vendor/modules.txt missing. Run 'go mod vendor' while networked." && exit 1)
+	go list -mod=vendor -deps -test ./... > /dev/null
 
 repomix: ## Bundle codebase context for LLM ingestion
 	@echo "Bundling codebase for LLM ingestion..."
