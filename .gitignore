@@ -37,6 +37,8 @@ EOF
 states/
 *TTrace_*.tla
 *TTrace_*.bin
+# pcal.trans backup of the module it rewrites
+docs/formal/*.old
 MC.tla
 MC.cfg
 MC.out

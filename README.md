@@ -212,3 +212,5 @@ ramfs is never swapped. A reboot discards it, together with every staged secret.
 | Leaves import no internal package; layering edges are explicit | `internal/validate` | `TestPackageLayering` |
 
 `make check` runs all of these deterministically (fixed rapid seed, fuzz seed corpora). `make verify` runs rapid at 10,000 checks with random seeds, plus each fuzz target for `FUZZTIME`. Namespace tests skip where unprivileged user namespaces are unavailable. `PREVIEWD_REQUIRE_NS_TESTS=1` and `PREVIEWD_REQUIRE_MLOCK_TEST=1` turn those skips into failures, and CI sets both.
+
+Phase 2 is a TLA+ model of the target queue design (webhook API, SQLite job queue, reconciler workers, startup sweep, daemon crash and host reboot) in `docs/formal/previewd.tla`. TLC checks zero secret leakage, no orphaned resources, monotonic ordering, eventual completion and eventual consistency. The shipped code still queues in memory; `docs/formal/README.md` has the results, the mutation table and how to run TLC offline.
