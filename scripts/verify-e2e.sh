@@ -16,18 +16,47 @@ WEBHOOK_SECRET="hook-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 
 fail() {
   echo "E2E FAILED: $*" >&2
+  if [ -n "$MOCK_DIR" ] && [ -f "$MOCK_DIR/agent.log" ]; then
+    echo "--- last agent log lines ---" >&2
+    tail -n 20 "$MOCK_DIR/agent.log" >&2
+  fi
   exit 1
 }
 
-# send_webhook EVENT BODY: POST a webhook signed exactly as GitHub does.
+# uuid1: an RFC 4122 version 1 UUID for the current time, like the
+# X-GitHub-Delivery GUIDs previewd orders deliveries by (100-ns ticks since
+# 1582-10-15).
+uuid1() {
+  local ticks
+  ticks=$(( $(date +%s%N) / 100 + 0x01B21DD213814000 ))
+  printf '%08x-%04x-1%03x-%04x-%04x%08x' \
+    $(( ticks & 0xffffffff )) $(( (ticks >> 32) & 0xffff )) $(( (ticks >> 48) & 0xfff )) \
+    $(( 0x8000 | (RANDOM & 0x3fff) )) "$RANDOM" $(( (RANDOM << 15) | RANDOM ))
+}
+
+# send_webhook EVENT BODY [DELIVERY]: POST a webhook signed exactly as GitHub
+# does (the signature covers the body only), with a fresh delivery GUID unless
+# one is given.
 send_webhook() {
-  local sig
+  local sig delivery="${3:-$(uuid1)}"
   sig=$(printf '%s' "$2" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | sed 's/^.*= //')
   curl -s -X POST http://localhost:8080/webhooks/github \
     -H "X-GitHub-Event: $1" \
+    -H "X-GitHub-Delivery: $delivery" \
     -H "X-Hub-Signature-256: sha256=$sig" \
     -H "Content-Type: application/json" \
     --data-binary "$2"
+}
+
+# wait_for SECONDS DESCRIPTION COMMAND...: poll until COMMAND succeeds.
+wait_for() {
+  local secs="$1" what="$2"
+  shift 2
+  for _ in $(seq "$secs"); do
+    if "$@" >/dev/null 2>&1; then return 0; fi
+    sleep 1
+  done
+  fail "timed out after ${secs}s waiting for $what"
 }
 
 cleanup() {
@@ -102,21 +131,26 @@ fi
 printf 'E2E_TOKEN=%s\n' "$E2E_SECRET" > "$MOCK_DIR/secrets.env"
 chmod 0600 "$MOCK_DIR/secrets.env"
 
-echo "==> Starting previewd agent in background..."
-# Unlocked memory is accepted here (logged as an error): mlockall needs
-# LimitMEMLOCK=infinity, which the dev shell does not have.
-PREVIEWD_WEBHOOK_SECRET="$WEBHOOK_SECRET" \
-  PREVIEWD_ALLOW_UNLOCKED_MEMORY=1 \
-  PREVIEWD_SECRETS_PATH="$MOCK_DIR/secrets.env" \
-  PREVIEWD_SECRETS_STAGING_DIR="$STAGING_DIR" \
-  PREVIEWD_ALLOW_TMPFS_SECRETS="$ALLOW_TMPFS" \
-  PREVIEWD_ROUTES_DIR="$ROUTES_DIR" \
-  PREVIEWD_TRAEFIK_DOMAIN="$DOMAIN" \
-  PREVIEWD_DB_PATH="$MOCK_DIR/previewd.sqlite" \
-  ./bin/previewd &
-AGENT_PID=$!
+# start_agent: run the daemon in the background on the E2E state (database,
+# routes, staging), and wait until it serves (the startup sweep runs first).
+start_agent() {
+  # Unlocked memory is accepted here (logged as an error): mlockall needs
+  # LimitMEMLOCK=infinity, which the dev shell does not have.
+  PREVIEWD_WEBHOOK_SECRET="$WEBHOOK_SECRET" \
+    PREVIEWD_ALLOW_UNLOCKED_MEMORY=1 \
+    PREVIEWD_SECRETS_PATH="$MOCK_DIR/secrets.env" \
+    PREVIEWD_SECRETS_STAGING_DIR="$STAGING_DIR" \
+    PREVIEWD_ALLOW_TMPFS_SECRETS="$ALLOW_TMPFS" \
+    PREVIEWD_ROUTES_DIR="$ROUTES_DIR" \
+    PREVIEWD_TRAEFIK_DOMAIN="$DOMAIN" \
+    PREVIEWD_DB_PATH="$MOCK_DIR/previewd.sqlite" \
+    ./bin/previewd >>"$MOCK_DIR/agent.log" 2>&1 &
+  AGENT_PID=$!
+  wait_for 30 "the agent to serve" curl -sf http://localhost:8080/healthz
+}
 
-sleep 3
+echo "==> Starting previewd agent in background..."
+start_agent
 
 echo "==> 1. Testing Ping Handshake..."
 send_webhook ping '{}'
@@ -132,18 +166,39 @@ PR_BODY() {
     "$1" "$MOCK_SHA" "$MOCK_DIR"
 }
 
+echo -e "\n==> 1c. Delivery GUIDs that cannot be ordered are rejected..."
+for bad in "" "3f1c6b2e-9a7d-4c1b-8e2f-0a1b2c3d4e5f" "not-a-uuid"; do
+  sig=$(printf '%s' "$(PR_BODY opened)" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | sed 's/^.*= //')
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8080/webhooks/github \
+    -H "X-GitHub-Event: pull_request" -H "X-GitHub-Delivery: $bad" \
+    -H "X-Hub-Signature-256: sha256=$sig" --data-binary "$(PR_BODY opened)")
+  [ "$code" = "400" ] || fail "delivery GUID '$bad' answered $code, want 400"
+done
+echo "    ok: missing, version 4 and malformed delivery GUIDs rejected (400)"
+
+# A GUID minted now, sent later: older than the deploy below, so stale.
+OLD_DELIVERY=$(uuid1)
+sleep 0.01
+
 echo -e "\n==> 2. Testing Environment Provisioning (Action: opened)..."
-reply=$(send_webhook pull_request "$(PR_BODY opened)")
+OPENED_DELIVERY=$(uuid1)
+reply=$(send_webhook pull_request "$(PR_BODY opened)" "$OPENED_DELIVERY")
 echo "$reply"
 ENV_ID=$(printf '%s' "$reply" | sed -n 's/.*"environment_id":"\([a-z0-9-]*\)".*/\1/p')
 [ -n "$ENV_ID" ] || fail "no environment_id in reply"
+case "$reply" in *'"status":"queued"'*) ;; *) fail "opened not queued: $reply" ;; esac
+
+echo -e "\n==> 2d. Replays and stale deliveries change nothing..."
+case "$(send_webhook pull_request "$(PR_BODY opened)" "$OPENED_DELIVERY")" in
+  *'"status":"duplicate"'*) ;; *) fail "redelivery of the same GUID not a duplicate" ;; esac
+case "$(send_webhook pull_request "$(PR_BODY opened)")" in
+  *'"status":"duplicate"'*) ;; *) fail "same signed body under a new GUID not a duplicate" ;; esac
+case "$(send_webhook pull_request "$(PR_BODY synchronize)" "$OLD_DELIVERY")" in
+  *'"status":"stale"'*) ;; *) fail "older delivery not stale" ;; esac
+echo "    ok: same GUID and same body under a new GUID are duplicates; an older GUID is stale"
 
 echo -e "\n\n[*] Agent is processing job in background. Waiting up to 60 seconds for the route..."
-for _ in $(seq 60); do
-  [ -f "$ROUTES_DIR/$ENV_ID.yml" ] && break
-  sleep 1
-done
-[ -f "$ROUTES_DIR/$ENV_ID.yml" ] || fail "route document $ENV_ID.yml not written"
+wait_for 60 "route document $ENV_ID.yml" test -f "$ROUTES_DIR/$ENV_ID.yml"
 
 echo "==> 2b. Verifying secrets reach the container only through the read-only ramfs mount..."
 inspect=$(docker inspect "$ENV_ID" 2>/dev/null) || fail "container $ENV_ID was not created"
@@ -196,10 +251,31 @@ if docker exec "$ENV_ID" wget -q -T 3 -O- --header "Host: $ENV_ID.$DOMAIN" "http
 fi
 echo "    ok: routed by file provider, internal network shared only with Traefik, Traefik not reachable from the PR"
 
+echo "==> 2e. Crash: kill -9 the agent, plant orphan route files, restart..."
+CONTAINER_ID=$(docker inspect "$ENV_ID" --format '{{.Id}}')
+kill -9 "$AGENT_PID"
+wait "$AGENT_PID" 2>/dev/null || true
+AGENT_PID=""
+# A planted route document no job backs: the startup sweep must delete it.
+printf '{"http":{"routers":{"evil":{"rule":"Host(`evil.%s`)","service":"evil"}},"services":{"evil":{"loadBalancer":{"servers":[{"url":"http://10.0.0.1"}]}}}}}' "$DOMAIN" >"$ROUTES_DIR/pr-1-0deadbeef0.yml" # airgap:allow planted orphan, deleted by the startup sweep, backend never contacted
+echo 'http: {}' > "$ROUTES_DIR/injected.yaml"
+echo partial > "$ROUTES_DIR/.pr-2-0deadbeef1.yml.tmp-1"
+start_agent
+for f in pr-1-0deadbeef0.yml injected.yaml .pr-2-0deadbeef1.yml.tmp-1; do
+  [ ! -e "$ROUTES_DIR/$f" ] || fail "orphan $f survived the startup sweep"
+done
+[ -f "$ROUTES_DIR/$ENV_ID.yml" ] || fail "route of the kept environment removed"
+[ "$(docker inspect "$ENV_ID" --format '{{.Id}}')" = "$CONTAINER_ID" ] || fail "kept environment was recreated"
+[ "$(curl -s -m 2 -H "Host: $ENV_ID.$DOMAIN" http://127.0.0.1/)" = "previewd-e2e-ok" ] || fail "kept environment no longer routed"
+[ "$(ls "$ROUTES_DIR")" = "$ENV_ID.yml" ] || fail "routes dir holds more than the kept route: $(ls -A "$ROUTES_DIR")"
+echo "    ok: orphan, foreign and partial route files removed; the kept environment and its route survive the crash"
+
 echo "==> 3. Testing Exhaustive Teardown (Action: closed)..."
-send_webhook pull_request "$(PR_BODY closed)"
+case "$(send_webhook pull_request "$(PR_BODY closed)")" in
+  *'"status":"queued"'*) ;; *) fail "closed not queued" ;; esac
 
 echo -e "\n==> 3b. Verifying teardown removed the container and the staged secrets..."
+wait_for 60 "teardown of $ENV_ID" sh -c "! docker inspect '$ENV_ID' && [ ! -e '$ROUTES_DIR/$ENV_ID.yml' ] && [ ! -e '$STAGING_DIR/$ENV_ID' ] && ! docker network inspect '$ENV_ID-net'"
 if docker inspect "$ENV_ID" >/dev/null 2>&1; then fail "container $ENV_ID survived teardown"; fi
 if [ -e "$STAGING_DIR/$ENV_ID" ]; then fail "staged secrets survived teardown"; fi
 if [ -e "$ROUTES_DIR/$ENV_ID.yml" ]; then fail "route document survived teardown"; fi

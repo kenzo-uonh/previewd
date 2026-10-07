@@ -96,7 +96,8 @@ func NewStore(ctx context.Context, path string) (*Store, error) {
 // Never edit a shipped entry: append a new one.
 var migrations = []string{
 	// 1: environment records. IF NOT EXISTS: databases created before
-	// versioning hold this table at user_version 0.
+	// versioning hold this table at user_version 0. Superseded by the job
+	// queue and dropped by migration 2.
 	`CREATE TABLE IF NOT EXISTS environments (
 		id TEXT PRIMARY KEY,
 		pr_number INTEGER NOT NULL,
@@ -104,8 +105,10 @@ var migrations = []string{
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	PRAGMA user_version = 1;`,
-	// 2: job queue, replay protection and boot epochs (jobs.go).
-	`CREATE TABLE jobs (
+	// 2: job queue, replay protection and boot epochs (jobs.go); the
+	// environment records of migration 1 are superseded by the queue.
+	`DROP TABLE IF EXISTS environments;
+	CREATE TABLE jobs (
 		id INTEGER PRIMARY KEY,
 		preview_id TEXT NOT NULL CHECK (length(preview_id) BETWEEN 1 AND 63),
 		type TEXT NOT NULL CHECK (type IN ('deploy', 'teardown')),
@@ -114,6 +117,10 @@ var migrations = []string{
 		attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
 		not_before INTEGER NOT NULL DEFAULT 0,
 		lease_epoch INTEGER NOT NULL DEFAULT 0,
+		repo TEXT NOT NULL CHECK (length(repo) BETWEEN 3 AND 140),
+		pr_number INTEGER NOT NULL CHECK (pr_number > 0),
+		commit_sha TEXT NOT NULL CHECK (length(commit_sha) IN (40, 64)),
+		clone_url TEXT NOT NULL CHECK (length(clone_url) BETWEEN 1 AND 2048),
 		UNIQUE (preview_id, seq),
 		CHECK (type = 'teardown' OR attempts = 0),
 		CHECK (type = 'deploy' OR status <> 'FAILED')
@@ -122,6 +129,7 @@ var migrations = []string{
 	CREATE INDEX jobs_by_preview ON jobs (preview_id, status, seq);
 	CREATE TABLE deliveries (
 		delivery_id TEXT PRIMARY KEY CHECK (length(delivery_id) BETWEEN 1 AND 64),
+		payload_sha256 TEXT NOT NULL UNIQUE CHECK (length(payload_sha256) = 64),
 		preview_id TEXT NOT NULL,
 		seq INTEGER NOT NULL,
 		verdict TEXT NOT NULL CHECK (verdict IN ('accepted', 'stale'))

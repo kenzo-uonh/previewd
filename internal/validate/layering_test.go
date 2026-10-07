@@ -23,13 +23,18 @@ var allowedImports = map[string][]string{
 	"textutil":  {},
 	"validate":  {},
 
-	"config":       {},
-	"secrets":      {},
-	"store":        {},
-	"vcs":          {},
-	"proxy":        {"envid", "validate"},
-	"orchestrator": {"config", "proxy", "secrets", "store", "vcs"},
-	"api":          {"config", "envid", "orchestrator", "store", "validate", "vcs"},
+	"config":  {},
+	"secrets": {},
+	"store":   {},
+	"vcs":     {},
+	"proxy":   {"envid", "validate"},
+	// The reconciler consumes the queue (store) and publishes routes (proxy);
+	// envid validates ownership labels at startup. Fetching and secrets come
+	// in through injected functions and interfaces.
+	"orchestrator": {"envid", "proxy", "store"},
+	// The handler writes to the queue and wakes the reconciler through
+	// consumer interfaces: no orchestrator import.
+	"api": {"config", "envid", "store", "validate", "vcs"},
 }
 
 var leaves = []string{"envid", "hardening", "textutil", "validate"}

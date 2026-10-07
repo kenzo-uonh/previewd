@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/kenzo-uonh/previewd/internal/envid"
 )
@@ -75,6 +76,47 @@ func (p *Publisher) Remove(envID string) error {
 	return nil
 }
 
+// Inventory returns the environment IDs that have a route document, after
+// removing every other file Traefik's file provider could load: temporary
+// files left by an interrupted Publish, and any .yml, .yaml or .toml file
+// that is not a route document of a valid environment (a foreign file in the
+// watched directory is a route injection). removed lists what was deleted.
+// A directory, symlink or other non-regular entry refuses the inventory:
+// previewd writes none, and Traefik may follow it.
+func (p *Publisher) Inventory() (routes, removed []string, err error) {
+	entries, err := p.fs.ReadDir(p.dir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read routes dir: %w", err)
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !e.Type().IsRegular() {
+			return nil, nil, fmt.Errorf("routes dir: %q is not a regular file: refusing to start until it is removed", name)
+		}
+		ext := filepath.Ext(name)
+		stem := strings.TrimSuffix(name, ext)
+		switch {
+		case ext == ".yml" && !strings.HasPrefix(name, ".") && envid.Valid(stem):
+			routes = append(routes, stem)
+			continue
+		case strings.HasPrefix(name, ".") && strings.Contains(name, ".tmp-"):
+		case ext == ".yml" || ext == ".yaml" || ext == ".toml":
+		default:
+			continue // Traefik ignores it
+		}
+		if err := p.fs.Remove(filepath.Join(p.dir, name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return nil, nil, fmt.Errorf("remove %s from routes dir: %w", name, err)
+		}
+		removed = append(removed, name)
+	}
+	if len(removed) > 0 {
+		if err := p.fs.SyncDir(p.dir); err != nil {
+			return nil, nil, fmt.Errorf("routes dir: %w", err)
+		}
+	}
+	return routes, removed, nil
+}
+
 // writeAtomic: write a temporary file in dir, fsync it, rename it over
 // name, then fsync dir so the rename itself is durable.
 func writeAtomic(ops fileOps, dir, name string, data []byte) (err error) {
@@ -127,6 +169,7 @@ type tempFile interface {
 }
 
 type fileOps interface {
+	ReadDir(dir string) ([]fs.DirEntry, error)
 	CreateTemp(dir, pattern string) (tempFile, error)
 	Rename(oldpath, newpath string) error
 	Remove(name string) error
@@ -135,6 +178,7 @@ type fileOps interface {
 
 type osOps struct{}
 
+func (osOps) ReadDir(dir string) ([]fs.DirEntry, error)        { return os.ReadDir(dir) }
 func (osOps) CreateTemp(dir, pattern string) (tempFile, error) { return os.CreateTemp(dir, pattern) }
 func (osOps) Rename(oldpath, newpath string) error             { return os.Rename(oldpath, newpath) }
 func (osOps) Remove(name string) error                         { return os.Remove(name) }

@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -40,9 +42,27 @@ func sweptStore(t *testing.T) (*Store, string) {
 	return s, path
 }
 
+var testSource = Source{
+	Repo:      "acme/app",
+	PRNumber:  7,
+	CommitSHA: "0123456789abcdef0123456789abcdef01234567",
+	CloneURL:  "https://git.example.internal/acme/app.git",
+}
+
+// payloadHash stands for the SHA-256 of a signed body; distinct deliveries
+// carry distinct bodies.
+func payloadHash(body string) string {
+	sum := sha256.Sum256([]byte(body))
+	return hex.EncodeToString(sum[:])
+}
+
+func testDelivery(id, env string, typ JobType, seq int64) Delivery {
+	return Delivery{ID: id, PayloadSHA256: payloadHash("body of " + id), EnvID: env, Type: typ, Seq: seq, Source: testSource}
+}
+
 func enqueue(t *testing.T, s *Store, id, env string, typ JobType, seq int64) (Verdict, int64) {
 	t.Helper()
-	v, jobID, err := s.Enqueue(context.Background(), Delivery{ID: id, EnvID: env, Type: typ, Seq: seq})
+	v, jobID, err := s.Enqueue(context.Background(), testDelivery(id, env, typ, seq))
 	if err != nil {
 		t.Fatalf("Enqueue %s: %v", id, err)
 	}
@@ -82,7 +102,7 @@ func statuses(t *testing.T, s *Store) []JobStatus {
 func TestQueueRefusesBeforeSweep(t *testing.T) {
 	s := openStore(t, filepath.Join(t.TempDir(), "previewd.sqlite"))
 	ctx := context.Background()
-	if _, _, err := s.Enqueue(ctx, Delivery{ID: "d1", EnvID: envA, Type: JobDeploy, Seq: 1}); !errors.Is(err, ErrNotSwept) {
+	if _, _, err := s.Enqueue(ctx, testDelivery("d1", envA, JobDeploy, 1)); !errors.Is(err, ErrNotSwept) {
 		t.Errorf("Enqueue: %v, want ErrNotSwept", err)
 	}
 	if _, _, err := s.Acquire(ctx, t0); !errors.Is(err, ErrNotSwept) {
@@ -98,17 +118,29 @@ func TestQueueRefusesBeforeSweep(t *testing.T) {
 
 func TestEnqueueRejectsInvalidDelivery(t *testing.T) {
 	s, _ := sweptStore(t)
-	long := string(make([]byte, 65))
-	for name, d := range map[string]Delivery{
-		"empty id":         {EnvID: envA, Type: JobDeploy, Seq: 1},
-		"id too long":      {ID: long, EnvID: envA, Type: JobDeploy, Seq: 1},
-		"empty env":        {ID: "d", Type: JobDeploy, Seq: 1},
-		"env too long":     {ID: "d", EnvID: long[:64], Type: JobDeploy, Seq: 1},
-		"unknown type":     {ID: "d", EnvID: envA, Type: "rollback", Seq: 1},
-		"zero seq":         {ID: "d", EnvID: envA, Type: JobDeploy},
-		"negative seq":     {ID: "d", EnvID: envA, Type: JobDeploy, Seq: -1},
-		"type case varies": {ID: "d", EnvID: envA, Type: "Deploy", Seq: 1},
+	long := strings.Repeat("a", 2049)
+	for name, mutate := range map[string]func(d *Delivery){
+		"empty id":           func(d *Delivery) { d.ID = "" },
+		"id too long":        func(d *Delivery) { d.ID = long[:65] },
+		"empty env":          func(d *Delivery) { d.EnvID = "" },
+		"env too long":       func(d *Delivery) { d.EnvID = long[:64] },
+		"unknown type":       func(d *Delivery) { d.Type = "rollback" },
+		"type case varies":   func(d *Delivery) { d.Type = "Deploy" },
+		"zero seq":           func(d *Delivery) { d.Seq = 0 },
+		"negative seq":       func(d *Delivery) { d.Seq = -1 },
+		"no payload hash":    func(d *Delivery) { d.PayloadSHA256 = "" },
+		"short payload hash": func(d *Delivery) { d.PayloadSHA256 = d.PayloadSHA256[:63] },
+		"upper payload hash": func(d *Delivery) { d.PayloadSHA256 = strings.ToUpper(d.PayloadSHA256) },
+		"short repo":         func(d *Delivery) { d.Source.Repo = "a/" },
+		"long repo":          func(d *Delivery) { d.Source.Repo = long[:141] },
+		"zero pr":            func(d *Delivery) { d.Source.PRNumber = 0 },
+		"short commit":       func(d *Delivery) { d.Source.CommitSHA = d.Source.CommitSHA[:39] },
+		"non hex commit":     func(d *Delivery) { d.Source.CommitSHA = "g" + d.Source.CommitSHA[1:] },
+		"no clone url":       func(d *Delivery) { d.Source.CloneURL = "" },
+		"clone url too long": func(d *Delivery) { d.Source.CloneURL = long },
 	} {
+		d := testDelivery("d", envA, JobDeploy, 1)
+		mutate(&d)
 		if _, _, err := s.Enqueue(context.Background(), d); !errors.Is(err, ErrInvalidDelivery) {
 			t.Errorf("%s: %v, want ErrInvalidDelivery", name, err)
 		}
@@ -129,6 +161,25 @@ func TestEnqueueReplay(t *testing.T) {
 	}
 	if got := statuses(t, s); len(got) != 1 {
 		t.Fatalf("jobs after replay: %v", got)
+	}
+}
+
+// GitHub does not sign X-GitHub-Delivery: the same signed body resent under
+// a new ID (and a later timestamp) is a replay, not a new intent.
+func TestEnqueueReplaysPayloadUnderNewID(t *testing.T) {
+	s, _ := sweptStore(t)
+	d := testDelivery("d1", envA, JobDeploy, 1)
+	if v, _, err := s.Enqueue(context.Background(), d); err != nil || v != VerdictAccepted {
+		t.Fatalf("first delivery = %s, %v", v, err)
+	}
+	forged := d
+	forged.ID, forged.Seq = "d2", 99
+	if v, id, err := s.Enqueue(context.Background(), forged); err != nil || v != VerdictReplay || id != 0 {
+		t.Fatalf("same body under a new ID = %s/%d, %v; want replay", v, id, err)
+	}
+	jobs, err := s.Jobs(context.Background())
+	if err != nil || len(jobs) != 1 || jobs[0].Source != testSource {
+		t.Fatalf("jobs = %+v, %v", jobs, err)
 	}
 }
 
@@ -252,7 +303,7 @@ func crashAndSweep(t *testing.T, s *Store, path string, observed []Observation) 
 }
 
 func intact(env string, jobID int64) Observation {
-	return Observation{EnvID: env, Running: true, NetworkBound: true, SecretsMounted: true, JobID: jobID}
+	return Observation{EnvID: env, Running: true, NetworkBound: true, SecretsMounted: true, Routed: true, JobID: jobID}
 }
 
 // deployed returns a store where envA runs job 1 (SUCCESS).
@@ -298,6 +349,23 @@ func TestSweepRearmsAfterReboot(t *testing.T) {
 	}
 	if l := acquire(t, s); l.JobID != 1 {
 		t.Fatalf("re-armed deploy not leased: %+v", l)
+	}
+}
+
+// A running environment whose route document is gone is not intact: it is
+// destroyed and its deploy re-armed, so route and container come back
+// together. Conversely, a lone route document is destroyed.
+func TestSweepRouteMustMatchEnvironment(t *testing.T) {
+	s, path := deployed(t)
+	o := intact(envA, 1)
+	o.Routed = false
+	lone := Observation{EnvID: envB, Routed: true}
+	s, res := crashAndSweep(t, s, path, []Observation{o, lone})
+	if !slices.Equal(res.Destroy, []string{envA, envB}) {
+		t.Fatalf("destroy = %v, want [%s %s]", res.Destroy, envA, envB)
+	}
+	if got := statuses(t, s); !slices.Equal(got, []JobStatus{StatusQueued}) {
+		t.Fatalf("statuses = %v, want the deploy re-armed", got)
 	}
 }
 
@@ -401,12 +469,13 @@ func TestMigrations(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := openStore(t, path)
-	var version, rows int
+	var version, tables int
 	if err := s.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil || version != len(migrations) {
 		t.Fatalf("user_version = %d, %v; want %d", version, err, len(migrations))
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM environments`).Scan(&rows); err != nil || rows != 1 {
-		t.Fatalf("environments rows = %d, %v; want the row kept", rows, err)
+	// The queue supersedes the environment records: migration 2 drops them.
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_schema WHERE name = 'environments'`).Scan(&tables); err != nil || tables != 0 {
+		t.Fatalf("environments table still present (%d), %v", tables, err)
 	}
 
 	// Every migration sets exactly its own version.

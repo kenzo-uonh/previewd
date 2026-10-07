@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -202,5 +203,41 @@ func TestRemoveIsIdempotent(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(s.dir, "pr-7")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("staged dir survived Remove: %v", err)
+	}
+}
+
+func TestListStagedEnvironments(t *testing.T) {
+	s := newTestStager(t)
+	for _, env := range []string{"pr-2-0b0b0b0b0b", "pr-1-0a0a0a0a0a"} {
+		if _, err := s.Stage(env, map[string]string{"TOKEN": "v"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	envs, err := s.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if want := []string{"pr-1-0a0a0a0a0a", "pr-2-0b0b0b0b0b"}; !slices.Equal(envs, want) {
+		t.Fatalf("List = %v, want %v", envs, want)
+	}
+}
+
+// Fail closed: anything in the staging root previewd did not write refuses
+// the listing, and therefore the daemon's start.
+func TestListRefusesUnexpectedEntries(t *testing.T) {
+	for name, mk := range map[string]func(dir string) error{
+		"file":         func(dir string) error { return os.WriteFile(filepath.Join(dir, "TOKEN"), []byte("x"), 0o600) },
+		"symlink":      func(dir string) error { return os.Symlink("/etc", filepath.Join(dir, "pr-1-0a0a0a0a0a")) },
+		"invalid name": func(dir string) error { return os.Mkdir(filepath.Join(dir, "Pr_1"), 0o700) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newTestStager(t)
+			if err := mk(s.dir); err != nil {
+				t.Fatal(err)
+			}
+			if envs, err := s.List(); err == nil {
+				t.Fatalf("List accepted a %s: %v", name, envs)
+			}
+		})
 	}
 }

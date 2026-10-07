@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -13,12 +14,6 @@ import (
 // material. A migration that adds or retypes anything fails verifySchema
 // until this list, and that review, are updated.
 var schemaAllowlist = map[string]map[string]string{
-	"environments": {
-		"id":         "TEXT",     // environment ID: envid.Generate output, a DNS label
-		"pr_number":  "INTEGER",  // pull request number
-		"status":     "TEXT",     // lifecycle state: building, running, failed
-		"created_at": "DATETIME", // timestamp
-	},
 	"jobs": {
 		"id":          "INTEGER", // job ID
 		"preview_id":  "TEXT",    // environment ID: envid.Generate output, a DNS label
@@ -28,12 +23,17 @@ var schemaAllowlist = map[string]map[string]string{
 		"attempts":    "INTEGER", // teardown requeues
 		"not_before":  "INTEGER", // backoff, Unix milliseconds
 		"lease_epoch": "INTEGER", // boot epoch of the lease
+		"repo":        "TEXT",    // repository full name, validate.RepoFullName
+		"pr_number":   "INTEGER", // pull request number
+		"commit_sha":  "TEXT",    // head commit, validate.CommitSHA (40 or 64 hex)
+		"clone_url":   "TEXT",    // validate.cloneURL: absolute, no user info (credentials refused)
 	},
 	"deliveries": {
-		"delivery_id": "TEXT",    // X-GitHub-Delivery GUID, at most 64 bytes (CHECK)
-		"preview_id":  "TEXT",    // environment ID: envid.Generate output, a DNS label
-		"seq":         "INTEGER", // delivery order
-		"verdict":     "TEXT",    // accepted or stale (CHECK)
+		"delivery_id":    "TEXT",    // X-GitHub-Delivery UUIDv1, canonical lower case
+		"payload_sha256": "TEXT",    // SHA-256 of the signed body (hex): content replay key
+		"preview_id":     "TEXT",    // environment ID: envid.Generate output, a DNS label
+		"seq":            "INTEGER", // delivery order
+		"verdict":        "TEXT",    // accepted or stale (CHECK)
 	},
 	"boots": {
 		"epoch":      "INTEGER", // boot epoch
@@ -41,9 +41,10 @@ var schemaAllowlist = map[string]map[string]string{
 	},
 }
 
-// verifySchema refuses a database whose schema leaves the allowlist, or that
-// has any column with BLOB affinity (declared BLOB, or no declared type),
-// which stores arbitrary bytes. It runs at every start.
+// verifySchema refuses a database whose schema differs from the allowlist in
+// either direction (extra or missing table or column, other declared type),
+// or that has any column with BLOB affinity (declared BLOB, or no declared
+// type), which stores arbitrary bytes. It runs at every start.
 func verifySchema(ctx context.Context, db *sql.DB) error {
 	tables, err := userTables(ctx, db)
 	if err != nil {
@@ -51,7 +52,9 @@ func verifySchema(ctx context.Context, db *sql.DB) error {
 	}
 
 	var violations []string
+	present := map[string]bool{}
 	for _, table := range tables {
+		present[table] = true
 		allowed, ok := schemaAllowlist[table]
 		if !ok {
 			violations = append(violations, fmt.Sprintf("table %q is not allowlisted", table))
@@ -60,6 +63,13 @@ func verifySchema(ctx context.Context, db *sql.DB) error {
 		cols, err := tableColumns(ctx, db, table)
 		if err != nil {
 			return err
+		}
+		// The schema is pinned both ways: a missing column means a database
+		// from another version that queries would fail on at run time.
+		for name := range allowed {
+			if _, ok := cols[name]; !ok {
+				violations = append(violations, fmt.Sprintf("column %s.%s is missing", table, name))
+			}
 		}
 		for name, declType := range cols {
 			if blobAffinity(declType) {
@@ -76,7 +86,13 @@ func verifySchema(ctx context.Context, db *sql.DB) error {
 			}
 		}
 	}
+	for table := range schemaAllowlist {
+		if !present[table] {
+			violations = append(violations, fmt.Sprintf("table %q is missing", table))
+		}
+	}
 	if len(violations) > 0 {
+		slices.Sort(violations)
 		return fmt.Errorf("schema refused: %s", strings.Join(violations, "; "))
 	}
 	return nil

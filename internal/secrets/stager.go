@@ -134,6 +134,25 @@ func (s *Stager) Remove(envID string) error {
 	return nil
 }
 
+// List returns the environments that have staged secrets. The staging root
+// holds nothing but previewd's per-environment directories: any other entry
+// (file, symlink, invalid name) refuses the listing, so the daemon does not
+// start next to secret material it cannot account for.
+func (s *Stager) List() ([]string, error) {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return nil, fmt.Errorf("list secret staging dir: %w", err)
+	}
+	envs := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() || !envIDPattern.MatchString(e.Name()) {
+			return nil, fmt.Errorf("secret staging dir holds an unexpected entry %q: remove it before starting", e.Name())
+		}
+		envs = append(envs, e.Name())
+	}
+	return envs, nil
+}
+
 func writeStaged(root *os.Root, envID string, secrets map[string]string) error {
 	if err := root.Mkdir(envID, writeDirMode); err != nil {
 		return fmt.Errorf("create staging dir: %w", err)

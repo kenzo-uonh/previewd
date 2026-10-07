@@ -11,17 +11,29 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/containerd/errdefs"
+	"github.com/kenzo-uonh/previewd/internal/envid"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
 )
 
 // SecretsMountTarget is where an environment's staged secrets appear inside
 // its container, one read-only file per key.
 const SecretsMountTarget = "/run/secrets"
+
+// Ownership labels on the containers and networks previewd creates. They
+// carry identities only, are set by previewd on every create (overriding any
+// image label of the same key), and are read by Observe at startup. Traefik
+// reads no label.
+const (
+	LabelEnv = "previewd.env"
+	LabelJob = "previewd.job"
+)
 
 // Limits bound every PR container.
 type Limits struct {
@@ -215,6 +227,7 @@ func (d *DockerEngine) ProvisionNetwork(ctx context.Context, envID string) error
 	opts := client.NetworkCreateOptions{
 		Driver:   "bridge",
 		Internal: true,
+		Labels:   map[string]string{LabelEnv: envID},
 	}
 	_, err := d.client.NetworkCreate(ctx, netName, opts)
 	if err == nil {
@@ -251,9 +264,13 @@ func containerSpec(env Environment, limits Limits) (*container.Config, *containe
 	}
 	pids := limits.Pids
 
-	// No routing labels: the proxy reads route documents, never labels.
+	// Ownership labels only: the proxy reads route documents, never labels.
 	cfg := &container.Config{
 		Image: env.Image,
+		Labels: map[string]string{
+			LabelEnv: env.ID,
+			LabelJob: strconv.FormatInt(env.JobID, 10),
+		},
 	}
 
 	netName := networkName(env.ID)
@@ -418,6 +435,68 @@ func (d *DockerEngine) disconnectProxy(ctx context.Context, netName string) erro
 		return fmt.Errorf("disconnect proxy from %s: %w", netName, err)
 	}
 	return nil
+}
+
+// Observe reports, per environment, the containers and networks previewd
+// owns on the host: by ownership label, or by name for resources created
+// before labels existed (container <env-id>, network <env-id>-net).
+func (d *DockerEngine) Observe(ctx context.Context) (map[string]EngineState, error) {
+	containers, err := d.client.ContainerList(ctx, client.ContainerListOptions{All: true})
+	if err != nil {
+		return nil, fmt.Errorf("list containers: %w", err)
+	}
+	networks, err := d.client.NetworkList(ctx, client.NetworkListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list networks: %w", err)
+	}
+	return observe(containers.Items, networks.Items), nil
+}
+
+// observe groups owned containers and networks by environment.
+func observe(containers []container.Summary, networks []network.Summary) map[string]EngineState {
+	states := map[string]EngineState{}
+	for _, c := range containers {
+		name := ""
+		if len(c.Names) > 0 {
+			name = strings.TrimPrefix(c.Names[0], "/")
+		}
+		env := ownerOf(c.Labels, name)
+		if env == "" {
+			continue
+		}
+		st := states[env]
+		st.Running = st.Running || c.State == container.StateRunning
+		st.Containers++
+		if job, err := strconv.ParseInt(c.Labels[LabelJob], 10, 64); err == nil && job > 0 && name == env {
+			st.JobID = job
+		}
+		states[env] = st
+	}
+	for _, n := range networks {
+		env := ownerOf(n.Labels, strings.TrimSuffix(n.Name, "-net"))
+		if env == "" || n.Name != networkName(env) {
+			continue
+		}
+		st := states[env]
+		st.NetworkBound = true
+		states[env] = st
+	}
+	return states
+}
+
+// ownerOf is the environment a resource belongs to: its ownership label if
+// set, else its name if that is an environment ID; "" if neither is valid.
+func ownerOf(labels map[string]string, name string) string {
+	if env, ok := labels[LabelEnv]; ok {
+		if envid.Valid(env) {
+			return env
+		}
+		return ""
+	}
+	if envid.Valid(name) {
+		return name
+	}
+	return ""
 }
 
 // Logs returns the standard output and error streams.

@@ -18,6 +18,15 @@ import (
 	"github.com/kenzo-uonh/previewd/internal/proxy"
 	"github.com/kenzo-uonh/previewd/internal/secrets"
 	"github.com/kenzo-uonh/previewd/internal/store"
+	"github.com/kenzo-uonh/previewd/internal/vcs"
+)
+
+const (
+	// appPort is the port every PR application listens on (MVP contract).
+	appPort = 8080
+	// startupSweepTimeout bounds the inventory, the sweep and the removal of
+	// what the database does not keep.
+	startupSweepTimeout = 5 * time.Minute
 )
 
 func main() {
@@ -116,13 +125,39 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Enforce bounded deployment concurrency based on configuration
-	pool := orchestrator.NewWorkerPool(cfg.MaxConcurrentBuilds, logger)
-	pool.Start(ctx, func(jobCtx context.Context, job orchestrator.Job) error {
-		return orchestrator.ProcessJob(jobCtx, job, cfg, db, engine, injector, stager, routes)
+	reconciler, err := orchestrator.NewReconciler(orchestrator.ReconcilerConfig{
+		Queue:   db,
+		Engine:  engine,
+		Routes:  routes,
+		Stager:  stager,
+		Secrets: injector,
+		Fetch:   vcs.FetchRepository,
+		Logger:  logger,
+		Domain:  cfg.TraefikDomain,
+		AppPort: appPort,
 	})
+	if err != nil {
+		logger.Error("Reconciler initialization failure", "error", err)
+		os.Exit(1)
+	}
 
-	apiServer := api.NewServer(logger, cfg, db, engine, stager, routes, pool)
+	// StartupSweep before anything is served: the host is brought back to
+	// what the database keeps, and no route document survives without it.
+	sweepCtx, sweepCancel := context.WithTimeout(ctx, startupSweepTimeout)
+	err = reconciler.Startup(sweepCtx)
+	sweepCancel()
+	if err != nil {
+		logger.Error("Startup sweep failed: refusing to serve", "error", err)
+		os.Exit(1)
+	}
+
+	workersDone := make(chan struct{})
+	go func() {
+		reconciler.Run(ctx, cfg.MaxConcurrentBuilds)
+		close(workersDone)
+	}()
+
+	apiServer := api.NewServer(logger, cfg, db, reconciler)
 	httpServer := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.APIPort),
 		Handler:           apiServer.Routes(),
@@ -149,6 +184,10 @@ func main() {
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Error("HTTP server graceful shutdown failed", "error", err)
 	}
+
+	// Workers stop taking jobs; an interrupted job rolls back and records its
+	// outcome before the database closes.
+	<-workersDone
 
 	logger.Info("Agent exited cleanly.")
 }

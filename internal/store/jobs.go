@@ -4,7 +4,8 @@ package store
 // docs/formal/previewd.tla. Each exported operation is one IMMEDIATE
 // transaction and implements one transition of the model:
 //
-//	Enqueue       ReceiveWebhook (replay protection, D1 stale rule)
+//	Enqueue       ReceiveWebhook (replay protection by delivery ID and by
+//	              payload, D1 stale rule)
 //	Acquire       AcquireJob (newest intent wins, older ones SKIPPED)
 //	Finish        CommitDeploy, CommitTeardown, deploy failure rollback
 //	Requeue       ExecuteTeardown transient failure (never FAILED)
@@ -69,17 +70,33 @@ var (
 const (
 	maxPreviewIDLen  = 63
 	maxDeliveryIDLen = 64
+	maxRepoLen       = 140
+	maxCloneURLLen   = 2048
 )
 
-// Delivery is one signed webhook delivery, reduced to what ordering needs.
-// ID is the GitHub delivery GUID (replay key). Seq orders intents of the
+// Source is what a deploy needs to build the environment. The API validates
+// it (internal/validate) before it reaches the queue; the store only bounds
+// it.
+type Source struct {
+	Repo      string
+	PRNumber  int64
+	CommitSHA string
+	CloneURL  string
+}
+
+// Delivery is one signed webhook delivery. ID is the delivery GUID and
+// PayloadSHA256 the hex SHA-256 of the signed body: both are replay keys,
+// the second because GitHub does not sign the delivery header, so a captured
+// body resent under a new ID is still a replay. Seq orders intents of the
 // same environment: a delivery whose Seq is not above every job already
 // recorded for EnvID is stale.
 type Delivery struct {
-	ID    string
-	EnvID string
-	Type  JobType
-	Seq   int64
+	ID            string
+	PayloadSHA256 string
+	EnvID         string
+	Type          JobType
+	Seq           int64
+	Source        Source
 }
 
 // Job is one row of the queue.
@@ -92,30 +109,39 @@ type Job struct {
 	Attempts   int64
 	NotBefore  int64 // Unix milliseconds; Acquire skips the job before then
 	LeaseEpoch int64
+	Source     Source
 }
 
 // Lease is a worker's claim on one IN_PROGRESS job.
 type Lease struct {
-	JobID int64
-	EnvID string
-	Type  JobType
-	Seq   int64
-	Epoch int64
+	JobID    int64
+	EnvID    string
+	Type     JobType
+	Seq      int64
+	Epoch    int64
+	Attempts int64
+	Source   Source
 }
 
-// Observation is what the engine reports about one environment at startup.
-// JobID names the deploy job that built it (0 when unknown, e.g. a leftover
-// no job tracks).
+// Observation is what the host holds for one environment at startup.
+// JobID names the deploy job that built the container (0 when unknown, e.g.
+// a leftover no job tracks).
 type Observation struct {
 	EnvID          string
 	Running        bool
 	NetworkBound   bool
 	SecretsMounted bool
+	Routed         bool // a route document exists
 	JobID          int64
 }
 
-func (o Observation) exists() bool { return o.Running || o.NetworkBound || o.SecretsMounted }
-func (o Observation) intact() bool { return o.Running && o.NetworkBound && o.SecretsMounted }
+func (o Observation) exists() bool {
+	return o.Running || o.NetworkBound || o.SecretsMounted || o.Routed
+}
+
+func (o Observation) intact() bool {
+	return o.Running && o.NetworkBound && o.SecretsMounted && o.Routed
+}
 
 // SweepResult lists the environments the caller must destroy, sorted, before
 // any worker or webhook is served.
@@ -130,6 +156,25 @@ func validPreviewID(id string) bool {
 
 func validType(t JobType) bool {
 	return t == JobDeploy || t == JobTeardown
+}
+
+func isLowerHex(s string) bool {
+	for i := range len(s) {
+		if c := s[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func (d Delivery) valid() bool {
+	src := d.Source
+	return d.ID != "" && len(d.ID) <= maxDeliveryIDLen &&
+		len(d.PayloadSHA256) == 64 && isLowerHex(d.PayloadSHA256) &&
+		validPreviewID(d.EnvID) && validType(d.Type) && d.Seq > 0 &&
+		len(src.Repo) >= 3 && len(src.Repo) <= maxRepoLen && src.PRNumber > 0 &&
+		(len(src.CommitSHA) == 40 || len(src.CommitSHA) == 64) && isLowerHex(src.CommitSHA) &&
+		src.CloneURL != "" && len(src.CloneURL) <= maxCloneURLLen
 }
 
 // Epoch returns the current boot epoch, 0 before StartupSweep.
@@ -168,16 +213,16 @@ func (s *Store) inTx(ctx context.Context, what string, fn func(*sql.Tx) error) (
 	return nil
 }
 
-// Enqueue records a delivery. A delivery already seen is a replay and changes
-// nothing. A delivery is stale when any job of the same environment has a Seq
-// at or above it, whatever that job's status (D1): a newer intent that
-// failed or was skipped still supersedes it. Otherwise a QUEUED job is
-// appended and its ID returned.
+// Enqueue records a delivery. A delivery whose ID or payload was already seen
+// is a replay and changes nothing. A delivery is stale when any job of the
+// same environment has a Seq at or above it, whatever that job's status
+// (D1): a newer intent that failed or was skipped still supersedes it.
+// Otherwise a QUEUED job is appended and its ID returned.
 func (s *Store) Enqueue(ctx context.Context, d Delivery) (Verdict, int64, error) {
 	if _, err := s.requireSwept(); err != nil {
 		return "", 0, err
 	}
-	if d.ID == "" || len(d.ID) > maxDeliveryIDLen || !validPreviewID(d.EnvID) || !validType(d.Type) || d.Seq <= 0 {
+	if !d.valid() {
 		return "", 0, ErrInvalidDelivery
 	}
 
@@ -185,7 +230,7 @@ func (s *Store) Enqueue(ctx context.Context, d Delivery) (Verdict, int64, error)
 	var jobID int64
 	err := s.inTx(ctx, "enqueue", func(tx *sql.Tx) error {
 		var seen int
-		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM deliveries WHERE delivery_id = ?`, d.ID).Scan(&seen); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM deliveries WHERE delivery_id = ? OR payload_sha256 = ?`, d.ID, d.PayloadSHA256).Scan(&seen); err != nil {
 			return fmt.Errorf("enqueue: replay check: %w", err)
 		}
 		if seen > 0 {
@@ -200,15 +245,17 @@ func (s *Store) Enqueue(ctx context.Context, d Delivery) (Verdict, int64, error)
 		if newer > 0 {
 			verdict = VerdictStale
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO deliveries (delivery_id, preview_id, seq, verdict) VALUES (?, ?, ?, ?)`,
-			d.ID, d.EnvID, d.Seq, string(verdict)); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO deliveries (delivery_id, payload_sha256, preview_id, seq, verdict) VALUES (?, ?, ?, ?, ?)`,
+			d.ID, d.PayloadSHA256, d.EnvID, d.Seq, string(verdict)); err != nil {
 			return fmt.Errorf("enqueue: record delivery: %w", err)
 		}
 		if verdict == VerdictStale {
 			return nil
 		}
-		res, err := tx.ExecContext(ctx, `INSERT INTO jobs (preview_id, type, seq, status) VALUES (?, ?, ?, 'QUEUED')`,
-			d.EnvID, string(d.Type), d.Seq)
+		res, err := tx.ExecContext(ctx, `
+			INSERT INTO jobs (preview_id, type, seq, status, repo, pr_number, commit_sha, clone_url)
+			VALUES (?, ?, ?, 'QUEUED', ?, ?, ?, ?)`,
+			d.EnvID, string(d.Type), d.Seq, d.Source.Repo, d.Source.PRNumber, d.Source.CommitSHA, d.Source.CloneURL)
 		if err != nil {
 			return fmt.Errorf("enqueue: insert job: %w", err)
 		}
@@ -236,7 +283,7 @@ func (s *Store) Acquire(ctx context.Context, now time.Time) (lease Lease, ok boo
 	}
 	err = s.inTx(ctx, "acquire", func(tx *sql.Tx) error {
 		row := tx.QueryRowContext(ctx, `
-			SELECT j.id, j.preview_id, j.type, j.seq FROM jobs j
+			SELECT j.id, j.preview_id, j.type, j.seq, j.attempts, j.repo, j.pr_number, j.commit_sha, j.clone_url FROM jobs j
 			WHERE j.status = 'QUEUED'
 			  AND j.not_before <= ?
 			  AND NOT EXISTS (SELECT 1 FROM jobs p WHERE p.preview_id = j.preview_id AND p.status = 'IN_PROGRESS')
@@ -244,7 +291,8 @@ func (s *Store) Acquire(ctx context.Context, now time.Time) (lease Lease, ok boo
 			ORDER BY j.id
 			LIMIT 1`, now.UnixMilli())
 		var typ string
-		switch err := row.Scan(&lease.JobID, &lease.EnvID, &typ, &lease.Seq); {
+		src := &lease.Source
+		switch err := row.Scan(&lease.JobID, &lease.EnvID, &typ, &lease.Seq, &lease.Attempts, &src.Repo, &src.PRNumber, &src.CommitSHA, &src.CloneURL); {
 		case errors.Is(err, sql.ErrNoRows):
 			return nil
 		case err != nil:
@@ -440,7 +488,9 @@ func rearm(ctx context.Context, tx *sql.Tx, kept map[string]bool) error {
 
 // Jobs returns every job, oldest first.
 func (s *Store) Jobs(ctx context.Context) (jobs []Job, err error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, preview_id, type, seq, status, attempts, not_before, lease_epoch FROM jobs ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, preview_id, type, seq, status, attempts, not_before, lease_epoch, repo, pr_number, commit_sha, clone_url
+		FROM jobs ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list jobs: %w", err)
 	}
@@ -452,7 +502,9 @@ func (s *Store) Jobs(ctx context.Context) (jobs []Job, err error) {
 	for rows.Next() {
 		var j Job
 		var typ, status string
-		if err := rows.Scan(&j.ID, &j.EnvID, &typ, &j.Seq, &status, &j.Attempts, &j.NotBefore, &j.LeaseEpoch); err != nil {
+		src := &j.Source
+		if err := rows.Scan(&j.ID, &j.EnvID, &typ, &j.Seq, &status, &j.Attempts, &j.NotBefore, &j.LeaseEpoch,
+			&src.Repo, &src.PRNumber, &src.CommitSHA, &src.CloneURL); err != nil {
 			return nil, fmt.Errorf("scan job: %w", err)
 		}
 		j.Type, j.Status = JobType(typ), JobStatus(status)

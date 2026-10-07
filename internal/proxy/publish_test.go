@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -129,14 +130,15 @@ type recordedFile struct {
 	name string
 }
 
-func (f recordedFile) Name() string                { return f.name }
-func (f recordedFile) Write(b []byte) (int, error) { return len(b), f.r.step("write") }
-func (f recordedFile) Chmod(fs.FileMode) error     { return f.r.step("chmod") }
-func (f recordedFile) Sync() error                 { return f.r.step("fsync-file") }
-func (f recordedFile) Close() error                { return f.r.step("close") }
-func (r *recorder) Rename(string, string) error    { return r.step("rename") }
-func (r *recorder) Remove(name string) error       { return r.step("remove " + filepath.Base(name)) }
-func (r *recorder) SyncDir(string) error           { return r.step("fsync-dir") }
+func (f recordedFile) Name() string                       { return f.name }
+func (f recordedFile) Write(b []byte) (int, error)        { return len(b), f.r.step("write") }
+func (f recordedFile) Chmod(fs.FileMode) error            { return f.r.step("chmod") }
+func (f recordedFile) Sync() error                        { return f.r.step("fsync-file") }
+func (f recordedFile) Close() error                       { return f.r.step("close") }
+func (r *recorder) Rename(string, string) error           { return r.step("rename") }
+func (r *recorder) Remove(name string) error              { return r.step("remove " + filepath.Base(name)) }
+func (r *recorder) SyncDir(string) error                  { return r.step("fsync-dir") }
+func (r *recorder) ReadDir(string) ([]fs.DirEntry, error) { return nil, r.step("readdir") }
 func (r *recorder) CreateTemp(dir, pattern string) (tempFile, error) {
 	r.created = filepath.Join(dir, strings.Replace(pattern, "*", "123", 1))
 	return recordedFile{r: r, name: r.created}, r.step("create")
@@ -216,5 +218,82 @@ func TestNewPublisherRefusesBadDirs(t *testing.T) {
 		if _, err := NewPublisher(dir); err == nil {
 			t.Errorf("NewPublisher accepted %q", dir)
 		}
+	}
+}
+
+// Inventory keeps route documents of valid environments and removes every
+// other file Traefik could load, including crash debris; a non-regular entry
+// refuses the inventory.
+func TestInventoryCollectsOrphans(t *testing.T) {
+	dir := t.TempDir()
+	p, err := NewPublisher(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := netip.MustParseAddrPort("172.31.0.2:8080")
+	for _, env := range []string{"pr-1-0a0a0a0a0a", "pr-2-0b0b0b0b0b"} {
+		if err := p.Publish(Route{EnvID: env, Domain: "local.previewd", Backend: backend}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files := map[string]string{
+		".pr-3-0c0c0c0c0c.yml.tmp-123": "partial",  // interrupted Publish
+		"injected.yml":                 "http: {}", // foreign route document
+		"Pr-4-0d0d0d0d0d.yml":          "http: {}", // not a valid environment ID
+		"pr-5-0e0e0e0e0e.yaml":         "http: {}", // other extension Traefik loads
+		"middlewares.toml":             "",
+		".hidden.yml":                  "",
+		"README":                       "kept: Traefik ignores it",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	routes, removed, err := p.Inventory()
+	if err != nil {
+		t.Fatalf("Inventory: %v", err)
+	}
+	slices.Sort(routes)
+	slices.Sort(removed)
+	if want := []string{"pr-1-0a0a0a0a0a", "pr-2-0b0b0b0b0b"}; !slices.Equal(routes, want) {
+		t.Fatalf("routes = %v, want %v", routes, want)
+	}
+	wantRemoved := []string{".hidden.yml", ".pr-3-0c0c0c0c0c.yml.tmp-123", "Pr-4-0d0d0d0d0d.yml", "injected.yml", "middlewares.toml", "pr-5-0e0e0e0e0e.yaml"}
+	if !slices.Equal(removed, wantRemoved) {
+		t.Fatalf("removed = %v, want %v", removed, wantRemoved)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var left []string
+	for _, e := range entries {
+		left = append(left, e.Name())
+	}
+	if want := []string{"README", "pr-1-0a0a0a0a0a.yml", "pr-2-0b0b0b0b0b.yml"}; !slices.Equal(left, want) {
+		t.Fatalf("left on disk = %v, want %v", left, want)
+	}
+}
+
+func TestInventoryRefusesNonRegularEntries(t *testing.T) {
+	for name, mk := range map[string]func(dir string) error{
+		"directory": func(dir string) error { return os.Mkdir(filepath.Join(dir, "nested"), 0o755) },
+		"symlink":   func(dir string) error { return os.Symlink("/etc/passwd", filepath.Join(dir, "pr-1-0a0a0a0a0a.yml")) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := mk(dir); err != nil {
+				t.Fatal(err)
+			}
+			p, err := NewPublisher(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if routes, _, err := p.Inventory(); err == nil {
+				t.Fatalf("Inventory accepted a %s (routes %v)", name, routes)
+			}
+		})
 	}
 }

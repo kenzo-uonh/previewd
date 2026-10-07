@@ -66,12 +66,10 @@ func TestJobStoreConcurrentTransactionsNeverBusy(t *testing.T) {
 			for i := range opsEach {
 				switch (g + i) % 3 {
 				case 0:
-					d := Delivery{
-						ID:    fmt.Sprintf("w%d-%d", g, i),
-						EnvID: fmt.Sprintf("pr-%d-0a0a0a0a0a", (g*7+i)%envCount),
-						Type:  []JobType{JobDeploy, JobTeardown}[(g+i)%2],
-						Seq:   seq.Add(1),
-					}
+					d := testDelivery(fmt.Sprintf("w%d-%d", g, i),
+						fmt.Sprintf("pr-%d-0a0a0a0a0a", (g*7+i)%envCount),
+						[]JobType{JobDeploy, JobTeardown}[(g+i)%2],
+						seq.Add(1))
 					if _, _, err := s.Enqueue(ctx, d); err != nil {
 						record(fmt.Errorf("enqueue: %w", err))
 					}

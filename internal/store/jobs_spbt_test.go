@@ -4,8 +4,9 @@ package store
 // docs/specs/formal_verification_plan.md).
 //
 // The reference model below is written from docs/formal/previewd.tla, not
-// from jobs.go: ReceiveWebhook with the D1 stale rule, AcquireJob,
-// ExecuteDeploy -> StartContainer -> CommitDeploy, ExecuteTeardown ->
+// from jobs.go: ReceiveWebhook with replay protection (delivery ID and
+// payload) and the D1 stale rule, AcquireJob, ExecuteDeploy ->
+// StartContainer -> PublishRoute -> CommitDeploy, ExecuteTeardown ->
 // CommitTeardown with requeue, SimulateCrash (daemon crash or host reboot)
 // followed by StartupSweep (D2, D3). The test plays the reconciler: it drives
 // the real Store on a real SQLite file (modernc, WAL) and a mocked Docker
@@ -43,14 +44,20 @@ func isBusy(err error) bool {
 	return errors.As(err, &se) && se.Code()&0xff == sqlite3.SQLITE_BUSY
 }
 
-// fakeEnv is the mocked Docker host's view of one environment.
+// fakeEnv is the mocked host's view of one environment: Docker resources,
+// staged secrets, route document.
 type fakeEnv struct {
-	Running, NetworkBound, SecretsMounted bool
-	JobID                                 int64 // builder; 0 for a stray
+	Running, NetworkBound, SecretsMounted, Routed bool
+	JobID                                         int64 // builder; 0 for a stray
 }
 
-func (f fakeEnv) exists() bool { return f.Running || f.NetworkBound || f.SecretsMounted }
-func (f fakeEnv) intact() bool { return f.Running && f.NetworkBound && f.SecretsMounted }
+func (f fakeEnv) exists() bool {
+	return f.Running || f.NetworkBound || f.SecretsMounted || f.Routed
+}
+
+func (f fakeEnv) intact() bool {
+	return f.Running && f.NetworkBound && f.SecretsMounted && f.Routed
+}
 
 type step int
 
@@ -58,6 +65,7 @@ const (
 	stepIdle step = iota
 	stepExecuteDeploy
 	stepStartContainer
+	stepPublishRoute
 	stepCommitDeploy
 	stepExecuteTeardown
 	stepCommitTeardown
@@ -73,6 +81,8 @@ type modelDelivery struct {
 	Seq     int64
 	Verdict Verdict
 	Type    JobType
+	Payload string
+	Source  Source
 }
 
 type previewdMachine struct {
@@ -86,6 +96,7 @@ type previewdMachine struct {
 	// Reference model.
 	jobs       []Job // index = ID-1
 	deliveries map[string]modelDelivery
+	payloads   map[string]bool
 	epoch      int64
 
 	// Mocked reconciler backend.
@@ -116,13 +127,14 @@ func newPreviewdMachine(t *rapid.T, base string) *previewdMachine {
 		path:       dir + "/previewd.sqlite",
 		now:        time.UnixMilli(1_800_000_000_000),
 		deliveries: map[string]modelDelivery{},
+		payloads:   map[string]bool{},
 		host:       map[string]fakeEnv{},
 	}
 	// Init: each environment may hold a leftover from an earlier install
 	// that no job tracks.
 	for _, e := range spbtEnvs {
 		if rapid.Bool().Draw(t, "stray "+e) {
-			m.host[e] = fakeEnv{Running: true, NetworkBound: true, SecretsMounted: true}
+			m.host[e] = fakeEnv{Running: true, NetworkBound: true, SecretsMounted: true, Routed: true}
 		}
 	}
 	m.boot(t)
@@ -153,7 +165,7 @@ func (m *previewdMachine) boot(t *rapid.T) {
 	var observed []Observation
 	for _, e := range slices.Sorted(maps.Keys(m.host)) {
 		h := m.host[e]
-		observed = append(observed, Observation{EnvID: e, Running: h.Running, NetworkBound: h.NetworkBound, SecretsMounted: h.SecretsMounted, JobID: h.JobID})
+		observed = append(observed, Observation{EnvID: e, Running: h.Running, NetworkBound: h.NetworkBound, SecretsMounted: h.SecretsMounted, Routed: h.Routed, JobID: h.JobID})
 	}
 	got, err := s.StartupSweep(m.ctx, m.now, observed)
 	m.must(t, err, "startup sweep")
@@ -231,14 +243,41 @@ func (m *previewdMachine) modelLatest() map[string]int64 {
 // ReceiveWebhook: a fresh delivery, possibly out of order.
 func (m *previewdMachine) ReceiveWebhook(t *rapid.T) {
 	m.nextID++
-	d := Delivery{
-		ID:    fmt.Sprintf("d-%04d", m.nextID),
-		EnvID: rapid.SampledFrom(spbtEnvs).Draw(t, "env"),
-		Type:  rapid.SampledFrom([]JobType{JobDeploy, JobTeardown}).Draw(t, "type"),
-		Seq:   rapid.Int64Range(1, spbtMaxSeq).Draw(t, "seq"),
+	id := fmt.Sprintf("d-%04d", m.nextID)
+	d := testDelivery(id,
+		rapid.SampledFrom(spbtEnvs).Draw(t, "env"),
+		rapid.SampledFrom([]JobType{JobDeploy, JobTeardown}).Draw(t, "type"),
+		rapid.Int64Range(1, spbtMaxSeq).Draw(t, "seq"))
+	d.Source.PRNumber = rapid.Int64Range(1, 9).Draw(t, "pr")
+	d.Source.CommitSHA = fmt.Sprintf("%040x", rapid.Uint64().Draw(t, "commit"))
+	m.receive(t, d)
+}
+
+// ForgedRedelivery: a captured body resent under a new delivery ID and a
+// later timestamp (the header is unsigned). Replay protection by payload
+// drops it.
+func (m *previewdMachine) ForgedRedelivery(t *rapid.T) {
+	if len(m.deliveries) == 0 {
+		t.Skip("no delivery yet")
 	}
+	orig := m.deliveries[rapid.SampledFrom(slices.Sorted(maps.Keys(m.deliveries))).Draw(t, "captured")]
+	m.nextID++
+	m.receive(t, Delivery{
+		ID: fmt.Sprintf("d-%04d", m.nextID), PayloadSHA256: orig.Payload, EnvID: orig.EnvID,
+		Type: orig.Type, Seq: spbtMaxSeq + 1, Source: orig.Source,
+	})
+}
+
+func (m *previewdMachine) receive(t *rapid.T, d Delivery) {
 	verdict, jobID, err := m.store.Enqueue(m.ctx, d)
 	m.must(t, err, "enqueue")
+
+	if _, seen := m.deliveries[d.ID]; seen || m.payloads[d.PayloadSHA256] {
+		if verdict != VerdictReplay || jobID != 0 {
+			t.Fatalf("replayed delivery %+v = %s/%d, want replay", d, verdict, jobID)
+		}
+		return
+	}
 
 	want, wantID := VerdictAccepted, int64(0)
 	for _, j := range m.jobs {
@@ -248,9 +287,10 @@ func (m *previewdMachine) ReceiveWebhook(t *rapid.T) {
 	}
 	if want == VerdictAccepted {
 		wantID = int64(len(m.jobs) + 1)
-		m.jobs = append(m.jobs, Job{ID: wantID, EnvID: d.EnvID, Type: d.Type, Seq: d.Seq, Status: StatusQueued})
+		m.jobs = append(m.jobs, Job{ID: wantID, EnvID: d.EnvID, Type: d.Type, Seq: d.Seq, Status: StatusQueued, Source: d.Source})
 	}
-	m.deliveries[d.ID] = modelDelivery{EnvID: d.EnvID, Seq: d.Seq, Verdict: want, Type: d.Type}
+	m.deliveries[d.ID] = modelDelivery{EnvID: d.EnvID, Seq: d.Seq, Verdict: want, Type: d.Type, Payload: d.PayloadSHA256, Source: d.Source}
+	m.payloads[d.PayloadSHA256] = true
 	if verdict != want || jobID != wantID {
 		t.Fatalf("enqueue %+v = %s/%d, model %s/%d", d, verdict, jobID, want, wantID)
 	}
@@ -263,7 +303,7 @@ func (m *previewdMachine) Redeliver(t *rapid.T) {
 	}
 	id := rapid.SampledFrom(slices.Sorted(maps.Keys(m.deliveries))).Draw(t, "delivery")
 	d := m.deliveries[id]
-	verdict, jobID, err := m.store.Enqueue(m.ctx, Delivery{ID: id, EnvID: d.EnvID, Type: d.Type, Seq: d.Seq})
+	verdict, jobID, err := m.store.Enqueue(m.ctx, Delivery{ID: id, PayloadSHA256: d.Payload, EnvID: d.EnvID, Type: d.Type, Seq: d.Seq, Source: d.Source})
 	m.must(t, err, "redeliver")
 	if verdict != VerdictReplay || jobID != 0 {
 		t.Fatalf("redelivery of %s = %s/%d, want replay", id, verdict, jobID)
@@ -293,7 +333,8 @@ func (m *previewdMachine) acquire(t *rapid.T, w int) bool {
 		t.Fatalf("acquire leased job %d, model leases %d", lease.JobID, wantID)
 	}
 	target := m.jobs[wantID-1]
-	if lease.EnvID != target.EnvID || lease.Type != target.Type || lease.Seq != target.Seq || lease.Epoch != m.epoch {
+	if lease.EnvID != target.EnvID || lease.Type != target.Type || lease.Seq != target.Seq || lease.Epoch != m.epoch ||
+		lease.Attempts != target.Attempts || lease.Source != target.Source {
 		t.Fatalf("lease %+v does not match model job %+v at epoch %d", lease, target, m.epoch)
 	}
 	// SafetyMonotonicStep: newer than every executed job of the environment.
@@ -373,6 +414,15 @@ func (m *previewdMachine) step(t *rapid.T, w int, ok bool) {
 		}
 		h := m.host[l.EnvID]
 		h.Running = true
+		m.host[l.EnvID] = h
+		wk.next = stepPublishRoute
+	case stepPublishRoute:
+		if !ok {
+			m.failDeploy(t, w)
+			return
+		}
+		h := m.host[l.EnvID]
+		h.Routed = true
 		m.host[l.EnvID] = h
 		wk.next = stepCommitDeploy
 	case stepCommitDeploy:
@@ -521,8 +571,12 @@ func (m *previewdMachine) Check(t *rapid.T) {
 		if !h.exists() {
 			continue
 		}
-		// 4. No orphaned resources: the builder is IN_PROGRESS or SUCCESS
-		// and no newer teardown succeeded.
+		// A route document never points at a container that is not running.
+		if h.Routed && !h.Running {
+			t.Fatalf("%s has a route document but no running container", e)
+		}
+		// 4. No orphaned resources (route documents included): the builder
+		// is IN_PROGRESS or SUCCESS and no newer teardown succeeded.
 		if h.JobID == 0 || h.JobID > int64(len(jobs)) {
 			t.Fatalf("%s exists on the host but no job built it", e)
 		}
@@ -560,14 +614,14 @@ func (m *previewdMachine) Check(t *rapid.T) {
 }
 
 func (m *previewdMachine) checkDeliveries(t *rapid.T) {
-	rows, err := m.store.db.QueryContext(m.ctx, `SELECT delivery_id, preview_id, seq, verdict FROM deliveries ORDER BY delivery_id`)
+	rows, err := m.store.db.QueryContext(m.ctx, `SELECT delivery_id, preview_id, seq, verdict, payload_sha256 FROM deliveries ORDER BY delivery_id`)
 	m.must(t, err, "list deliveries")
 	got := map[string]modelDelivery{}
 	for rows.Next() {
-		var id, env, verdict string
+		var id, env, verdict, payload string
 		var seq int64
-		m.must(t, rows.Scan(&id, &env, &seq, &verdict), "scan delivery")
-		got[id] = modelDelivery{EnvID: env, Seq: seq, Verdict: Verdict(verdict)}
+		m.must(t, rows.Scan(&id, &env, &seq, &verdict, &payload), "scan delivery")
+		got[id] = modelDelivery{EnvID: env, Seq: seq, Verdict: Verdict(verdict), Payload: payload}
 	}
 	m.must(t, rows.Err(), "list deliveries")
 	m.must(t, rows.Close(), "close deliveries")
@@ -576,7 +630,7 @@ func (m *previewdMachine) checkDeliveries(t *rapid.T) {
 	}
 	for id, d := range m.deliveries {
 		g, ok := got[id]
-		if !ok || g.EnvID != d.EnvID || g.Seq != d.Seq || g.Verdict != d.Verdict {
+		if !ok || g.EnvID != d.EnvID || g.Seq != d.Seq || g.Verdict != d.Verdict || g.Payload != d.Payload {
 			t.Fatalf("delivery %s = %+v, model %+v", id, g, d)
 		}
 	}
@@ -633,6 +687,7 @@ func weightedActions(m *previewdMachine) map[string]func(*rapid.T) {
 		actions[fmt.Sprintf("Step#%d", i+2)] = m.Step
 	}
 	actions["AcquireJob#2"] = m.AcquireJob
+	actions["Step#4"] = m.Step
 	actions["ReceiveWebhook#2"] = m.ReceiveWebhook
 	return actions
 }

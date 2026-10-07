@@ -26,8 +26,14 @@ func TestContainerSpecMountsSecretsReadOnlyWithoutEnv(t *testing.T) {
 	if len(cfg.Env) != 0 {
 		t.Fatalf("container env must be empty, got %q", cfg.Env)
 	}
-	if len(cfg.Labels) != 0 {
-		t.Fatalf("routing goes through route documents, never labels; got %v", cfg.Labels)
+	// Ownership labels only: routing goes through route documents.
+	if len(cfg.Labels) != 2 || cfg.Labels[LabelEnv] != env.ID || cfg.Labels[LabelJob] != "0" {
+		t.Fatalf("labels = %v, want exactly the ownership labels", cfg.Labels)
+	}
+	for k := range cfg.Labels {
+		if strings.HasPrefix(strings.ToLower(k), "traefik") {
+			t.Fatalf("routing label %q", k)
+		}
 	}
 	if hostCfg.NetworkMode != container.NetworkMode(networkName(env.ID)) {
 		t.Fatalf("network mode = %q, want the environment's internal network only", hostCfg.NetworkMode)
@@ -123,6 +129,7 @@ type fakeStager struct {
 }
 
 func (f fakeStager) Stage(string, map[string]string) (string, error) { return "", nil }
+func (f fakeStager) List() ([]string, error)                         { return nil, nil }
 
 func (f fakeStager) Remove(string) error {
 	*f.calls = append(*f.calls, "remove-secrets")
@@ -134,7 +141,8 @@ type fakeRoutes struct {
 	calls     *[]string
 }
 
-func (f fakeRoutes) Publish(proxy.Route) error { return nil }
+func (f fakeRoutes) Publish(proxy.Route) error                        { return nil }
+func (f fakeRoutes) Inventory() (routes, removed []string, err error) { return nil, nil, nil }
 
 func (f fakeRoutes) Remove(string) error {
 	*f.calls = append(*f.calls, "remove-route")

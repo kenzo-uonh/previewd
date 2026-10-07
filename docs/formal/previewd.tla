@@ -36,6 +36,15 @@
 (*   D5 Safety 2 checks the prose rule. The plan's formula requires the    *)
 (*      latest job to be IN_PROGRESS/SUCCESS, which a QUEUED redeploy in   *)
 (*      front of a running environment violates in normal operation.       *)
+(*                                                                         *)
+(* Route documents are part of an environment (route_published): written  *)
+(* by PublishRoute after the container starts, removed with it, and kept   *)
+(* by the sweep only for an intact environment the database keeps. A       *)
+(* route document anywhere else is an orphan the sweep destroys.          *)
+(*                                                                         *)
+(* Not modeled: payload identity. A body resent under a new (unsigned)     *)
+(* delivery ID is refused by the store's payload hash (jobs.go, tested by  *)
+(* the SPBT); here a delivery is identified by its ts.                     *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets, TLC
 
@@ -66,20 +75,22 @@ ASSUME MaxCrashes \in Nat /\ MaxFaults \in Nat
 ASSUME SecretChannel \in SecretChannels
 
 EnvRecords == [state: {"absent", "running"}, network_bound: BOOLEAN,
-               secrets_mounted: BOOLEAN, secrets_persisted_to_disk: BOOLEAN,
-               deployed_ts: 0..MaxWebhooks]
+               secrets_mounted: BOOLEAN, route_published: BOOLEAN,
+               secrets_persisted_to_disk: BOOLEAN, deployed_ts: 0..MaxWebhooks]
 
 Absent == [state |-> "absent", network_bound |-> FALSE, secrets_mounted |-> FALSE,
-           secrets_persisted_to_disk |-> FALSE, deployed_ts |-> 0]
+           route_published |-> FALSE, secrets_persisted_to_disk |-> FALSE,
+           deployed_ts |-> 0]
 
 \* Leftover from an earlier run whose state was lost: previewd owns it
 \* (naming, labels) but no job tracks it. The sweep must remove it.
 Stray == [Absent EXCEPT !.state = "running", !.network_bound = TRUE,
-                        !.secrets_mounted = TRUE]
+                        !.secrets_mounted = TRUE, !.route_published = TRUE]
 
 \* Disk contamination is irreversible: destroying the container keeps it.
 Destroyed(r) == [r EXCEPT !.state = "absent", !.network_bound = FALSE,
-                          !.secrets_mounted = FALSE, !.deployed_ts = 0]
+                          !.secrets_mounted = FALSE, !.route_published = FALSE,
+                          !.deployed_ts = 0]
 
 (*--algorithm previewd
 
@@ -122,10 +133,12 @@ define
     Exists(e) == \/ environments[e].state = "running"
                  \/ environments[e].network_bound
                  \/ environments[e].secrets_mounted
+                 \/ environments[e].route_published
 
     Intact(e) == /\ environments[e].state = "running"
                  /\ environments[e].network_bound
                  /\ environments[e].secrets_mounted
+                 /\ environments[e].route_published
 
     \* The deploy job whose ts the environment carries (empty for a stray).
     Builder(e) == {j \in JobsOf(e) : /\ db_jobs[j].type = "deploy"
@@ -179,8 +192,9 @@ define
 
     (***********************************************************************)
     (* Safety 2: No Orphaned Resources (D5). Once the sweep has run, every *)
-    (* container, network or staged secret belongs to the deploy job whose *)
-    (* ts it carries; that job is IN_PROGRESS or SUCCESS, and no newer     *)
+    (* container, network, staged secret or route document belongs to the *)
+    (* deploy job whose ts it carries; that job is IN_PROGRESS or SUCCESS, *)
+    (* and no newer                                                        *)
     (* teardown has succeeded. Before the sweep, leftovers may exist: the  *)
     (* sweep is the control that removes them.                             *)
     (***********************************************************************)
@@ -218,6 +232,11 @@ define
     (***********************************************************************)
     SafetyUniqueDelivery ==
         \A j, k \in DOMAIN db_jobs : j # k => db_jobs[j].ts # db_jobs[k].ts
+
+    \* A route document never points at a container that is not running.
+    SafetyRouteImpliesRunning ==
+        \A e \in EnvIDs :
+            environments[e].route_published => environments[e].state = "running"
 
     SafetyOneJobPerEnv ==
         \A e \in EnvIDs :
@@ -299,7 +318,7 @@ ExecuteDeploy:
                 \* network, build, stage secrets on ramfs.
                 environments[e] :=
                     [state |-> "absent", network_bound |-> TRUE,
-                     secrets_mounted |-> TRUE,
+                     secrets_mounted |-> TRUE, route_published |-> FALSE,
                      secrets_persisted_to_disk |->
                          environments[e].secrets_persisted_to_disk
                          \/ SecretChannel \in DiskBackedChannels,
@@ -325,6 +344,25 @@ StartContainer:
                 \* Secrets reach the container only through the read-only
                 \* bind of the ramfs staging directory, never through Env.
                 environments[e].state := "running";
+                goto PublishRoute;
+            or
+                environments[e] := Destroyed(environments[e]);
+                db_jobs[job].status := "FAILED";
+                job := 0;
+                goto AcquireJob;
+            end either;
+        end with;
+    end if;
+
+PublishRoute:
+    if epoch # crashes then
+        job := 0;
+        goto AcquireJob;
+    else
+        with e = db_jobs[job].env_id do
+            either
+                \* Write the route document atomically (temp file, rename).
+                environments[e].route_published := TRUE;
                 goto CommitDeploy;
             or
                 environments[e] := Destroyed(environments[e]);
@@ -446,10 +484,12 @@ EventAt(ts) == webhooks[CHOOSE i \in DOMAIN webhooks : webhooks[i].ts = ts]
 Exists(e) == \/ environments[e].state = "running"
              \/ environments[e].network_bound
              \/ environments[e].secrets_mounted
+             \/ environments[e].route_published
 
 Intact(e) == /\ environments[e].state = "running"
              /\ environments[e].network_bound
              /\ environments[e].secrets_mounted
+             /\ environments[e].route_published
 
 
 Builder(e) == {j \in JobsOf(e) : /\ db_jobs[j].type = "deploy"
@@ -508,6 +548,7 @@ SafetyZeroSecretLeakage ==
 
 
 
+
 Owned(e) ==
     \E j \in Builder(e) :
         /\ db_jobs[j].status \in {"IN_PROGRESS", "SUCCESS"}
@@ -542,6 +583,11 @@ SafetyMonotonicity ==
 
 SafetyUniqueDelivery ==
     \A j, k \in DOMAIN db_jobs : j # k => db_jobs[j].ts # db_jobs[k].ts
+
+
+SafetyRouteImpliesRunning ==
+    \A e \in EnvIDs :
+        environments[e].route_published => environments[e].state = "running"
 
 SafetyOneJobPerEnv ==
     \A e \in EnvIDs :
@@ -625,7 +671,7 @@ ExecuteDeploy(self) == /\ pc[self] = "ExecuteDeploy"
                                   /\ UNCHANGED << db_jobs, environments >>
                              ELSE /\ LET e == db_jobs[job[self]].env_id IN
                                        \/ /\ environments' = [environments EXCEPT ![e] = [state |-> "absent", network_bound |-> TRUE,
-                                                                                          secrets_mounted |-> TRUE,
+                                                                                          secrets_mounted |-> TRUE, route_published |-> FALSE,
                                                                                           secrets_persisted_to_disk |->
                                                                                               environments[e].secrets_persisted_to_disk
                                                                                               \/ SecretChannel \in DiskBackedChannels,
@@ -646,7 +692,7 @@ StartContainer(self) == /\ pc[self] = "StartContainer"
                                    /\ UNCHANGED << db_jobs, environments >>
                               ELSE /\ LET e == db_jobs[job[self]].env_id IN
                                         \/ /\ environments' = [environments EXCEPT ![e].state = "running"]
-                                           /\ pc' = [pc EXCEPT ![self] = "CommitDeploy"]
+                                           /\ pc' = [pc EXCEPT ![self] = "PublishRoute"]
                                            /\ UNCHANGED <<db_jobs, job>>
                                         \/ /\ environments' = [environments EXCEPT ![e] = Destroyed(environments[e])]
                                            /\ db_jobs' = [db_jobs EXCEPT ![job[self]].status = "FAILED"]
@@ -654,6 +700,21 @@ StartContainer(self) == /\ pc[self] = "StartContainer"
                                            /\ pc' = [pc EXCEPT ![self] = "AcquireJob"]
                         /\ UNCHANGED << webhooks, daemon, crashes, faults, 
                                         epoch >>
+
+PublishRoute(self) == /\ pc[self] = "PublishRoute"
+                      /\ IF epoch[self] # crashes
+                            THEN /\ job' = [job EXCEPT ![self] = 0]
+                                 /\ pc' = [pc EXCEPT ![self] = "AcquireJob"]
+                                 /\ UNCHANGED << db_jobs, environments >>
+                            ELSE /\ LET e == db_jobs[job[self]].env_id IN
+                                      \/ /\ environments' = [environments EXCEPT ![e].route_published = TRUE]
+                                         /\ pc' = [pc EXCEPT ![self] = "CommitDeploy"]
+                                         /\ UNCHANGED <<db_jobs, job>>
+                                      \/ /\ environments' = [environments EXCEPT ![e] = Destroyed(environments[e])]
+                                         /\ db_jobs' = [db_jobs EXCEPT ![job[self]].status = "FAILED"]
+                                         /\ job' = [job EXCEPT ![self] = 0]
+                                         /\ pc' = [pc EXCEPT ![self] = "AcquireJob"]
+                      /\ UNCHANGED << webhooks, daemon, crashes, faults, epoch >>
 
 CommitDeploy(self) == /\ pc[self] = "CommitDeploy"
                       /\ IF epoch[self] # crashes
@@ -696,8 +757,9 @@ CommitTeardown(self) == /\ pc[self] = "CommitTeardown"
                                         crashes, faults, epoch >>
 
 Worker(self) == AcquireJob(self) \/ ExecuteDeploy(self)
-                   \/ StartContainer(self) \/ CommitDeploy(self)
-                   \/ ExecuteTeardown(self) \/ CommitTeardown(self)
+                   \/ StartContainer(self) \/ PublishRoute(self)
+                   \/ CommitDeploy(self) \/ ExecuteTeardown(self)
+                   \/ CommitTeardown(self)
 
 StartupSweep == /\ pc["supervisor"] = "StartupSweep"
                 /\ daemon = "down"

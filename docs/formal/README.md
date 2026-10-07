@@ -8,7 +8,7 @@ GitHub ──signed delivery──▶ Api ──1 tx──▶ db_jobs (SQLite) �
                        Supervisor: StartupSweep at every start   Chaos: SimulateCrash (daemon crash / host reboot)
 ```
 
-It is the reference for Phase 3: `internal/store/jobs.go` implements its transitions and `TestJobStore_StateMachine` checks the implementation against it after every command (`docs/specs/phase3_spbt_architecture.md`). The shipped code still queues in memory (`orchestrator.WorkerPool`) and tears down inside the webhook handler, so the model describes the design, not the current binary.
+The daemon implements it: `internal/store/jobs.go` (queue transitions) and `internal/orchestrator/reconciler.go` (workers and startup sweep). `TestJobStore_StateMachine` checks the queue against the model after every command (`docs/specs/phase3_spbt_architecture.md`).
 
 ## Files
 
@@ -39,11 +39,12 @@ java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers auto -config preview
 | Property | Kind | Meaning |
 |---|---|---|
 | `SafetyZeroSecretLeakage` | invariant | No environment's secret bytes ever reach a block device |
-| `SafetyNoOrphanedResources` | invariant | After the sweep, every container, network or staged secret belongs to an `IN_PROGRESS`/`SUCCESS` deploy that no newer teardown has undone |
+| `SafetyNoOrphanedResources` | invariant | After the sweep, every container, network, staged secret or route document belongs to an `IN_PROGRESS`/`SUCCESS` deploy that no newer teardown has undone |
 | `SafetyMonotonicity` | invariant | No older intent is pending or running once a newer one has executed; a running environment is never older than a completed intent |
 | `SafetyMonotonicStep` | action | A job becomes `IN_PROGRESS` only if it is newer than every executed job of its environment |
 | `SafetyUniqueDelivery` | invariant | One job per delivery (replay protection) |
 | `SafetyOneJobPerEnv` | invariant | At most one `IN_PROGRESS` job per environment |
+| `SafetyRouteImpliesRunning` | invariant | A route document never points at a container that is not running |
 | `SafetyLeases` | invariant | A current-epoch lease points at an `IN_PROGRESS` job and is never shared |
 | `TypeOK` | invariant | Types and bounds |
 | `LivenessEventualCompletion` | liveness | Every `QUEUED` job reaches `SUCCESS`, `FAILED` or `SKIPPED` |
@@ -55,10 +56,12 @@ The initial state lets each environment hold a stray (container, network, staged
 
 | Config | Distinct states | Depth | Result |
 |---|---|---|---|
-| `previewd.cfg` (1 worker) | 548,975 | 22 | no error |
-| `previewd-workers.cfg` (2 workers) | 2,253,617 | 24 | no error |
+| `previewd.cfg` (1 worker) | 634,821 | 24 | no error (1 min 37 s) |
+| `previewd-workers.cfg` (2 workers) | 2,779,645 | 26 | no error (10 min 44 s) |
 
-`-coverage` on `previewd.cfg`: every action (`ReceiveWebhook`, `AcquireJob`, `ExecuteDeploy`, `StartContainer`, `CommitDeploy`, `ExecuteTeardown`, `CommitTeardown`, `StartupSweep`, `SimulateCrash`) produces new states, and no sub-expression is left unevaluated.
+Since the route documents were added (`route_published`, `PublishRoute`). Before: 548,975 / 2,253,617 states.
+
+`-coverage` on `previewd.cfg`: every action (`ReceiveWebhook`, `AcquireJob`, `ExecuteDeploy`, `StartContainer`, `PublishRoute`, `CommitDeploy`, `ExecuteTeardown`, `CommitTeardown`, `StartupSweep`, `SimulateCrash`) produces new states, and no sub-expression is left unevaluated.
 
 ## Mutation check
 
@@ -78,6 +81,9 @@ Each mutant changes one rule in the translated model. TLC must reject it. Rows m
 | `AcquireJob` leaves older jobs `QUEUED` instead of `SKIPPED` | `SafetyMonotonicity` |
 | No per-environment lock (2 workers, 2 deliveries) | `SafetyMonotonicity` |
 | No replay protection | `SafetyUniqueDelivery` |
+| Destroy leaves the route document | `SafetyNoOrphanedResources` |
+| Route document written before the container starts | `SafetyRouteImpliesRunning` |
+| Sweep keeps an environment whose route document is missing | not killed: equivalent in the model, where only a full destroy removes a route. The case (route deleted by hand) is covered by `TestSweepRouteMustMatchEnvironment` and `TestStartupKeepsThenRebuildsDeployedEnvironment` |
 
 ## Not modeled
 

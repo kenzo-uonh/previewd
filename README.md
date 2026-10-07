@@ -32,7 +32,7 @@
 │   │   ├── docker.go              # Docker Driver implementation for the MVP.
 │   │   ├── engine.go              # Interface defining the Driver (Docker/Kubernetes).
 │   │   ├── environment.go         # EaaS lifecycle logic (Clone, Start, Stop, Destroy).
-│   │   └── queue.go               # Bounded worker pool for deployment concurrency.
+│   │   └── reconciler.go          # Startup sweep (inventory, destroy, route GC) and the deployment workers on the durable queue.
 │   ├── proxy/
 │   │   ├── route.go               # Traefik file-provider route documents (validated, JSON-as-YAML), the only routing path.
 │   │   └── publish.go             # Atomic publish: temp file, fsync, rename, fsync dir.
@@ -153,7 +153,7 @@ Operational parameters enforce hardware boundaries and are managed exclusively v
 * `PREVIEWD_TRAEFIK_DOMAIN`: Base routing domain for PR environments (default: local.previewd).
 
 
-* `PREVIEWD_MAX_BUILDS`: Strict concurrency limit for active deployment workers to prevent host CPU/RAM exhaustion (default: 2).
+* `PREVIEWD_MAX_BUILDS`: Number of reconciler workers, i.e. jobs (deploys and teardowns) run at once; one job per environment at a time regardless (default: 2).
 
 
 * `PREVIEWD_WEBHOOK_SECRET`: HMAC secret of the GitHub webhook. **Required.** The daemon refuses to start without it, and an empty secret accepts nothing. Every webhook must carry the exact `X-Hub-Signature-256` for its body (at most 1 MiB).
@@ -191,7 +191,7 @@ Secrets reach a preview container only as read-only files:
 
 1. At deploy, previewd writes each key to `$PREVIEWD_SECRETS_STAGING_DIR/<env-id>/<KEY>`. Directories are `0555` and files `0444`. Keys must match `[A-Za-z_][A-Za-z0-9_]*`, and a bad key refuses the job before anything is written.
 2. The container gets that directory at `/run/secrets` as a `bind` mount with `ReadOnly`, `rprivate` propagation and no recursion. Its config holds no secret, so `docker inspect` and the daemon's on-disk container state show only the host path.
-3. Teardown (PR closed) removes the container, then the staged directory, even when Docker teardown fails. A failed deploy removes its staging too.
+3. Teardown (PR closed) removes the route document, then the container, then the staged directory; each step runs even when an earlier one fails. A failed deploy removes its staging too, and the startup sweep removes staging no kept environment owns.
 
 The staging root lives in memory. Mount it before starting previewd:
 
@@ -208,6 +208,25 @@ ramfs is never swapped. A reboot discards it, together with every staged secret.
 1. **Signature:** the body is read up to 1 MiB (larger bodies get 413, never truncated). It must carry `X-Hub-Signature-256: sha256=<64 lowercase hex>`, equal to HMAC-SHA256 of the raw body under `PREVIEWD_WEBHOOK_SECRET`. Anything else gets 401.
 2. **Schema:** `pull_request` bodies need `action`, `number` (1 to 2^32-1), `pull_request.head.ref` (git ref rules), `pull_request.head.sha` (40 or 64 lowercase hex), `repository.full_name` (`owner/repo`) and `repository.clone_url` (absolute, no credentials), for every action, `closed` included. `opened`, `reopened`, `synchronize` and `closed` are acted on; other well-formed actions get 202 and are ignored.
 3. **Environment ID:** `pr-<number>-<10 hex of SHA-256(repo, head branch)>`. The same PR number in two repositories, or on two branches, never shares an environment.
+4. **Ordering:** `X-GitHub-Delivery` must be a canonical UUID version 1 (RFC 4122 variant). Its embedded timestamp, in 100-nanosecond intervals, orders the intents of one environment. Anything else gets 400, and so does a timestamp more than 5 minutes ahead of the host's clock. GitHub does not sign that header, and one forged far-future ID would otherwise make every later event of the environment stale. Ordering relies on the clock of the GitHub Enterprise Server that minted the IDs; keep it and the previewd host on NTP.
+5. **Queue:** one SQLite transaction records the delivery (`internal/store/jobs.go`). A delivery whose GUID or whose body (SHA-256) was already recorded is a duplicate (200). The body check matters because the header is unsigned, so a captured body resent under a new GUID is still refused. A delivery older than any job of its environment, whatever that job's status, is stale (202, nothing queued). Otherwise a job is queued (202) and a worker woken. `opened`, `reopened` and `synchronize` queue a deploy, `closed` a teardown.
+
+## Reconciliation
+
+Workers (`PREVIEWD_MAX_BUILDS`) take the newest queued job of an environment with no job in progress; older queued jobs of that environment are skipped.
+
+- **Deploy:** remove the previous version, fetch the commit, create the internal network, build, stage secrets, start the container, publish the route document, commit SUCCESS. Any failure removes everything and records FAILED.
+- **Teardown:** remove route, container, network, image and staging. A failure requeues it with backoff (1 s doubling to 5 min); a teardown never ends FAILED.
+
+At every start, before the API listens, the startup sweep runs:
+
+1. Inventory the host: containers and networks previewd owns (`previewd.env` label, or the environment name for resources created before labels), staging directories, route documents.
+2. Garbage-collect the routes directory. Crash debris from an interrupted write and any `.yml`, `.yaml` or `.toml` file that is not the route document of a valid environment ID are deleted. A directory or symlink there refuses the start.
+3. Sweep the queue against that inventory. An environment is kept only if it is complete (container running, network, staged secrets, route document) and built by the newest executed job, a SUCCESS deploy. An interrupted deploy becomes FAILED and an interrupted teardown is queued again. A latest SUCCESS deploy whose environment is gone (a reboot wiped its secrets, its route was lost) is queued again.
+4. Destroy everything else.
+5. Check that every remaining route document belongs to a kept environment.
+
+Any error refuses the start. A route document therefore exists only while the database records the environment as deployed.
 
 ## Formal Verification (Phase 1)
 
@@ -227,4 +246,4 @@ ramfs is never swapped. A reboot discards it, together with every staged secret.
 
 `make check` runs all of these deterministically (fixed rapid seed, fuzz seed corpora). `make verify` runs rapid at 10,000 checks with random seeds, plus each fuzz target for `FUZZTIME`. Namespace tests skip where unprivileged user namespaces are unavailable. `PREVIEWD_REQUIRE_NS_TESTS=1` and `PREVIEWD_REQUIRE_MLOCK_TEST=1` turn those skips into failures, and CI sets both.
 
-Phase 2 is a TLA+ model of the target queue design (webhook API, SQLite job queue, reconciler workers, startup sweep, daemon crash and host reboot) in `docs/formal/previewd.tla`. TLC checks zero secret leakage, no orphaned resources, monotonic ordering, eventual completion and eventual consistency. The shipped code still queues in memory; `docs/formal/README.md` has the results, the mutation table and how to run TLC offline.
+Phase 2 is a TLA+ model of the queue design (webhook API, SQLite job queue, reconciler workers, route documents, startup sweep, daemon crash and host reboot) in `docs/formal/previewd.tla`. TLC checks zero secret leakage, no orphaned resources (route documents included), routes only to running containers, monotonic ordering, eventual completion and eventual consistency. The daemon runs this design: `internal/store/jobs.go` and `internal/orchestrator/reconciler.go`. `docs/formal/README.md` has the results, the mutation table and how to run TLC offline.

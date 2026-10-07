@@ -40,15 +40,17 @@ func TestNewStoreAcceptsShippedSchema(t *testing.T) {
 // Fail closed: any drift a migration could introduce refuses the database.
 func TestVerifySchemaRefusesDrift(t *testing.T) {
 	for name, ddl := range map[string]string{
-		"secret text column":         `ALTER TABLE environments ADD COLUMN token TEXT`,
-		"innocent text column":       `ALTER TABLE environments ADD COLUMN note TEXT`,
-		"blob column":                `ALTER TABLE environments ADD COLUMN payload BLOB`,
-		"untyped column":             `ALTER TABLE environments ADD COLUMN extra`,
-		"varchar column":             `ALTER TABLE environments ADD COLUMN env VARCHAR(255)`,
+		"secret text column":         `ALTER TABLE jobs ADD COLUMN token TEXT`,
+		"innocent text column":       `ALTER TABLE deliveries ADD COLUMN note TEXT`,
+		"blob column":                `ALTER TABLE jobs ADD COLUMN payload BLOB`,
+		"untyped column":             `ALTER TABLE boots ADD COLUMN extra`,
+		"varchar column":             `ALTER TABLE jobs ADD COLUMN env VARCHAR(255)`,
 		"new table":                  `CREATE TABLE leases (id INTEGER PRIMARY KEY)`,
-		"text column on jobs":        `ALTER TABLE jobs ADD COLUMN note TEXT`,
 		"new table with blob":        `CREATE TABLE cache (k INTEGER, v BLOB)`,
-		"allowlisted column retyped": `ALTER TABLE environments RENAME COLUMN status TO status_old; ALTER TABLE environments ADD COLUMN status BLOB`,
+		"allowlisted column retyped": `ALTER TABLE jobs RENAME COLUMN clone_url TO clone_url_old; ALTER TABLE jobs ADD COLUMN clone_url BLOB`,
+		"old environments table":     `CREATE TABLE environments (id TEXT PRIMARY KEY, pr_number INTEGER NOT NULL, status TEXT NOT NULL)`,
+		"allowlisted column missing": `ALTER TABLE deliveries DROP COLUMN verdict`,
+		"allowlisted table missing":  `DROP TABLE boots`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			db := openTestDB(t)
@@ -102,7 +104,7 @@ func TestNewStoreRefusesDriftedDatabase(t *testing.T) {
 	if err := migrate(context.Background(), db); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(context.Background(), `ALTER TABLE environments ADD COLUMN token TEXT`); err != nil {
+	if _, err := db.ExecContext(context.Background(), `ALTER TABLE jobs ADD COLUMN token TEXT`); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -112,5 +114,34 @@ func TestNewStoreRefusesDriftedDatabase(t *testing.T) {
 	if s, err := NewStore(context.Background(), path); err == nil {
 		_ = s.Close()
 		t.Fatal("NewStore opened a database with a non-allowlisted TEXT column")
+	}
+}
+
+// A schema-version-2 database from before the jobs carried their source
+// (commit 8ec4c66, unreleased) is refused at start, not at the first query.
+func TestNewStoreRefusesEarlierVersion2Schema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "previewd.sqlite")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ddl := range []string{
+		`CREATE TABLE jobs (id INTEGER PRIMARY KEY, preview_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER NOT NULL,
+			status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, not_before INTEGER NOT NULL DEFAULT 0,
+			lease_epoch INTEGER NOT NULL DEFAULT 0)`,
+		`CREATE TABLE deliveries (delivery_id TEXT PRIMARY KEY, preview_id TEXT NOT NULL, seq INTEGER NOT NULL, verdict TEXT NOT NULL)`,
+		`CREATE TABLE boots (epoch INTEGER PRIMARY KEY, started_at INTEGER NOT NULL)`,
+		`PRAGMA user_version = 2`,
+	} {
+		if _, err := db.ExecContext(context.Background(), ddl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := NewStore(context.Background(), path); err == nil {
+		_ = s.Close()
+		t.Fatal("NewStore opened a version-2 database without the job source columns")
 	}
 }
