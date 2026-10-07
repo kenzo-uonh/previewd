@@ -1,0 +1,171 @@
+----------------------------- MODULE previewd -----------------------------
+EXTENDS Integers, Sequences, FiniteSets, TLC
+
+CONSTANTS MaxWebhooks, EnvIDs, MaxCrashes
+
+(* PlusCal Algorithm *)
+(*--algorithm previewd
+variables
+  \* The physical state of the host/containers
+  environments = [e \in EnvIDs |-> [state |-> "absent", network_bound |-> FALSE, secrets_mounted |-> FALSE, secrets_persisted |-> FALSE]],
+  \* The persistent SQLite database of jobs
+  db_jobs = {},
+  \* Bounded counters
+  next_job_id = 1,
+  webhooks_received = 0,
+  crashes_simulated = 0,
+  \* Indicates if the system is currently crashed (awaiting StartupSweep)
+  is_crashed = FALSE,
+  \* Reconciler state
+  reconciler_active_job = [id |-> 0, type |-> "none", env_id |-> "none", ts |-> 0, status |-> "none", retries |-> 0];
+
+define
+  \* Helper to check if any job exists for an env
+  HasJob(env) == \E j \in db_jobs: j.env_id = env
+  
+  \* Helper to find the latest job for an env_id
+  LatestJobForEnv(env) == 
+    CHOOSE j \in {job \in db_jobs: job.env_id = env}:
+      \A j2 \in {job \in db_jobs: job.env_id = env}: j2.ts <= j.ts
+
+  \* Is this job the latest job for its env?
+  IsLatestJob(job) ==
+    \A j2 \in {j \in db_jobs: j.env_id = job.env_id}: j2.ts <= job.ts
+
+  \* Safety 1: Zero Secret Leakage (Memory & Disk)
+  SafetyZeroSecretLeakage ==
+    \A env \in EnvIDs:
+      (environments[env].state = "running") => (environments[env].secrets_persisted = FALSE)
+
+  \* Safety 2: No Orphaned Resources (Physical to Logical Verification)
+  SafetyNoOrphanedResources ==
+    \A env \in EnvIDs:
+      (environments[env].state = "running" \/ environments[env].network_bound = TRUE) =>
+        ~(HasJob(env) /\ LatestJobForEnv(env).type = "teardown" /\ LatestJobForEnv(env).status = "SUCCESS")
+
+  \* Safety 3: Monotonicity & Ordering
+  \* Older webhook intents must not overwrite newer executed intents.
+  SafetyStrictMonotonicity ==
+    \A j1, j2 \in db_jobs:
+      (j1.env_id = j2.env_id /\ j1.ts < j2.ts /\ j2.status \in {"IN_PROGRESS", "SUCCESS"}) =>
+      ~(j1.status \in {"QUEUED", "IN_PROGRESS"})
+
+  \* Liveness 1: Eventual Completion
+  LivenessEventualCompletion ==
+    \A env \in EnvIDs:
+      \A ts \in 1..MaxWebhooks:
+        (\E job \in db_jobs: job.env_id = env /\ job.ts = ts /\ job.status = "QUEUED")
+        ~> 
+        (\E job \in db_jobs: job.env_id = env /\ job.ts = ts /\ job.status \in {"SUCCESS", "FAILED", "SKIPPED"})
+
+  \* Liveness 2: Eventual Consistency
+  \* Assuming webhook stream pauses, environments map reflects latest intent.
+  LivenessEventualConsistency ==
+    (webhooks_received = MaxWebhooks) ~>
+      (\A env \in EnvIDs:
+         IF HasJob(env) /\ LatestJobForEnv(env).type = "deploy" /\ LatestJobForEnv(env).status = "SUCCESS" THEN
+           environments[env].state = "running"
+         ELSE
+           environments[env].state = "absent")
+
+end define;
+
+fair process Reconciler = "reconciler_loop"
+begin
+ReconcilerLoop:
+  while TRUE do
+    if is_crashed then
+      StartupSweep:
+        is_crashed := FALSE;
+        db_jobs := { IF j.status = "IN_PROGRESS" THEN [j EXCEPT !.status = "FAILED"] ELSE j : j \in db_jobs };
+        environments := [e \in EnvIDs |-> 
+          IF (~HasJob(e) \/ (HasJob(e) /\ LatestJobForEnv(e).type = "teardown") \/ environments[e].secrets_mounted = FALSE) THEN
+            [state |-> "absent", network_bound |-> FALSE, secrets_mounted |-> FALSE, secrets_persisted |-> FALSE]
+          ELSE
+            environments[e]
+        ];
+    else
+      if reconciler_active_job.id = 0 then
+        either
+            await \E j \in db_jobs: j.status = "QUEUED";
+          AcquireJob:
+            with e \in {env \in EnvIDs: \E j \in db_jobs: j.env_id = env /\ j.status = "QUEUED"} do
+                with target \in {j \in db_jobs: j.env_id = e /\ j.status = "QUEUED" /\ \A j2 \in db_jobs: (j2.env_id = e /\ j2.status = "QUEUED") => j2.ts <= j.ts} do
+                    reconciler_active_job := target;
+                    db_jobs := { 
+                        IF j.env_id = e /\ j.status = "QUEUED" THEN
+                            IF j.id = target.id THEN [j EXCEPT !.status = "IN_PROGRESS"] ELSE [j EXCEPT !.status = "SKIPPED"]
+                        ELSE j 
+                        : j \in db_jobs 
+                    };
+                end with;
+            end with;
+        or
+            await crashes_simulated < MaxCrashes;
+          CrashFromIdle:
+            is_crashed := TRUE;
+            crashes_simulated := crashes_simulated + 1;
+            environments := [e \in EnvIDs |-> [environments[e] EXCEPT !.secrets_mounted = FALSE]];
+        or
+            await ~(\E j \in db_jobs: j.status = "QUEUED") /\ crashes_simulated = MaxCrashes;
+          IdleLoop:
+            skip;
+        end either;
+      else
+        either
+          ExecuteAction:
+            if reconciler_active_job.type = "deploy" then
+                either
+                    environments[reconciler_active_job.env_id] := [state |-> "running", network_bound |-> TRUE, secrets_mounted |-> TRUE, secrets_persisted |-> FALSE];
+                    db_jobs := { IF j.id = reconciler_active_job.id THEN [j EXCEPT !.status = "SUCCESS"] ELSE j : j \in db_jobs };
+                or
+                    db_jobs := { IF j.id = reconciler_active_job.id THEN [j EXCEPT !.status = "FAILED"] ELSE j : j \in db_jobs };
+                end either;
+            else
+                either
+                    environments[reconciler_active_job.env_id] := [state |-> "absent", network_bound |-> FALSE, secrets_mounted |-> FALSE, secrets_persisted |-> FALSE];
+                    db_jobs := { IF j.id = reconciler_active_job.id THEN [j EXCEPT !.status = "SUCCESS"] ELSE j : j \in db_jobs };
+                or
+                    if reconciler_active_job.retries < 3 then
+                        db_jobs := { IF j.id = reconciler_active_job.id THEN [j EXCEPT !.status = "QUEUED", !.retries = reconciler_active_job.retries + 1] ELSE j : j \in db_jobs };
+                    else
+                        db_jobs := { IF j.id = reconciler_active_job.id THEN [j EXCEPT !.status = "FAILED"] ELSE j : j \in db_jobs };
+                    end if;
+                end either;
+            end if;
+            reconciler_active_job := [id |-> 0, type |-> "none", env_id |-> "none", ts |-> 0, status |-> "none", retries |-> 0];
+        or
+            await crashes_simulated < MaxCrashes;
+          CrashDuringExecution:
+            is_crashed := TRUE;
+            crashes_simulated := crashes_simulated + 1;
+            reconciler_active_job := [id |-> 0, type |-> "none", env_id |-> "none", ts |-> 0, status |-> "none", retries |-> 0];
+            environments := [e \in EnvIDs |-> [environments[e] EXCEPT !.secrets_mounted = FALSE]];
+        end either;
+      end if;
+    end if;
+  end while;
+end process;
+
+fair process WebhookSender = "github"
+begin
+SendLoop:
+  while webhooks_received < MaxWebhooks do
+    ReceiveWebhook:
+      with type \in {"deploy", "teardown"}, e \in EnvIDs, ts \in 1..MaxWebhooks do
+        if ~(\E j \in db_jobs: j.ts = ts) then
+            if \E j \in db_jobs: j.env_id = e /\ j.ts > ts /\ j.status \in {"QUEUED", "IN_PROGRESS", "SUCCESS"} then
+                \* Discard out of order
+                webhooks_received := webhooks_received + 1;
+            else
+                db_jobs := db_jobs \cup {[id |-> next_job_id, type |-> type, env_id |-> e, ts |-> ts, status |-> "QUEUED", retries |-> 0]};
+                next_job_id := next_job_id + 1;
+                webhooks_received := webhooks_received + 1;
+            end if;
+        end if;
+      end with;
+  end while;
+end process;
+end algorithm; *)
+
+=============================================================================

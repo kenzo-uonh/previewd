@@ -32,14 +32,33 @@ build-errors.log
 *.sqlite*
 EOF
 
-# repomix output
+# TLA+ Model Checker artifacts
+states/
+*TTrace_*.tla
+*TTrace_*.bin
+MC.tla
+MC.cfg
+MC.out
+*.st
+tla2tools.jar
+
+# AI Tools & Assistants
+.agent/
+CLAUDE.md
 repomix-output.xml
+claude.json
+.aider*
+.cursor/
+.cursorrules
+.cline/
+.agy/
+.gemini/
 
 # vulnerability report
 vuln-report.txt
 
 # IntelliJ project files
-.idea
+.idea/
 *.iml
-out
-gen
+out/
+gen/
