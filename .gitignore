@@ -60,9 +60,6 @@ claude.json
 # vulnerability report
 vuln-report.txt
 
-# Internal documentation
-docs/specs/
-
 # IntelliJ project files
 .idea/
 *.iml
