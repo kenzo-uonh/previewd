@@ -1,4 +1,4 @@
-.PHONY: all build run dev clean fmt vet lint test sec deps deps-check vendor-check check verify airgap-check fmt-check repomix vuln docker-up docker-down help e2e
+.PHONY: all build run dev clean fmt vet lint test sec deps deps-check vendor-check check verify airgap-check fmt-check repomix vuln docker-up docker-down help e2e airgap-scan
 
 APP_NAME    := previewd
 BIN_DIR     := bin
@@ -28,7 +28,7 @@ help: ## Display this help message
 
 ##@ Development & Quality Checks
 
-check: $(DEPS_GATE) fmt-check vet lint sec vuln airgap-check test ## Run all verification checks and test suite (deterministic gate)
+check: $(DEPS_GATE) fmt-check vet lint sec vuln airgap-check airgap-scan test ## Run all verification checks and test suite (deterministic gate)
 
 verify: ## Deep verification: rapid PBT (RAPID_CHECKS=10000) + every native fuzz target (FUZZTIME per target)
 	@chmod +x scripts/verify.sh scripts/rapid-packages.sh
@@ -74,6 +74,12 @@ test: ## Execute the unit test suite (rapid packages use the fixed RAPID_SEED)
 	@echo "Executing test suite..."
 	@chmod +x scripts/test.sh scripts/rapid-packages.sh
 	@RAPID_SEED=$(RAPID_SEED) ./scripts/test.sh
+
+airgap-scan: ## Static air-gap scan of source, deployments and specs (fails on LOW and above), after its own regression tests
+	@echo "Running air-gap scanner self-tests..."
+	@python3 -I -B scripts/airgap_scan_test.py
+	@echo "Scanning source, deployment files and specs..."
+	@python3 -I -B scripts/airgap_scan.py . --fail-on low
 
 airgap-check: ## Fail if the binary links telemetry SDKs/exporters, gRPC, cloud SDKs or docker/docker
 	@chmod +x scripts/airgap-check.sh

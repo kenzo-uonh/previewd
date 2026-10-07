@@ -42,6 +42,9 @@ docs/formal/*.old
 
 # rapid failure files (reproduce a failing run locally; never committed)
 **/testdata/rapid/
+
+# Python bytecode (scripts/airgap_scan*.py)
+__pycache__/
 MC.tla
 MC.cfg
 MC.out
