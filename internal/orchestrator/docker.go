@@ -2,8 +2,10 @@ package orchestrator
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/containerd/errdefs"
 	"github.com/kenzo-uonh/previewd/internal/envid"
+	"github.com/kenzo-uonh/previewd/internal/textutil"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/api/types/network"
@@ -212,11 +215,102 @@ func (d *DockerEngine) Build(ctx context.Context, buildDir, tag string) error {
 		_ = res.Body.Close()
 	}()
 
-	if _, err := io.Copy(io.Discard, res.Body); err != nil {
-		return fmt.Errorf("failed to drain build output: %w", err)
+	// The daemon answers 200 before building: the outcome is in the stream.
+	if _, err := readBuildStream(res.Body); err != nil {
+		return fmt.Errorf("docker image build: %w", err)
 	}
-
 	return nil
+}
+
+// ErrBuildFailed is a build the daemon reported as failed, or whose outcome
+// it never confirmed.
+var ErrBuildFailed = errors.New("build failed")
+
+const (
+	// maxBuildMessageBytes bounds one line of the build stream, its newline
+	// included; a longer line fails the build rather than being cut.
+	maxBuildMessageBytes = 1 << 20
+	// maxBuildErrorBytes bounds the daemon's error text quoted in our error:
+	// it repeats PR-controlled Dockerfile content.
+	maxBuildErrorBytes = 512
+)
+
+// buildMessage is one line of the /build response: newline-delimited JSON
+// from the classic builder and from BuildKit alike.
+type buildMessage struct {
+	ID          string          `json:"id"`
+	Aux         json.RawMessage `json:"aux"`
+	Error       string          `json:"error"`
+	ErrorDetail *struct {
+		Message string `json:"message"`
+	} `json:"errorDetail"`
+}
+
+// readBuildStream reads the build response to its end and returns the built
+// image ID. A build is successful only if no message carries an error and
+// the daemon reported the image ID (classic: {"aux":{"ID":...}}; BuildKit:
+// {"id":"moby.image.id","aux":{"ID":...}}). An error message, a malformed or
+// oversized line, a stream cut short, or a stream without the image ID fails
+// the build (ErrBuildFailed or a read error).
+func readBuildStream(r io.Reader) (string, error) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64<<10), maxBuildMessageBytes)
+	imageID := ""
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var msg buildMessage
+		if err := json.Unmarshal(line, &msg); err != nil {
+			return "", fmt.Errorf("%w: malformed build output line: %w", ErrBuildFailed, err)
+		}
+		if msg.Error != "" || msg.ErrorDetail != nil {
+			detail := msg.Error
+			if msg.ErrorDetail != nil && msg.ErrorDetail.Message != "" {
+				detail = msg.ErrorDetail.Message
+			}
+			return "", fmt.Errorf("%w: %q", ErrBuildFailed, textutil.Truncate(detail, maxBuildErrorBytes))
+		}
+		if id, ok := auxImageID(msg); ok {
+			imageID = id
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return "", fmt.Errorf("%w: read build output: %w", ErrBuildFailed, err)
+	}
+	if imageID == "" {
+		return "", fmt.Errorf("%w: the daemon did not report an image ID", ErrBuildFailed)
+	}
+	return imageID, nil
+}
+
+// auxImageID extracts the image ID message; other aux payloads (BuildKit
+// progress traces are base64 strings) are ignored.
+func auxImageID(msg buildMessage) (string, bool) {
+	if len(msg.Aux) == 0 || msg.Aux[0] != '{' || (msg.ID != "" && msg.ID != "moby.image.id") {
+		return "", false
+	}
+	var aux struct {
+		ID string `json:"ID"`
+	}
+	if json.Unmarshal(msg.Aux, &aux) != nil || !validImageID(aux.ID) {
+		return "", false
+	}
+	return aux.ID, true
+}
+
+func validImageID(id string) bool {
+	hex, ok := strings.CutPrefix(id, "sha256:")
+	if !ok || len(hex) != 64 {
+		return false
+	}
+	for i := range len(hex) {
+		if c := hex[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // ProvisionNetwork creates the environment's internal bridge network: no

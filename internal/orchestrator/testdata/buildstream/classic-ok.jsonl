@@ -1,0 +1,12 @@
+{"stream":"Step 1/2 : FROM busybox:latest"}
+{"stream":"\n"}
+{"stream":" ---\u003e fd7dc98638c8\n"}
+{"stream":"Step 2/2 : RUN echo building"}
+{"stream":"\n"}
+{"stream":" ---\u003e Running in 594697c41868\n"}
+{"stream":"building\n"}
+{"stream":" ---\u003e Removed intermediate container 594697c41868\n"}
+{"stream":" ---\u003e 418d7d1f6a6d\n"}
+{"aux":{"ID":"sha256:418d7d1f6a6dd935ed837171df7c65752432097073deb00a1357bb21acc81970"}}
+{"stream":"Successfully built 418d7d1f6a6d\n"}
+{"stream":"Successfully tagged streamprobe-default:latest\n"}

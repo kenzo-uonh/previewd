@@ -31,7 +31,9 @@ var allowedImports = map[string][]string{
 	// The reconciler consumes the queue (store) and publishes routes (proxy);
 	// envid validates ownership labels at startup. Fetching and secrets come
 	// in through injected functions and interfaces.
-	"orchestrator": {"envid", "proxy", "store"},
+	// textutil bounds untrusted daemon output (build errors quote the PR's
+	// Dockerfile) before it reaches an error or a log line.
+	"orchestrator": {"envid", "proxy", "store", "textutil"},
 	// The handler writes to the queue and wakes the reconciler through
 	// consumer interfaces: no orchestrator import.
 	"api": {"config", "envid", "store", "validate", "vcs"},

@@ -102,6 +102,15 @@ git commit -q -m "initial commit"
 git push -q origin HEAD
 MOCK_SHA=$(git rev-parse HEAD)
 
+# A second branch whose build fails in a RUN step: the daemon still answers
+# the build request with HTTP 200 and reports the failure in the stream.
+git checkout -q -b e2e/broken
+printf 'FROM busybox:latest\nRUN echo about-to-fail && exit 3\n' > Dockerfile
+git commit -q -am "broken build"
+git push -q origin e2e/broken
+BROKEN_SHA=$(git rev-parse HEAD)
+git checkout -q -
+
 cd "$PROJECT_ROOT"
 
 echo "==> Bootstrapping Traefik (file provider, no socket)..."
@@ -269,6 +278,21 @@ done
 [ "$(curl -s -m 2 -H "Host: $ENV_ID.$DOMAIN" http://127.0.0.1/)" = "previewd-e2e-ok" ] || fail "kept environment no longer routed"
 [ "$(ls "$ROUTES_DIR")" = "$ENV_ID.yml" ] || fail "routes dir holds more than the kept route: $(ls -A "$ROUTES_DIR")"
 echo "    ok: orphan, foreign and partial route files removed; the kept environment and its route survive the crash"
+
+echo "==> 2f. A build that fails in a RUN step is recorded as a build failure..."
+BROKEN_BODY=$(printf '{"action":"opened","number":1000,"pull_request":{"head":{"ref":"e2e/broken","sha":"%s"}},"repository":{"full_name":"e2e/mock","clone_url":"file://%s/mock.git"}}' "$BROKEN_SHA" "$MOCK_DIR")
+reply=$(send_webhook pull_request "$BROKEN_BODY")
+BROKEN_ENV=$(printf '%s' "$reply" | sed -n 's/.*"environment_id":"\([a-z0-9-]*\)".*/\1/p')
+[ -n "$BROKEN_ENV" ] || fail "no environment_id for the broken build: $reply"
+# broken_failure: the agent's "Deploy failed" log line for the broken environment.
+broken_failure() { grep '"msg":"Deploy failed' "$MOCK_DIR/agent.log" | grep "\"environment_id\":\"$BROKEN_ENV\""; }
+wait_for 60 "the broken deploy to fail" broken_failure
+broken_failure | grep -q 'build failed' \
+  || fail "broken deploy did not fail as a build failure: $(broken_failure | head -c 400)"
+if docker inspect "$BROKEN_ENV" >/dev/null 2>&1; then fail "a container exists for the failed build"; fi
+[ ! -e "$ROUTES_DIR/$BROKEN_ENV.yml" ] || fail "a route exists for the failed build"
+[ ! -e "$STAGING_DIR/$BROKEN_ENV" ] || fail "staged secrets exist for the failed build"
+echo "    ok: failed RUN reported as a build failure; no container, route or staging"
 
 echo "==> 3. Testing Exhaustive Teardown (Action: closed)..."
 case "$(send_webhook pull_request "$(PR_BODY closed)")" in
