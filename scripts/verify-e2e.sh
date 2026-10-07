@@ -58,10 +58,12 @@ git init -q --bare "$MOCK_DIR/mock.git"
 git clone -q "$MOCK_DIR/mock.git" "$MOCK_DIR/src"
 
 cd "$MOCK_DIR/src"
-# Prints its secret once, then serves a fixed page on the application port.
+# Prints its secret once, then serves a page written at build time: the
+# container runs on a read-only root with no writable mount.
 cat > Dockerfile <<'DOCKERFILE'
 FROM busybox:latest
-CMD ["sh", "-c", "cat /run/secrets/E2E_TOKEN && echo && mkdir -p /tmp/www && echo previewd-e2e-ok > /tmp/www/index.html && exec httpd -f -p 8080 -h /tmp/www"]
+RUN mkdir /www && echo previewd-e2e-ok > /www/index.html
+CMD ["sh", "-c", "cat /run/secrets/E2E_TOKEN && echo && exec httpd -f -p 8080 -h /www"]
 DOCKERFILE
 git config user.name "E2E Test"
 git config user.email "test@previewd.local"
@@ -153,6 +155,18 @@ mount_rw=$(docker inspect "$ENV_ID" --format '{{range .Mounts}}{{if eq .Destinat
 [ -f "$STAGING_DIR/$ENV_ID/E2E_TOKEN" ] || fail "secret not staged on ramfs"
 [ "$(docker logs "$ENV_ID" 2>&1)" = "$E2E_SECRET" ] || fail "container could not read its mounted secret"
 echo "    ok: no env, read-only bind mount, secret readable in the container"
+
+echo "==> 2a. Verifying PR container hardening..."
+[ "$(docker inspect "$ENV_ID" --format '{{json .HostConfig.CapDrop}}')" = '["ALL"]' ] || fail "capabilities not all dropped"
+[ "$(docker inspect "$ENV_ID" --format '{{json .HostConfig.CapAdd}}')" = 'null' ] || fail "capabilities added"
+[ "$(docker inspect "$ENV_ID" --format '{{json .HostConfig.SecurityOpt}}')" = '["no-new-privileges:true"]' ] || fail "no-new-privileges not set"
+[ "$(docker inspect "$ENV_ID" --format '{{.HostConfig.ReadonlyRootfs}}')" = "true" ] || fail "root file system writable"
+[ "$(docker inspect "$ENV_ID" --format '{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}} {{.HostConfig.PidsLimit}}')" = "536870912 536870912 256" ] || fail "resource limits missing"
+if docker exec "$ENV_ID" touch /probe 2>/dev/null; then fail "PR container wrote to its root file system"; fi
+if docker exec "$ENV_ID" touch /tmp/probe 2>/dev/null; then fail "PR container wrote to /tmp"; fi
+[ "$(docker exec "$ENV_ID" grep -E '^CapEff' /proc/1/status | awk '{print $2}')" = "0000000000000000" ] || fail "PID 1 holds capabilities"
+[ "$(docker exec "$ENV_ID" grep -E '^NoNewPrivs' /proc/1/status | awk '{print $2}')" = "1" ] || fail "NoNewPrivs not set on PID 1"
+echo "    ok: cap-drop ALL, no-new-privileges, read-only root, 512 MiB without swap, 256 tasks"
 
 echo "==> 2c. Verifying routing through the route document and network isolation..."
 grep -q "Host(\`$ENV_ID.$DOMAIN\`)" "$ROUTES_DIR/$ENV_ID.yml" || fail "route document has no rule for $ENV_ID.$DOMAIN"

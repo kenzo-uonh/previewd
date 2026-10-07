@@ -87,7 +87,10 @@ func main() {
 		}
 	}()
 
-	engine, err := orchestrator.NewDockerEngine(cfg.TraefikContainer)
+	engine, err := orchestrator.NewDockerEngine(cfg.TraefikContainer, orchestrator.Limits{
+		MemoryBytes: cfg.ContainerMemoryMiB << 20,
+		Pids:        cfg.ContainerPids,
+	})
 	if err != nil {
 		logger.Error("Docker engine initialization failure", "error", err)
 		os.Exit(1)

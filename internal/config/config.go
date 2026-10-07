@@ -20,6 +20,8 @@ type Config struct {
 	AllowTmpfsSecrets   bool
 	AllowUnlockedMemory bool
 	MaxConcurrentBuilds int
+	ContainerMemoryMiB  int64
+	ContainerPids       int64
 }
 
 // defaultStagingDir mirrors secrets.DefaultStagingDir; config imports
@@ -100,6 +102,15 @@ func Load() (*Config, error) {
 		}
 	}
 
+	memoryMiB, err := positiveInt("PREVIEWD_CONTAINER_MEMORY_MIB", 512)
+	if err != nil {
+		return nil, err
+	}
+	pids, err := positiveInt("PREVIEWD_CONTAINER_PIDS", 256)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Config{
 		APIPort:             apiPort,
 		DBPath:              dbPath,
@@ -113,7 +124,26 @@ func Load() (*Config, error) {
 		AllowTmpfsSecrets:   allowTmpfs,
 		AllowUnlockedMemory: allowUnlocked,
 		MaxConcurrentBuilds: maxBuilds,
+		ContainerMemoryMiB:  memoryMiB,
+		ContainerPids:       pids,
 	}, nil
+}
+
+// maxPositiveInt keeps a MiB value convertible to bytes in an int64.
+const maxPositiveInt = 1 << 40
+
+// positiveInt reads a limit. Unset means def; anything but an integer in
+// 1..2^40 is a configuration error, never a silent fallback.
+func positiveInt(name string, def int64) (int64, error) {
+	v := os.Getenv(name)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n <= 0 || n > maxPositiveInt {
+		return 0, fmt.Errorf("invalid %s %q: want an integer in 1..%d", name, v, int64(maxPositiveInt))
+	}
+	return n, nil
 }
 
 // optIn reads an opt-in flag. Opt-ins are exact: only "1" enables, any other

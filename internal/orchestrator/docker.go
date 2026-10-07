@@ -23,25 +23,43 @@ import (
 // its container, one read-only file per key.
 const SecretsMountTarget = "/run/secrets"
 
+// Limits bound every PR container.
+type Limits struct {
+	MemoryBytes int64 // hard limit; swap is disabled (MemorySwap = MemoryBytes)
+	Pids        int64 // maximum number of tasks
+}
+
+func (l Limits) validate() error {
+	if l.MemoryBytes <= 0 || l.Pids <= 0 {
+		return fmt.Errorf("container limits must be positive (memory %d bytes, pids %d)", l.MemoryBytes, l.Pids)
+	}
+	return nil
+}
+
 // DockerEngine implements Engine using the local Docker API.
 type DockerEngine struct {
 	client *client.Client
 	// proxyContainer is the Traefik container. It joins each environment's
 	// internal network so that it, and only it, reaches the environment.
 	proxyContainer string
+	limits         Limits
 }
 
 // NewDockerEngine initializes a connection to the local host's Docker daemon.
-// proxyContainer names the Traefik container that serves the routes.
-func NewDockerEngine(proxyContainer string) (*DockerEngine, error) {
+// proxyContainer names the Traefik container that serves the routes; limits
+// bound every PR container.
+func NewDockerEngine(proxyContainer string, limits Limits) (*DockerEngine, error) {
 	if proxyContainer == "" {
 		return nil, errors.New("proxy container name is required")
+	}
+	if err := limits.validate(); err != nil {
+		return nil, err
 	}
 	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize docker client: %w", err)
 	}
-	return &DockerEngine{client: cli, proxyContainer: proxyContainer}, nil
+	return &DockerEngine{client: cli, proxyContainer: proxyContainer, limits: limits}, nil
 }
 
 // networkName is the internal bridge network of envID.
@@ -219,10 +237,19 @@ func (d *DockerEngine) ProvisionNetwork(ctx context.Context, envID string) error
 // part of it: the container receives the host directory staged on ramfs as a
 // read-only bind mount, so no secret value reaches the Docker API, the
 // daemon's on-disk container config, or `docker inspect`.
-func containerSpec(env Environment) (*container.Config, *container.HostConfig, error) {
+//
+// The PR's code is hostile: no capability, no privilege gain through setuid
+// or file capabilities, a read-only root file system with no writable mount
+// at all, bounded memory without swap (what the application reads from its
+// secrets never reaches swap) and a bounded task count.
+func containerSpec(env Environment, limits Limits) (*container.Config, *container.HostConfig, error) {
 	if env.SecretsDir == "" || !filepath.IsAbs(env.SecretsDir) {
 		return nil, nil, fmt.Errorf("environment %s: staged secrets dir %q must be an absolute path", env.ID, env.SecretsDir)
 	}
+	if err := limits.validate(); err != nil {
+		return nil, nil, fmt.Errorf("environment %s: %w", env.ID, err)
+	}
+	pids := limits.Pids
 
 	// No routing labels: the proxy reads route documents, never labels.
 	cfg := &container.Config{
@@ -231,8 +258,16 @@ func containerSpec(env Environment) (*container.Config, *container.HostConfig, e
 
 	netName := networkName(env.ID)
 	hostCfg := &container.HostConfig{
-		NetworkMode: container.NetworkMode(netName),
-		AutoRemove:  false,
+		NetworkMode:    container.NetworkMode(netName),
+		AutoRemove:     false,
+		CapDrop:        []string{"ALL"},
+		SecurityOpt:    []string{"no-new-privileges:true"},
+		ReadonlyRootfs: true,
+		Resources: container.Resources{
+			Memory:     limits.MemoryBytes,
+			MemorySwap: limits.MemoryBytes,
+			PidsLimit:  &pids,
+		},
 		Mounts: []mount.Mount{
 			{
 				Type:     mount.TypeBind,
@@ -254,7 +289,7 @@ func containerSpec(env Environment) (*container.Config, *container.HostConfig, e
 // joins the proxy to that network, and returns the address the route
 // document points to.
 func (d *DockerEngine) Deploy(ctx context.Context, env Environment) (netip.AddrPort, error) {
-	cfg, hostCfg, err := containerSpec(env)
+	cfg, hostCfg, err := containerSpec(env, d.limits)
 	if err != nil {
 		return netip.AddrPort{}, err
 	}

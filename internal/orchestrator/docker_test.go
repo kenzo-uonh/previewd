@@ -14,10 +14,12 @@ import (
 	"github.com/moby/moby/api/types/network"
 )
 
+var testLimits = Limits{MemoryBytes: 512 << 20, Pids: 256}
+
 func TestContainerSpecMountsSecretsReadOnlyWithoutEnv(t *testing.T) {
 	env := Environment{ID: "pr-7", Image: "pr-7:latest", Port: 8080, Domain: "local.previewd", SecretsDir: "/run/previewd/secrets/pr-7"}
 
-	cfg, hostCfg, err := containerSpec(env)
+	cfg, hostCfg, err := containerSpec(env, testLimits)
 	if err != nil {
 		t.Fatalf("containerSpec: %v", err)
 	}
@@ -52,8 +54,54 @@ func TestContainerSpecMountsSecretsReadOnlyWithoutEnv(t *testing.T) {
 func TestContainerSpecFailsClosedWithoutStagedDir(t *testing.T) {
 	for _, dir := range []string{"", "relative/pr-7", "pr-7"} {
 		env := Environment{ID: "pr-7", Image: "pr-7:latest", SecretsDir: dir}
-		if _, _, err := containerSpec(env); err == nil {
+		if _, _, err := containerSpec(env, testLimits); err == nil {
 			t.Errorf("containerSpec accepted secrets dir %q", dir)
+		}
+	}
+}
+
+// PR containers: no capability, no privilege gain, read-only root with no
+// writable mount, bounded memory without swap, bounded tasks.
+func TestContainerSpecHardening(t *testing.T) {
+	env := Environment{ID: "pr-7", Image: "pr-7:latest", Port: 8080, SecretsDir: "/run/previewd/secrets/pr-7"}
+	_, h, err := containerSpec(env, testLimits)
+	if err != nil {
+		t.Fatalf("containerSpec: %v", err)
+	}
+	if len(h.CapDrop) != 1 || h.CapDrop[0] != "ALL" || len(h.CapAdd) != 0 {
+		t.Errorf("capabilities: drop %v add %v, want drop [ALL] add []", h.CapDrop, h.CapAdd)
+	}
+	if len(h.SecurityOpt) != 1 || h.SecurityOpt[0] != "no-new-privileges:true" {
+		t.Errorf("security options = %v, want [no-new-privileges:true]", h.SecurityOpt)
+	}
+	if !h.ReadonlyRootfs {
+		t.Error("root file system is writable")
+	}
+	if len(h.Tmpfs) != 0 || len(h.Binds) != 0 || len(h.VolumesFrom) != 0 {
+		t.Errorf("writable mounts present: tmpfs %v binds %v volumes-from %v", h.Tmpfs, h.Binds, h.VolumesFrom)
+	}
+	for _, m := range h.Mounts {
+		if !m.ReadOnly {
+			t.Errorf("mount %s -> %s is writable", m.Source, m.Target)
+		}
+	}
+	if h.Privileged || h.PidMode != "" || h.IpcMode != "" || h.UsernsMode != "" || h.CgroupnsMode != "" {
+		t.Errorf("host namespace or privilege requested: %+v", h)
+	}
+	if h.Memory != testLimits.MemoryBytes || h.MemorySwap != testLimits.MemoryBytes {
+		t.Errorf("memory %d swap %d, want %d with no swap", h.Memory, h.MemorySwap, testLimits.MemoryBytes)
+	}
+	if h.PidsLimit == nil || *h.PidsLimit != testLimits.Pids {
+		t.Errorf("pids limit = %v, want %d", h.PidsLimit, testLimits.Pids)
+	}
+}
+
+// Fail closed: a container is never created without limits.
+func TestContainerSpecRefusesMissingLimits(t *testing.T) {
+	env := Environment{ID: "pr-7", Image: "pr-7:latest", SecretsDir: "/run/previewd/secrets/pr-7"}
+	for _, l := range []Limits{{}, {MemoryBytes: 1 << 20}, {Pids: 10}, {MemoryBytes: -1, Pids: 10}, {MemoryBytes: 1 << 20, Pids: -1}} {
+		if _, _, err := containerSpec(env, l); err == nil {
+			t.Errorf("containerSpec accepted limits %+v", l)
 		}
 	}
 }

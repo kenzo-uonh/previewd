@@ -5,7 +5,7 @@
 ## Architecture & Tech Stack
 
 *   **Core Daemon:** Statically compiled Go 1.27+ binary (`CGO_ENABLED=0`) requiring zero external OS dependencies.
-*   **Orchestration:** Docker API (`github.com/moby/moby/client`). Each environment runs on its own internal bridge network (no default route, no egress), shared only with the Traefik container.
+*   **Orchestration:** Docker API (`github.com/moby/moby/client`). Each environment runs on its own internal bridge network (no default route, no egress), shared only with the Traefik container. PR containers run with every capability dropped, `no-new-privileges`, a read-only root file system with no writable mount (no tmpfs), a memory limit without swap and a task limit. An application that must write at run time is not supported yet.
 *   **Ingress & Routing:** Traefik with the file provider only. previewd writes one route document per environment into `PREVIEWD_ROUTES_DIR` and removes it at teardown. Traefik has no Docker socket and reads no container label, so nothing in a PR image can add or change a route. Its entry point listens only on its fixed `previewd-proxy` address, never on the environment networks it joins, so a PR container cannot reach other environments through it. previewd refuses to start if the Traefik container mounts a socket, enables the Docker provider, is privileged or is not running.
 *   **Persistence:** CGO-free SQLite (`modernc.org/sqlite`) storing minimal environment metadata to ensure crash recovery.
 *   **Security Context:** Secrets are loaded into memory from a local secrets file. For each environment they are staged on a host ramfs directory (`/run/previewd/secrets/<env-id>/`, one file per key) and bind-mounted read-only into the container at `/run/secrets`. They never pass through container environment variables, the Docker API, `docker inspect`, image layers or disk.
@@ -172,6 +172,12 @@ Operational parameters enforce hardware boundaries and are managed exclusively v
 
 
 * `PREVIEWD_DB_PATH`: SQLite database path (default: previewd.sqlite).
+
+
+* `PREVIEWD_CONTAINER_MEMORY_MIB`: Memory limit of each PR container, swap disabled (default: 512). Must be an integer in 1..2^40; anything else is a configuration error.
+
+
+* `PREVIEWD_CONTAINER_PIDS`: Task limit of each PR container (default: 256). Same validation.
 
 
 * `PREVIEWD_ROUTES_DIR`: Directory of the route documents, watched by Traefik's file provider (default: `/var/lib/previewd/routes`). Must exist (absolute path, not a symlink); the daemon refuses to start otherwise. Mounted read-only into Traefik.
