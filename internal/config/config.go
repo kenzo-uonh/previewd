@@ -15,6 +15,8 @@ type Config struct {
 	WebhookSecret       string
 	SecretsPath         string
 	SecretsStagingDir   string
+	RoutesDir           string
+	TraefikContainer    string
 	AllowTmpfsSecrets   bool
 	AllowUnlockedMemory bool
 	MaxConcurrentBuilds int
@@ -23,6 +25,13 @@ type Config struct {
 // defaultStagingDir mirrors secrets.DefaultStagingDir; config imports
 // no internal package.
 const defaultStagingDir = "/run/previewd/secrets"
+
+// defaultRoutesDir is the directory Traefik's file provider watches
+// (deployments/docker-compose.yml mounts it read-only).
+const defaultRoutesDir = "/var/lib/previewd/routes"
+
+// defaultTraefikContainer is the container_name in deployments/docker-compose.yml.
+const defaultTraefikContainer = "traefik-proxy"
 
 // Load extracts configuration from the host environment with strict fallback defaults.
 func Load() (*Config, error) {
@@ -65,6 +74,16 @@ func Load() (*Config, error) {
 		stagingDir = defaultStagingDir
 	}
 
+	routesDir := os.Getenv("PREVIEWD_ROUTES_DIR")
+	if routesDir == "" {
+		routesDir = defaultRoutesDir
+	}
+
+	traefikContainer := os.Getenv("PREVIEWD_TRAEFIK_CONTAINER")
+	if traefikContainer == "" {
+		traefikContainer = defaultTraefikContainer
+	}
+
 	allowTmpfs, err := optIn("PREVIEWD_ALLOW_TMPFS_SECRETS")
 	if err != nil {
 		return nil, err
@@ -89,6 +108,8 @@ func Load() (*Config, error) {
 		WebhookSecret:       webhookSecret,
 		SecretsPath:         secretsPath,
 		SecretsStagingDir:   stagingDir,
+		RoutesDir:           routesDir,
+		TraefikContainer:    traefikContainer,
 		AllowTmpfsSecrets:   allowTmpfs,
 		AllowUnlockedMemory: allowUnlocked,
 		MaxConcurrentBuilds: maxBuilds,

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/kenzo-uonh/previewd/internal/config"
+	"github.com/kenzo-uonh/previewd/internal/proxy"
 	"github.com/kenzo-uonh/previewd/internal/secrets"
 	"github.com/kenzo-uonh/previewd/internal/store"
 	"github.com/kenzo-uonh/previewd/internal/vcs"
@@ -32,10 +33,24 @@ type SecretStager interface {
 	Remove(envID string) error
 }
 
-// Teardown destroys the environment's Docker resources, then its staged
-// secrets. Secrets are removed even if Docker teardown fails.
-func Teardown(ctx context.Context, engine Engine, stager SecretStager, envID string) error {
+// RoutePublisher writes and removes the route document of one environment
+// in the directory the proxy's file provider watches. Remove is idempotent.
+type RoutePublisher interface {
+	Publish(r proxy.Route) error
+	Remove(envID string) error
+}
+
+// cleanupTimeout bounds a rollback that runs after the job's context ended.
+const cleanupTimeout = 2 * time.Minute
+
+// Teardown removes the environment's route first, so the proxy stops sending
+// traffic, then its Docker resources, then its staged secrets. Every step
+// runs even if an earlier one fails; the errors are joined.
+func Teardown(ctx context.Context, engine Engine, routes RoutePublisher, stager SecretStager, envID string) error {
 	var errs []error
+	if err := routes.Remove(envID); err != nil {
+		errs = append(errs, err)
+	}
 	if err := engine.Destroy(ctx, envID); err != nil {
 		errs = append(errs, fmt.Errorf("destroy environment %s: %w", envID, err))
 	}
@@ -46,7 +61,7 @@ func Teardown(ctx context.Context, engine Engine, stager SecretStager, envID str
 }
 
 // ProcessJob executes the end-to-end lifecycle for an EaaS environment.
-func ProcessJob(ctx context.Context, job Job, cfg *config.Config, db *store.Store, engine Engine, injector *secrets.Injector, stager SecretStager) error {
+func ProcessJob(ctx context.Context, job Job, cfg *config.Config, db *store.Store, engine Engine, injector *secrets.Injector, stager SecretStager, routes RoutePublisher) error {
 	// Exhaustive Teardown: Enforce clean state for re-entrant updates (ActionSynchronize).
 	_ = engine.Destroy(ctx, job.EnvID)
 
@@ -93,11 +108,16 @@ func ProcessJob(ctx context.Context, job Job, cfg *config.Config, db *store.Stor
 		Domain:     cfg.TraefikDomain,
 		SecretsDir: secretsDir,
 	}
-	if err := engine.Deploy(ctx, env); err != nil {
-		err = fmt.Errorf("deploy step failed: %w", err)
-		if rmErr := stager.Remove(job.EnvID); rmErr != nil {
-			err = errors.Join(err, rmErr)
-		}
+	backend, err := engine.Deploy(ctx, env)
+	if err != nil {
+		err = errors.Join(fmt.Errorf("deploy step failed: %w", err), rollback(ctx, engine, routes, stager, job.EnvID))
+		_ = db.UpsertEnvironment(ctx, store.EnvironmentRecord{ID: job.EnvID, Status: "failed"})
+		return err
+	}
+
+	route := proxy.Route{EnvID: job.EnvID, Domain: cfg.TraefikDomain, Backend: backend}
+	if err := routes.Publish(route); err != nil {
+		err = errors.Join(fmt.Errorf("route step failed: %w", err), rollback(ctx, engine, routes, stager, job.EnvID))
 		_ = db.UpsertEnvironment(ctx, store.EnvironmentRecord{ID: job.EnvID, Status: "failed"})
 		return err
 	}
@@ -108,4 +128,15 @@ func ProcessJob(ctx context.Context, job Job, cfg *config.Config, db *store.Stor
 		Status:    "running",
 		CreatedAt: time.Now().UTC(),
 	})
+}
+
+// rollback tears down a failed deploy on a context that outlives the job's,
+// so a cancelled job cannot leave a container, network or staging behind.
+func rollback(ctx context.Context, engine Engine, routes RoutePublisher, stager SecretStager, envID string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
+	if err := Teardown(cleanupCtx, engine, routes, stager, envID); err != nil {
+		return fmt.Errorf("rollback %s: %w", envID, err)
+	}
+	return nil
 }

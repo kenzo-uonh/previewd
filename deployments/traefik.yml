@@ -1,17 +1,28 @@
+# Traefik static configuration for previewd.
+#
+# Routing comes only from the route documents previewd writes into
+# PREVIEWD_ROUTES_DIR, mounted read-only at /etc/traefik/routes. There is no
+# Docker provider and no Docker socket: a socket gives the proxy host root,
+# and a label-reading provider would let a PR image set its own routes.
+
 global:
   checkNewVersion: false
   sendAnonymousUsage: false
 
-api:
-  dashboard: true
-  insecure: true
-
-providers:
-  docker:
-    endpoint: "unix:///var/run/docker.sock"
-    exposedByDefault: false
-    network: "previewd-proxy"
+# No API, no dashboard.
 
 entryPoints:
   web:
-    address: ":80"
+    # Bound to the proxy's fixed address on previewd-proxy only. Traefik also
+    # joins every environment's internal network (to reach its backend), and
+    # must not listen there: a PR container could otherwise reach other
+    # environments through it. Keep in sync with docker-compose.yml.
+    address: "172.30.255.2:80"
+
+providers:
+  file:
+    directory: /etc/traefik/routes
+    watch: true
+
+log:
+  level: INFO

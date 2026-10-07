@@ -15,6 +15,7 @@ import (
 	"github.com/kenzo-uonh/previewd/internal/config"
 	"github.com/kenzo-uonh/previewd/internal/hardening"
 	"github.com/kenzo-uonh/previewd/internal/orchestrator"
+	"github.com/kenzo-uonh/previewd/internal/proxy"
 	"github.com/kenzo-uonh/previewd/internal/secrets"
 	"github.com/kenzo-uonh/previewd/internal/store"
 )
@@ -69,6 +70,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	routes, err := proxy.NewPublisher(cfg.RoutesDir)
+	if err != nil {
+		logger.Error("Routes directory refused", "routes_dir", cfg.RoutesDir, "error", err)
+		os.Exit(1)
+	}
+
 	db, err := store.NewStore(ctx, cfg.DBPath)
 	if err != nil {
 		logger.Error("Database initialization failure", "error", err)
@@ -80,7 +87,7 @@ func main() {
 		}
 	}()
 
-	engine, err := orchestrator.NewDockerEngine()
+	engine, err := orchestrator.NewDockerEngine(cfg.TraefikContainer)
 	if err != nil {
 		logger.Error("Docker engine initialization failure", "error", err)
 		os.Exit(1)
@@ -99,13 +106,20 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The proxy must never reach the Docker daemon: no socket, no Docker
+	// provider. It only reads the route documents previewd writes.
+	if err := engine.VerifyProxy(pingCtx); err != nil {
+		logger.Error("Proxy container refused", "proxy_container", cfg.TraefikContainer, "error", err)
+		os.Exit(1)
+	}
+
 	// Enforce bounded deployment concurrency based on configuration
 	pool := orchestrator.NewWorkerPool(cfg.MaxConcurrentBuilds, logger)
 	pool.Start(ctx, func(jobCtx context.Context, job orchestrator.Job) error {
-		return orchestrator.ProcessJob(jobCtx, job, cfg, db, engine, injector, stager)
+		return orchestrator.ProcessJob(jobCtx, job, cfg, db, engine, injector, stager, routes)
 	})
 
-	apiServer := api.NewServer(logger, cfg, db, engine, stager, pool)
+	apiServer := api.NewServer(logger, cfg, db, engine, stager, routes, pool)
 	httpServer := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.APIPort),
 		Handler:           apiServer.Routes(),

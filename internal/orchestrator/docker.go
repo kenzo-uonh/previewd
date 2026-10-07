@@ -4,14 +4,16 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/containerd/errdefs"
-	"github.com/kenzo-uonh/previewd/internal/proxy"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/client"
@@ -24,15 +26,72 @@ const SecretsMountTarget = "/run/secrets"
 // DockerEngine implements Engine using the local Docker API.
 type DockerEngine struct {
 	client *client.Client
+	// proxyContainer is the Traefik container. It joins each environment's
+	// internal network so that it, and only it, reaches the environment.
+	proxyContainer string
 }
 
 // NewDockerEngine initializes a connection to the local host's Docker daemon.
-func NewDockerEngine() (*DockerEngine, error) {
+// proxyContainer names the Traefik container that serves the routes.
+func NewDockerEngine(proxyContainer string) (*DockerEngine, error) {
+	if proxyContainer == "" {
+		return nil, errors.New("proxy container name is required")
+	}
 	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize docker client: %w", err)
 	}
-	return &DockerEngine{client: cli}, nil
+	return &DockerEngine{client: cli, proxyContainer: proxyContainer}, nil
+}
+
+// networkName is the internal bridge network of envID.
+func networkName(envID string) string {
+	return envID + "-net"
+}
+
+// VerifyProxy refuses a proxy container that is missing, stopped, or able
+// to reach the Docker daemon (see checkProxyContainer).
+func (d *DockerEngine) VerifyProxy(ctx context.Context) error {
+	res, err := d.client.ContainerInspect(ctx, d.proxyContainer, client.ContainerInspectOptions{})
+	if err != nil {
+		return fmt.Errorf("inspect proxy container %s: %w", d.proxyContainer, err)
+	}
+	return checkProxyContainer(d.proxyContainer, res.Container)
+}
+
+// checkProxyContainer fails closed unless the proxy runs without any path to
+// the Docker daemon: no mounted socket (a socket gives the proxy host root),
+// no Docker provider in its arguments or environment (PR containers could
+// then set routes through labels), not privileged.
+func checkProxyContainer(name string, c container.InspectResponse) error {
+	if c.State == nil || !c.State.Running {
+		return fmt.Errorf("proxy container %s is not running", name)
+	}
+	if c.HostConfig != nil && c.HostConfig.Privileged {
+		return fmt.Errorf("proxy container %s is privileged", name)
+	}
+	for _, m := range c.Mounts {
+		if strings.HasSuffix(m.Source, ".sock") || strings.HasSuffix(m.Destination, ".sock") {
+			return fmt.Errorf("proxy container %s mounts socket %s: the proxy must never reach a daemon", name, m.Destination)
+		}
+	}
+	if c.Config != nil {
+		for _, kv := range c.Config.Env {
+			if strings.HasPrefix(strings.ToUpper(kv), "TRAEFIK_PROVIDERS_DOCKER") {
+				return fmt.Errorf("proxy container %s enables the Docker provider through its environment", name)
+			}
+		}
+	}
+	args := c.Args
+	if c.Config != nil {
+		args = append(append([]string{}, c.Config.Cmd...), args...)
+	}
+	for _, a := range args {
+		if strings.Contains(strings.ToLower(a), "providers.docker") {
+			return fmt.Errorf("proxy container %s enables the Docker provider: %s", name, a)
+		}
+	}
+	return nil
 }
 
 // Ping verifies daemon reachability.
@@ -130,15 +189,28 @@ func (d *DockerEngine) Build(ctx context.Context, buildDir, tag string) error {
 	return nil
 }
 
-// ProvisionNetwork creates a dedicated bridge network for the pull request.
+// ProvisionNetwork creates the environment's internal bridge network: no
+// default route, no egress, shared only with the proxy. An existing network
+// of that name is reused only if it is internal.
 func (d *DockerEngine) ProvisionNetwork(ctx context.Context, envID string) error {
-	netName := fmt.Sprintf("%s-net", envID)
+	netName := networkName(envID)
 	opts := client.NetworkCreateOptions{
-		Driver: "bridge",
+		Driver:   "bridge",
+		Internal: true,
 	}
 	_, err := d.client.NetworkCreate(ctx, netName, opts)
-	if err != nil && !errdefs.IsConflict(err) {
+	if err == nil {
+		return nil
+	}
+	if !errdefs.IsConflict(err) {
 		return fmt.Errorf("failed to provision isolated network %s: %w", netName, err)
+	}
+	res, inspectErr := d.client.NetworkInspect(ctx, netName, client.NetworkInspectOptions{})
+	if inspectErr != nil {
+		return fmt.Errorf("inspect existing network %s: %w", netName, inspectErr)
+	}
+	if !res.Network.Internal {
+		return fmt.Errorf("existing network %s is not internal: refusing to reuse it", netName)
 	}
 	return nil
 }
@@ -152,12 +224,12 @@ func containerSpec(env Environment) (*container.Config, *container.HostConfig, e
 		return nil, nil, fmt.Errorf("environment %s: staged secrets dir %q must be an absolute path", env.ID, env.SecretsDir)
 	}
 
+	// No routing labels: the proxy reads route documents, never labels.
 	cfg := &container.Config{
-		Image:  env.Image,
-		Labels: proxy.GenerateLabels(env.ID, env.Port, env.Domain),
+		Image: env.Image,
 	}
 
-	netName := fmt.Sprintf("%s-net", env.ID)
+	netName := networkName(env.ID)
 	hostCfg := &container.HostConfig{
 		NetworkMode: container.NetworkMode(netName),
 		AutoRemove:  false,
@@ -178,11 +250,13 @@ func containerSpec(env Environment) (*container.Config, *container.HostConfig, e
 	return cfg, hostCfg, nil
 }
 
-// Deploy provisions a container with dynamic routing labels and attaches it to proxy/isolated networks.
-func (d *DockerEngine) Deploy(ctx context.Context, env Environment) error {
+// Deploy starts the environment's container on its internal network only,
+// joins the proxy to that network, and returns the address the route
+// document points to.
+func (d *DockerEngine) Deploy(ctx context.Context, env Environment) (netip.AddrPort, error) {
 	cfg, hostCfg, err := containerSpec(env)
 	if err != nil {
-		return err
+		return netip.AddrPort{}, err
 	}
 
 	resp, err := d.client.ContainerCreate(ctx, client.ContainerCreateOptions{
@@ -191,18 +265,77 @@ func (d *DockerEngine) Deploy(ctx context.Context, env Environment) error {
 		Name:       env.ID,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to create environment container %s: %w", env.ID, err)
-	}
-
-	if _, err := d.client.NetworkConnect(ctx, "previewd-proxy", client.NetworkConnectOptions{Container: resp.ID}); err != nil {
-		return fmt.Errorf("failed to connect container to ingress proxy network: %w", err)
+		return netip.AddrPort{}, fmt.Errorf("failed to create environment container %s: %w", env.ID, err)
 	}
 
 	if _, err := d.client.ContainerStart(ctx, resp.ID, client.ContainerStartOptions{}); err != nil {
-		return fmt.Errorf("failed to start environment container %s: %w", env.ID, err)
+		return netip.AddrPort{}, fmt.Errorf("failed to start environment container %s: %w", env.ID, err)
 	}
 
+	// The proxy can be recreated while the daemon runs: re-check it before
+	// joining it to another environment's network.
+	if err := d.VerifyProxy(ctx); err != nil {
+		return netip.AddrPort{}, err
+	}
+	netName := networkName(env.ID)
+	if err := d.connectProxy(ctx, netName); err != nil {
+		return netip.AddrPort{}, err
+	}
+
+	res, err := d.client.ContainerInspect(ctx, resp.ID, client.ContainerInspectOptions{})
+	if err != nil {
+		return netip.AddrPort{}, fmt.Errorf("inspect environment container %s: %w", env.ID, err)
+	}
+	return backendAddr(res.Container, netName, env.Port)
+}
+
+// connectProxy joins the proxy container to netName. Already joined is fine.
+func (d *DockerEngine) connectProxy(ctx context.Context, netName string) error {
+	_, err := d.client.NetworkConnect(ctx, netName, client.NetworkConnectOptions{Container: d.proxyContainer})
+	if err == nil {
+		return nil
+	}
+	attached, inspectErr := d.proxyAttached(ctx, netName)
+	if inspectErr != nil {
+		return errors.Join(fmt.Errorf("connect proxy to %s: %w", netName, err), inspectErr)
+	}
+	if !attached {
+		return fmt.Errorf("connect proxy to %s: %w", netName, err)
+	}
 	return nil
+}
+
+// proxyAttached reports whether the proxy container is an endpoint of netName.
+func (d *DockerEngine) proxyAttached(ctx context.Context, netName string) (bool, error) {
+	res, err := d.client.NetworkInspect(ctx, netName, client.NetworkInspectOptions{})
+	if err != nil {
+		return false, fmt.Errorf("inspect network %s: %w", netName, err)
+	}
+	for id, ep := range res.Network.Containers {
+		if ep.Name == d.proxyContainer || id == d.proxyContainer {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// backendAddr is the container's address on its internal network, with the
+// application port.
+func backendAddr(c container.InspectResponse, netName string, port int) (netip.AddrPort, error) {
+	if port <= 0 || port > 65535 {
+		return netip.AddrPort{}, fmt.Errorf("application port %d out of range", port)
+	}
+	if c.NetworkSettings == nil {
+		return netip.AddrPort{}, fmt.Errorf("container %s has no network settings", c.Name)
+	}
+	ep, ok := c.NetworkSettings.Networks[netName]
+	if !ok || ep == nil {
+		return netip.AddrPort{}, fmt.Errorf("container %s is not attached to %s", c.Name, netName)
+	}
+	if !ep.IPAddress.IsValid() || ep.IPAddress.IsUnspecified() {
+		return netip.AddrPort{}, fmt.Errorf("container %s has no address on %s", c.Name, netName)
+	}
+	return netip.AddrPortFrom(ep.IPAddress, uint16(port)), nil // #nosec G115 -- port checked within 1..65535 above
 }
 
 // Destroy aggressively terminates the container, purges the image, and removes the network.
@@ -215,7 +348,10 @@ func (d *DockerEngine) Destroy(ctx context.Context, id string) error {
 		return fmt.Errorf("container teardown failed: %w", err)
 	}
 
-	netName := fmt.Sprintf("%s-net", id)
+	netName := networkName(id)
+	if err := d.disconnectProxy(ctx, netName); err != nil {
+		return err
+	}
 	if _, err := d.client.NetworkRemove(ctx, netName, client.NetworkRemoveOptions{}); err != nil && !errdefs.IsNotFound(err) {
 		return fmt.Errorf("network teardown failed: %w", err)
 	}
@@ -225,6 +361,27 @@ func (d *DockerEngine) Destroy(ctx context.Context, id string) error {
 		return fmt.Errorf("image teardown failed: %w", err)
 	}
 
+	return nil
+}
+
+// disconnectProxy detaches the proxy from netName, which cannot be removed
+// while the proxy is an endpoint. A missing network or a proxy already
+// detached is fine.
+func (d *DockerEngine) disconnectProxy(ctx context.Context, netName string) error {
+	_, err := d.client.NetworkDisconnect(ctx, netName, client.NetworkDisconnectOptions{Container: d.proxyContainer, Force: true})
+	if err == nil || errdefs.IsNotFound(err) {
+		return nil
+	}
+	attached, inspectErr := d.proxyAttached(ctx, netName)
+	if inspectErr != nil {
+		if errdefs.IsNotFound(inspectErr) {
+			return nil
+		}
+		return errors.Join(fmt.Errorf("disconnect proxy from %s: %w", netName, err), inspectErr)
+	}
+	if attached {
+		return fmt.Errorf("disconnect proxy from %s: %w", netName, err)
+	}
 	return nil
 }
 

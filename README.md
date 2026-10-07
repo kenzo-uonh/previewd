@@ -5,8 +5,8 @@
 ## Architecture & Tech Stack
 
 *   **Core Daemon:** Statically compiled Go 1.27+ binary (`CGO_ENABLED=0`) requiring zero external OS dependencies.
-*   **Orchestration:** Docker API (`github.com/moby/moby/client`) for isolated bridge networks and container lifecycles.
-*   **Ingress & Routing:** Traefik reverse proxy bound to the local Docker socket, configured dynamically via runtime container labels.
+*   **Orchestration:** Docker API (`github.com/moby/moby/client`). Each environment runs on its own internal bridge network (no default route, no egress), shared only with the Traefik container.
+*   **Ingress & Routing:** Traefik with the file provider only. previewd writes one route document per environment into `PREVIEWD_ROUTES_DIR` and removes it at teardown. Traefik has no Docker socket and reads no container label, so nothing in a PR image can add or change a route. Its entry point listens only on its fixed `previewd-proxy` address, never on the environment networks it joins, so a PR container cannot reach other environments through it. previewd refuses to start if the Traefik container mounts a socket, enables the Docker provider, is privileged or is not running.
 *   **Persistence:** CGO-free SQLite (`modernc.org/sqlite`) storing minimal environment metadata to ensure crash recovery.
 *   **Security Context:** Secrets are loaded into memory from a local secrets file. For each environment they are staged on a host ramfs directory (`/run/previewd/secrets/<env-id>/`, one file per key) and bind-mounted read-only into the container at `/run/secrets`. They never pass through container environment variables, the Docker API, `docker inspect`, image layers or disk.
 
@@ -18,8 +18,8 @@
 │   └── previewd/
 │       └── main.go                # Single binary entry point initializing config, store, and HTTP server.
 ├── deployments/
-│   ├── docker-compose.yml         # Standalone installation for agent and Traefik reverse proxy.
-│   └── traefik.yml                # Base Traefik static configuration.
+│   ├── docker-compose.yml         # Traefik: digest-pinned, read-only, no socket, routes dir mounted read-only.
+│   └── traefik.yml                # Traefik static configuration: file provider only, no API, no telemetry.
 ├── internal/
 │   ├── api/
 │   │   ├── handlers.go            # Webhook receivers for GitHub PR events (validate + envid).
@@ -34,8 +34,7 @@
 │   │   ├── environment.go         # EaaS lifecycle logic (Clone, Start, Stop, Destroy).
 │   │   └── queue.go               # Bounded worker pool for deployment concurrency.
 │   ├── proxy/
-│   │   ├── labels.go              # Docker label routing (current runtime path).
-│   │   ├── route.go               # Traefik file-provider route documents (validated, JSON-as-YAML).
+│   │   ├── route.go               # Traefik file-provider route documents (validated, JSON-as-YAML), the only routing path.
 │   │   └── publish.go             # Atomic publish: temp file, fsync, rename, fsync dir.
 │   ├── secrets/
 │   │   ├── injector.go            # Loads the secrets file into memory.
@@ -64,7 +63,7 @@ The project uses a strict `Makefile` for all build and verification pipelines to
 
 ### Core Commands
 
-* **Initialize Infrastructure:** Start the local Traefik proxy on port 8081 and create the `previewd-proxy` bridge network.
+* **Initialize Infrastructure:** Start Traefik on port 80 and create the `previewd-proxy` bridge network (`172.30.255.0/24`; change it in both `deployments/docker-compose.yml` and `deployments/traefik.yml` if it overlaps a site network). `PREVIEWD_ROUTES_DIR` must exist first and be the directory the daemon writes to. The image is pinned by digest: on an air-gapped host, `docker load` it from a tar first.
 
 
 ```bash
@@ -88,7 +87,7 @@ make run
 ```
 
 
-* **Execute End-to-End Tests:** Run the air-gapped validation suite using a locally generated bare Git repository to verify the complete environment lifecycle.
+* **Execute End-to-End Tests:** Run the air-gapped validation suite using a locally generated bare Git repository to verify the complete environment lifecycle: signature check, secrets only through the read-only mount, routing through the route document (no label, no socket), the internal network shared only with Traefik, Traefik unreachable from the PR container, and teardown of container, network, route and staged secrets. It mounts a ramfs with sudo; `E2E_STAGING=tmpfs make e2e` uses `/dev/shm` with `PREVIEWD_ALLOW_TMPFS_SECRETS=1` instead. Needs `busybox:latest` loaded locally.
 
 
 ```bash
@@ -172,6 +171,12 @@ Operational parameters enforce hardware boundaries and are managed exclusively v
 
 
 * `PREVIEWD_DB_PATH`: SQLite database path (default: previewd.sqlite).
+
+
+* `PREVIEWD_ROUTES_DIR`: Directory of the route documents, watched by Traefik's file provider (default: `/var/lib/previewd/routes`). Must exist (absolute path, not a symlink); the daemon refuses to start otherwise. Mounted read-only into Traefik.
+
+
+* `PREVIEWD_TRAEFIK_CONTAINER`: Name of the Traefik container, joined to each environment network (default: `traefik-proxy`). Checked at startup.
 
 ## Secret Staging
 
