@@ -16,6 +16,7 @@ type Config struct {
 	SecretsPath         string
 	SecretsStagingDir   string
 	AllowTmpfsSecrets   bool
+	AllowUnlockedMemory bool
 	MaxConcurrentBuilds int
 }
 
@@ -50,6 +51,9 @@ func Load() (*Config, error) {
 	}
 
 	webhookSecret := os.Getenv("PREVIEWD_WEBHOOK_SECRET")
+	if webhookSecret == "" {
+		return nil, fmt.Errorf("PREVIEWD_WEBHOOK_SECRET is required: webhooks are never accepted unsigned")
+	}
 
 	secretsPath := os.Getenv("PREVIEWD_SECRETS_PATH")
 	if secretsPath == "" {
@@ -61,14 +65,13 @@ func Load() (*Config, error) {
 		stagingDir = defaultStagingDir
 	}
 
-	// Opt-ins are exact: only "1" enables, any other non-empty value is an error.
-	allowTmpfs := false
-	switch v := os.Getenv("PREVIEWD_ALLOW_TMPFS_SECRETS"); v {
-	case "":
-	case "1":
-		allowTmpfs = true
-	default:
-		return nil, fmt.Errorf("invalid PREVIEWD_ALLOW_TMPFS_SECRETS %q: set exactly 1 or leave unset", v)
+	allowTmpfs, err := optIn("PREVIEWD_ALLOW_TMPFS_SECRETS")
+	if err != nil {
+		return nil, err
+	}
+	allowUnlocked, err := optIn("PREVIEWD_ALLOW_UNLOCKED_MEMORY")
+	if err != nil {
+		return nil, err
 	}
 
 	maxBuilds := 2
@@ -87,6 +90,20 @@ func Load() (*Config, error) {
 		SecretsPath:         secretsPath,
 		SecretsStagingDir:   stagingDir,
 		AllowTmpfsSecrets:   allowTmpfs,
+		AllowUnlockedMemory: allowUnlocked,
 		MaxConcurrentBuilds: maxBuilds,
 	}, nil
+}
+
+// optIn reads an opt-in flag. Opt-ins are exact: only "1" enables, any other
+// non-empty value is a configuration error.
+func optIn(name string) (bool, error) {
+	switch v := os.Getenv(name); v {
+	case "":
+		return false, nil
+	case "1":
+		return true, nil
+	default:
+		return false, fmt.Errorf("invalid %s %q: set exactly 1 or leave unset", name, v)
+	}
 }

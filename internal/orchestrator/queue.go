@@ -8,7 +8,7 @@ import (
 // Job encapsulates the required parameters for provisioning an ephemeral stack.
 type Job struct {
 	EnvID    string
-	PRNumber int
+	PRNumber int64
 	CloneURL string
 	Commit   string
 }

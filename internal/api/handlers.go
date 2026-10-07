@@ -1,14 +1,17 @@
 package api
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 
 	"github.com/kenzo-uonh/previewd/internal/config"
+	"github.com/kenzo-uonh/previewd/internal/envid"
 	"github.com/kenzo-uonh/previewd/internal/orchestrator"
 	"github.com/kenzo-uonh/previewd/internal/store"
+	"github.com/kenzo-uonh/previewd/internal/validate"
 	"github.com/kenzo-uonh/previewd/internal/vcs"
 )
 
@@ -48,7 +51,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealthCheck())
 
 	webhookHandler := http.HandlerFunc(s.handleGitHubWebhook())
-	mux.Handle("POST /webhooks/github", ValidateGitHubSignature(s.cfg.WebhookSecret)(webhookHandler))
+	mux.Handle("POST /webhooks/github", ValidateGitHubSignature([]byte(s.cfg.WebhookSecret))(webhookHandler))
 
 	return mux
 }
@@ -87,37 +90,49 @@ func (s *Server) handleGitHubWebhook() http.HandlerFunc {
 			return
 		}
 
-		var payload vcs.PullRequestPayload
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			s.logger.Error("Malformed JSON webhook payload", "error", err)
-			http.Error(w, "invalid JSON payload", http.StatusBadRequest)
+		body, err := io.ReadAll(io.LimitReader(r.Body, validate.MaxPayloadBytes+1))
+		if err != nil {
+			http.Error(w, "payload read failure", http.StatusBadRequest)
+			return
+		}
+		pr, err := validate.ParsePullRequest(body)
+		if errors.Is(err, validate.ErrIgnoredAction) {
+			s.logger.Debug("Unsupported PR action ignored", "pr_number", pr.Number, "repository", pr.Repo)
+			s.respond(w, http.StatusAccepted, `{"status":"action_ignored"}`)
+			return
+		}
+		if err != nil {
+			s.logger.Error("Rejected webhook payload", "error", err)
+			http.Error(w, "invalid pull_request payload", http.StatusBadRequest)
 			return
 		}
 
-		envID := fmt.Sprintf("pr-%d", payload.Number)
+		envID := envid.Generate(pr.Repo, pr.HeadRef, uint64(pr.Number))
 
-		switch payload.Action {
-		case vcs.ActionOpened, vcs.ActionReopened, vcs.ActionSynchronize:
+		switch pr.Action {
+		case validate.ActionOpened, validate.ActionReopened, validate.ActionSynchronize:
 			s.logger.Info("Queueing environment deployment",
 				"environment_id", envID,
-				"pr_number", payload.Number,
-				"action", payload.Action,
-				"commit_sha", payload.PullRequest.Head.SHA,
+				"repository", pr.Repo,
+				"pr_number", pr.Number,
+				"action", pr.Action,
+				"commit_sha", pr.HeadSHA,
 			)
 
 			s.pool.Submit(orchestrator.Job{
 				EnvID:    envID,
-				PRNumber: payload.Number,
-				CloneURL: payload.Repository.CloneURL,
-				Commit:   payload.PullRequest.Head.SHA,
+				PRNumber: int64(pr.Number),
+				CloneURL: pr.CloneURL,
+				Commit:   pr.HeadSHA,
 			})
 
 			s.respond(w, http.StatusAccepted, fmt.Sprintf(`{"status":"queued","environment_id":"%s"}`, envID))
 
-		case vcs.ActionClosed:
+		case validate.ActionClosed:
 			s.logger.Info("Triggering environment teardown",
 				"environment_id", envID,
-				"pr_number", payload.Number,
+				"repository", pr.Repo,
+				"pr_number", pr.Number,
 			)
 
 			if err := orchestrator.Teardown(r.Context(), s.engine, s.stager, envID); err != nil {
@@ -128,10 +143,6 @@ func (s *Server) handleGitHubWebhook() http.HandlerFunc {
 			}
 
 			s.respond(w, http.StatusOK, fmt.Sprintf(`{"status":"terminated","environment_id":"%s"}`, envID))
-
-		default:
-			s.logger.Debug("Unsupported PR action ignored", "action", payload.Action)
-			s.respond(w, http.StatusAccepted, `{"status":"action_ignored"}`)
 		}
 	}
 }

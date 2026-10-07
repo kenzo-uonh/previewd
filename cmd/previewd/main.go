@@ -13,6 +13,7 @@ import (
 
 	"github.com/kenzo-uonh/previewd/internal/api"
 	"github.com/kenzo-uonh/previewd/internal/config"
+	"github.com/kenzo-uonh/previewd/internal/hardening"
 	"github.com/kenzo-uonh/previewd/internal/orchestrator"
 	"github.com/kenzo-uonh/previewd/internal/secrets"
 	"github.com/kenzo-uonh/previewd/internal/store"
@@ -36,6 +37,18 @@ func main() {
 		"domain", cfg.TraefikDomain,
 		"docker_host", cfg.DockerHost,
 	)
+
+	// Lock memory before any secret is read into it.
+	if err := hardening.LockMemory(); err != nil {
+		if !cfg.AllowUnlockedMemory {
+			logger.Error("Process memory lock refused", "error", err)
+			os.Exit(1)
+		}
+		logger.Error("Opt-in active: process memory not locked, secrets in memory can be swapped to disk",
+			"opt_in", "PREVIEWD_ALLOW_UNLOCKED_MEMORY",
+			"error", err,
+		)
+	}
 
 	injector, err := secrets.NewInjector(cfg.SecretsPath)
 	if err != nil {

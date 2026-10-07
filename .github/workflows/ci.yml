@@ -203,6 +203,8 @@ jobs:
           GOPROXY: "off"
           GOSUMDB: "off"
           GOMODCACHE: ${{ runner.temp }}/empty-modcache
+          # Namespace system tests (real ramfs/tmpfs mounts) must run, not skip.
+          PREVIEWD_REQUIRE_NS_TESTS: "1"
         run: |
           ./scripts/airgap-exec.sh make check \
             DEPS_GATE=vendor-check \
@@ -214,7 +216,22 @@ jobs:
           GOPROXY: "off"
           GOSUMDB: "off"
           GOMODCACHE: ${{ runner.temp }}/empty-modcache
+          PREVIEWD_REQUIRE_NS_TESTS: "1"
         run: ./scripts/airgap-exec.sh make verify
+
+      - name: "Phase 2 (air-gapped): mlockall success path"
+        env:
+          GOFLAGS: -mod=vendor
+          GOPROXY: "off"
+          GOSUMDB: "off"
+          GOMODCACHE: ${{ runner.temp }}/empty-modcache
+          PREVIEWD_REQUIRE_MLOCK_TEST: "1"
+        run: |
+          # Root raises this shell's RLIMIT_MEMLOCK to unlimited (what
+          # LimitMEMLOCK=infinity gives the daemon); the air-gap wrapper and
+          # the test inherit it and run as the runner user.
+          sudo prlimit --memlock=unlimited:unlimited --pid $$
+          ./scripts/airgap-exec.sh go test -count=1 -run '^TestLockMemory' ./internal/hardening/
 
       - name: Upload fuzz crashers
         if: failure()

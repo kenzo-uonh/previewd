@@ -22,26 +22,33 @@
 │   └── traefik.yml                # Base Traefik static configuration.
 ├── internal/
 │   ├── api/
-│   │   ├── handlers.go            # Webhook receivers for GitHub PR events.
-│   │   └── middleware.go          # Request authentication and payload signature verification.
+│   │   ├── handlers.go            # Webhook receivers for GitHub PR events (validate + envid).
+│   │   └── middleware.go          # Bounded body read, HMAC-SHA256 verification (validate).
 │   ├── config/
 │   │   └── config.go              # Air-gapped environment configuration loading.
+│   ├── envid/                     # Environment ID: pr-<n>-<hash(repo, branch)>, a DNS label (leaf).
+│   ├── hardening/                 # mlockall with RLIMIT_MEMLOCK and VmLck checks (leaf, _linux/_other).
 │   ├── orchestrator/
 │   │   ├── docker.go              # Docker Driver implementation for the MVP.
 │   │   ├── engine.go              # Interface defining the Driver (Docker/Kubernetes).
 │   │   ├── environment.go         # EaaS lifecycle logic (Clone, Start, Stop, Destroy).
 │   │   └── queue.go               # Bounded worker pool for deployment concurrency.
 │   ├── proxy/
-│   │   └── labels.go              # Dynamic routing configuration and Docker label assignment.
+│   │   ├── labels.go              # Docker label routing (current runtime path).
+│   │   ├── route.go               # Traefik file-provider route documents (validated, JSON-as-YAML).
+│   │   └── publish.go             # Atomic publish: temp file, fsync, rename, fsync dir.
 │   ├── secrets/
 │   │   ├── injector.go            # Loads the secrets file into memory.
 │   │   └── stager*.go             # ramfs staging: fs-type, owner and mode checks, one file per key.
 │   ├── store/
 │   │   ├── db.go                  # modernc.org/sqlite connection pool (No CGO).
-│   │   └── queries.go             # Agent persistence for active environment states.
+│   │   ├── queries.go             # Agent persistence for active environment states.
+│   │   └── schema.go              # Startup schema check: pinned columns, no BLOB affinity.
+│   ├── textutil/                  # Sanitize: map untrusted text onto [a-zA-Z0-9-] (leaf).
+│   ├── validate/                  # Identifier validators, webhook HMAC and payload schema, layering test (leaf).
 │   └── vcs/
 │       ├── clone.go               # Secure repository cloning execution.
-│       └── github.go              # GitHub webhook payload schemas.
+│       └── github.go              # GitHub webhook event names.
 ├── scripts/
 │   ├── build.sh                   # Static binary compilation script.
 │   └── verify-e2e.sh              # Local, air-gapped end-to-end integration validation.
@@ -149,6 +156,12 @@ Operational parameters enforce hardware boundaries and are managed exclusively v
 * `PREVIEWD_MAX_BUILDS`: Strict concurrency limit for active deployment workers to prevent host CPU/RAM exhaustion (default: 2).
 
 
+* `PREVIEWD_WEBHOOK_SECRET`: HMAC secret of the GitHub webhook. **Required.** The daemon refuses to start without it, and an empty secret accepts nothing. Every webhook must carry the exact `X-Hub-Signature-256` for its body (at most 1 MiB).
+
+
+* `PREVIEWD_ALLOW_UNLOCKED_MEMORY`: Set exactly `1` to start when `mlockall` cannot be applied. By default the daemon locks all current and future memory before reading any secret, and refuses to start unless `RLIMIT_MEMLOCK` is unlimited (systemd `LimitMEMLOCK=infinity`). The opt-in is logged as an error at every start.
+
+
 * `PREVIEWD_SECRETS_PATH`: Path to the local air-gapped secrets file (default: secrets.env).
 
 
@@ -177,3 +190,25 @@ sudo chown previewd:previewd /run/previewd/secrets
 ```
 
 ramfs is never swapped. A reboot discards it, together with every staged secret.
+
+## Webhook Ingestion
+
+1. **Signature:** the body is read up to 1 MiB (larger bodies get 413, never truncated). It must carry `X-Hub-Signature-256: sha256=<64 lowercase hex>`, equal to HMAC-SHA256 of the raw body under `PREVIEWD_WEBHOOK_SECRET`. Anything else gets 401.
+2. **Schema:** `pull_request` bodies need `action`, `number` (1 to 2^32-1), `pull_request.head.ref` (git ref rules), `pull_request.head.sha` (40 or 64 lowercase hex), `repository.full_name` (`owner/repo`) and `repository.clone_url` (absolute, no credentials), for every action, `closed` included. `opened`, `reopened`, `synchronize` and `closed` are acted on; other well-formed actions get 202 and are ignored.
+3. **Environment ID:** `pr-<number>-<10 hex of SHA-256(repo, head branch)>`. The same PR number in two repositories, or on two branches, never shares an environment.
+
+## Formal Verification (Phase 1)
+
+| Invariant | Where | How |
+|---|---|---|
+| Environment ID is an RFC 1123 label (at most 63 chars), recovers its PR number, is deterministic, separates repositories | `internal/envid` | rapid properties over arbitrary strings and bytes |
+| `Sanitize` is idempotent and outputs only `[a-zA-Z0-9-]` | `internal/textutil` | rapid properties |
+| Route documents decode with `gopkg.in/yaml.v3` (Traefik's parser) and as strict JSON; merged routes send each host only to its own backend | `internal/proxy` | rapid properties |
+| Signature check and payload parser never panic; only the exact HMAC is accepted; schema violations are rejected | `internal/validate` | native fuzzing (`FuzzVerifySignature`, `FuzzParsePullRequest`) |
+| Route swap is atomic (no torn read) and durable (fsync file, rename, fsync dir) | `internal/proxy` | concurrent reader test, call-order test |
+| Schema holds no BLOB column and no unreviewed column | `internal/store` | startup check plus drift tests on modernc |
+| Staging root is really ramfs | `internal/secrets` | real ramfs and tmpfs mounts inside an unprivileged user and mount namespace |
+| `mlockall` locks current and future pages, and is refused under a finite limit | `internal/hardening` | subprocess tests (the success path needs `RLIMIT_MEMLOCK` unlimited; CI raises it with `prlimit`) |
+| Leaves import no internal package; layering edges are explicit | `internal/validate` | `TestPackageLayering` |
+
+`make check` runs all of these deterministically (fixed rapid seed, fuzz seed corpora). `make verify` runs rapid at 10,000 checks with random seeds, plus each fuzz target for `FUZZTIME`. Namespace tests skip where unprivileged user namespaces are unavailable. `PREVIEWD_REQUIRE_NS_TESTS=1` and `PREVIEWD_REQUIRE_MLOCK_TEST=1` turn those skips into failures, and CI sets both.

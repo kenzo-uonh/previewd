@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -33,6 +34,9 @@ func NewStore(ctx context.Context, dsn string) (*Store, error) {
 
 	if err := initializeSchema(ctx, db); err != nil {
 		return nil, err
+	}
+	if err := verifySchema(ctx, db); err != nil {
+		return nil, errors.Join(err, db.Close())
 	}
 
 	return &Store{db: db}, nil

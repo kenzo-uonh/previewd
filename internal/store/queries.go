@@ -9,7 +9,7 @@ import (
 // EnvironmentRecord models the persistence schema for ephemeral stacks.
 type EnvironmentRecord struct {
 	ID        string
-	PRNumber  int
+	PRNumber  int64
 	Status    string
 	CreatedAt time.Time
 }
