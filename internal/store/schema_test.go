@@ -19,7 +19,7 @@ func openTestDB(t *testing.T) *sql.DB {
 			t.Error(err)
 		}
 	})
-	if err := initializeSchema(context.Background(), db); err != nil {
+	if err := migrate(context.Background(), db); err != nil {
 		t.Fatal(err)
 	}
 	return db
@@ -45,7 +45,8 @@ func TestVerifySchemaRefusesDrift(t *testing.T) {
 		"blob column":                `ALTER TABLE environments ADD COLUMN payload BLOB`,
 		"untyped column":             `ALTER TABLE environments ADD COLUMN extra`,
 		"varchar column":             `ALTER TABLE environments ADD COLUMN env VARCHAR(255)`,
-		"new table":                  `CREATE TABLE jobs (id INTEGER PRIMARY KEY)`,
+		"new table":                  `CREATE TABLE leases (id INTEGER PRIMARY KEY)`,
+		"text column on jobs":        `ALTER TABLE jobs ADD COLUMN note TEXT`,
 		"new table with blob":        `CREATE TABLE cache (k INTEGER, v BLOB)`,
 		"allowlisted column retyped": `ALTER TABLE environments RENAME COLUMN status TO status_old; ALTER TABLE environments ADD COLUMN status BLOB`,
 	} {
@@ -98,7 +99,7 @@ func TestNewStoreRefusesDriftedDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := initializeSchema(context.Background(), db); err != nil {
+	if err := migrate(context.Background(), db); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.ExecContext(context.Background(), `ALTER TABLE environments ADD COLUMN token TEXT`); err != nil {

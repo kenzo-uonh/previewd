@@ -40,7 +40,8 @@
 │   │   ├── injector.go            # Loads the secrets file into memory.
 │   │   └── stager*.go             # ramfs staging: fs-type, owner and mode checks, one file per key.
 │   ├── store/
-│   │   ├── db.go                  # modernc.org/sqlite connection pool (No CGO).
+│   │   ├── db.go                  # modernc.org/sqlite pool (No CGO): WAL, busy_timeout, IMMEDIATE transactions, forward-only migrations.
+│   │   ├── jobs.go                # Durable job queue: replay protection, stale deliveries, leases, startup sweep (TLA+ model).
 │   │   ├── queries.go             # Agent persistence for active environment states.
 │   │   └── schema.go              # Startup schema check: pinned columns, no BLOB affinity.
 │   ├── textutil/                  # Sanitize: map untrusted text onto [a-zA-Z0-9-] (leaf).
@@ -215,6 +216,8 @@ ramfs is never swapped. A reboot discards it, together with every staged secret.
 | Staging root is really ramfs | `internal/secrets` | real ramfs and tmpfs mounts inside an unprivileged user and mount namespace |
 | `mlockall` locks current and future pages, and is refused under a finite limit | `internal/hardening` | subprocess tests (the success path needs `RLIMIT_MEMLOCK` unlimited; CI raises it with `prlimit`) |
 | Leaves import no internal package; layering edges are explicit | `internal/validate` | `TestPackageLayering` |
+| Job queue equals the TLA+ model after every command (enqueue, replay, out-of-order delivery, acquire, deploy and teardown steps with Docker failures, daemon crash, host reboot, stale leases); lock integrity, monotonicity, no orphaned resources; every job completes and the host converges | `internal/store` | `rapid.StateMachine` (`TestJobStore_StateMachine`), scenario tests per deviation D1 to D3 |
+| Overlapping read/write transactions never surface `SQLITE_BUSY` | `internal/store` | 16 writers and 4 long readers on two pools; controls prove the detector fires without the connection parameters |
 
 `make check` runs all of these deterministically (fixed rapid seed, fuzz seed corpora). `make verify` runs rapid at 10,000 checks with random seeds, plus each fuzz target for `FUZZTIME`. Namespace tests skip where unprivileged user namespaces are unavailable. `PREVIEWD_REQUIRE_NS_TESTS=1` and `PREVIEWD_REQUIRE_MLOCK_TEST=1` turn those skips into failures, and CI sets both.
 

@@ -8,7 +8,7 @@ GitHub ──signed delivery──▶ Api ──1 tx──▶ db_jobs (SQLite) �
                        Supervisor: StartupSweep at every start   Chaos: SimulateCrash (daemon crash / host reboot)
 ```
 
-It is the reference for Phase 3 (`store/jobs.go`, SPBT against this model). The shipped code still queues in memory (`orchestrator.WorkerPool`) and tears down inside the webhook handler, so the model describes the design, not the current binary.
+It is the reference for Phase 3: `internal/store/jobs.go` implements its transitions and `TestJobStore_StateMachine` checks the implementation against it after every command (`docs/specs/phase3_spbt_architecture.md`). The shipped code still queues in memory (`orchestrator.WorkerPool`) and tears down inside the webhook handler, so the model describes the design, not the current binary.
 
 ## Files
 

@@ -19,6 +19,26 @@ var schemaAllowlist = map[string]map[string]string{
 		"status":     "TEXT",     // lifecycle state: building, running, failed
 		"created_at": "DATETIME", // timestamp
 	},
+	"jobs": {
+		"id":          "INTEGER", // job ID
+		"preview_id":  "TEXT",    // environment ID: envid.Generate output, a DNS label
+		"type":        "TEXT",    // deploy or teardown (CHECK)
+		"seq":         "INTEGER", // delivery order
+		"status":      "TEXT",    // QUEUED, IN_PROGRESS, SUCCESS, FAILED, SKIPPED (CHECK)
+		"attempts":    "INTEGER", // teardown requeues
+		"not_before":  "INTEGER", // backoff, Unix milliseconds
+		"lease_epoch": "INTEGER", // boot epoch of the lease
+	},
+	"deliveries": {
+		"delivery_id": "TEXT",    // X-GitHub-Delivery GUID, at most 64 bytes (CHECK)
+		"preview_id":  "TEXT",    // environment ID: envid.Generate output, a DNS label
+		"seq":         "INTEGER", // delivery order
+		"verdict":     "TEXT",    // accepted or stale (CHECK)
+	},
+	"boots": {
+		"epoch":      "INTEGER", // boot epoch
+		"started_at": "INTEGER", // Unix milliseconds
+	},
 }
 
 // verifySchema refuses a database whose schema leaves the allowlist, or that
