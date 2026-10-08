@@ -10,14 +10,15 @@ Supervisor: StartupSweep at every start      Revalidator, Expirer: fair previewd
 Pruner, Chaos (daemon crash, host reboot), GitHub: unfair, bounded
 ```
 
-The daemon implements the MVP part: `internal/store/jobs.go` (queue transitions) and `internal/orchestrator/reconciler.go` (workers and startup sweep). `TestJobStore_StateMachine` checks the queue against the model after every command (`docs/specs/phase3_spbt_architecture.md`). The V1 part is specified in `docs/specs/V1-previewd.md`; task A2 extends the state-machine test to it.
+The daemon implements the MVP part: `internal/store/jobs.go` (queue transitions) and `internal/orchestrator/reconciler.go` (workers and startup sweep). `TestJobStore_StateMachine` checks the queue against the model after every command (`docs/specs/phase3_spbt_architecture.md`). The V1 part is specified in `docs/specs/V1-previewd.md`. Task A2 extended the state-machine test to it (`internal/store/jobs_spbt_v1*_test.go`, V1-model.md section 8): the Go reference model follows this model rule for rule, and found two design bugs beyond the TLC bounds (V1-model.md section 11), fixed here and pinned by `previewd_a2.tla`.
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `previewd.tla` | Model, invariants, temporal properties. The block between `BEGIN TRANSLATION` and `END TRANSLATION` is generated: edit the PlusCal, then translate again. |
-| `V1-model.md` | Design of the V1 model (A0), and the deviations found while implementing it (section 10). |
+| `V1-model.md` | Design of the V1 model (A0), the deviations found while implementing it (section 10, A1) and testing it (section 11, A2). |
+| `previewd_a2.tla`, `previewd_a2.cfg`, `previewd_a2-trust.cfg` | A2 regression: `RegressionA21` (action) and `RegressionA22` (invariant) name the step and the state that doomed an approved head in the A1 model. Safety only, 2 commits: 5 GitHub actions on a fork PR; the `-trust` variant, a same-repo PR whose opener loses write access, at 4 (at 5 it passed 33 M states without finishing). |
 | `previewd.cfg`, `previewd-workers.cfg` | MVP regression: every V1 feature off (trusted environments only, one commit, no permission loss, no GHES fault, no pruning, no expiry). |
 | `previewd-approval.cfg` | Approval gate, revocation, new head, GHES faults, approver loses write access. |
 | `previewd-reapproval.cfg` | Dismissal then re-approval; approval of the current head with no job waiting. |
@@ -45,7 +46,13 @@ for c in previewd previewd-workers previewd-approval previewd-reapproval \
          previewd-approval-reboot previewd-mixed previewd-prune previewd-ttl previewd-grace; do
   java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers auto -lncheck final -config "$c.cfg" previewd.tla
 done
+# A2 regression (safety only; the module extends previewd).
+for c in previewd_a2 previewd_a2-trust; do
+  java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers auto -config "$c.cfg" previewd_a2.tla
+done
 ```
+
+One TLC at a time on a host with less than 16 GB: on a 7 GB host, four parallel runs with 5 GB heaps were killed (exit 137).
 
 ## Checked properties
 
@@ -57,7 +64,7 @@ Every configuration checks every property. The initial state lets each environme
 | `SafetyZeroSecretLeakage` | invariant | No environment's secret bytes ever reach a block device |
 | `SafetyNoOrphanedResources` | invariant | After the sweep, every container, network, staged secret or route document belongs to an `IN_PROGRESS`/`SUCCESS` deploy that no newer teardown has undone |
 | `SafetyMonotonicity` | invariant | No older intent pending or running once a newer one has executed; a running environment is never older than a completed intent |
-| `SafetyUniqueDelivery` | invariant | One job per seq |
+| `SafetyUniqueDelivery` | invariant | One job per seq and environment, as `UNIQUE (preview_id, seq)` (A2-3) |
 | `SafetyOneJobPerEnv` | invariant | At most one `IN_PROGRESS` job per environment, trusted or not |
 | `SafetyLeases` | invariant | A current-epoch lease points at an `IN_PROGRESS` job and is never shared |
 | `SafetyRouteImpliesRunning` | invariant | A route document never points at a container that is not running |
@@ -73,6 +80,8 @@ Every configuration checks every property. The initial state lets each environme
 | `SafetyAuthorizeChecksBoth` | action | An `approved` authorization reads the DB grant and GitHub truth in the same step; a `trusted` one reads GitHub truth |
 | `SafetyApprovalBindsCommit` | action | Only a live grant of the exact commit unparks a job |
 | `SafetyInternalJobsAreNewest` | action | An internal job (approval, revocation, re-validation, expiry) is above every seq of its environment |
+| `RegressionA21` | action (`previewd_a2` only) | A revocation teardown is created only above a latest intent that deploys the revoked commit (A2-1) |
+| `RegressionA22` | invariant (`previewd_a2` only) | A deploy in flight, newer than every delivery of its environment ever recorded, is never already stale (A2-2) |
 | `LivenessEventualCompletion` | liveness | Every `QUEUED` job reaches a terminal state or waits for an approval |
 | `LivenessEventualConsistency` | liveness | `<>[]`: each environment runs the latest job's commit iff that job is a `SUCCESS` deploy GitHub still allows, absent otherwise |
 | `LivenessRevokedTornDown` | liveness | Access lost in GitHub (revoked approval, approver or opener without write access) eventually removes the environment |
@@ -83,27 +92,37 @@ Every configuration checks every property. The initial state lets each environme
 
 Budget per configuration (V1-model.md section 6.1): 5 million distinct states and 15 minutes on 16 cores.
 
+After A2 (the rules of V1-model.md section 11), all on one 16-thread, 7 GB host, one TLC at a time, 12 workers:
+
 | Config | Distinct states | Depth | Time | Result |
 |---|---|---|---|---|
-| `previewd.cfg` | 686,226 | 37 | 9 min 05 s | no error |
-| `previewd-workers.cfg` | 48,386 | 32 | 51 s | no error |
-| `previewd-approval.cfg` | 104,240 | 31 | 3 min 45 s | no error |
-| `previewd-reapproval.cfg` | 110,752 | 31 | 4 min 12 s | no error |
-| `previewd-approval-reboot.cfg` | 95,710 | 34 | 2 min 21 s | no error |
-| `previewd-mixed.cfg` | 390,624 | 34 | 10 min 02 s | no error |
-| `previewd-prune.cfg` | 203,029 | 32 | 2 min 11 s | no error |
-| `previewd-ttl.cfg` | 8,896 | 30 | 31 s | no error |
-| `previewd-grace.cfg` | 58,876 | 32 | 3 min 35 s | no error |
+| `previewd.cfg` | 686,226 | 37 | 7 min 42 s | no error |
+| `previewd-workers.cfg` | 48,386 | 32 | 37 s | no error |
+| `previewd-approval.cfg` | 211,448 | 37 | 2 min 34 s | no error |
+| `previewd-reapproval.cfg` | 189,904 | 36 | 2 min 57 s | no error |
+| `previewd-approval-reboot.cfg` | 194,928 | 40 | 2 min 08 s | no error |
+| `previewd-mixed.cfg` | 481,280 | 33 | 11 min 26 s | no error |
+| `previewd-prune.cfg` | 203,029 | 32 | 1 min 53 s | no error |
+| `previewd-ttl.cfg` | 9,144 | 30 | 9 s | no error |
+| `previewd-grace.cfg` | 125,236 | 38 | 1 min 32 s | no error |
+| `previewd_a2.cfg` (safety) | 17,241,260 | 44 | 11 min 32 s | no error |
+| `previewd_a2-trust.cfg` (safety) | 3,156,312 | 41 | 1 min 53 s | no error |
 
-Times are wall clock on a shared 16-thread machine, several configurations at once; they are an upper bound.
+The MVP regression configurations (`previewd`, `previewd-workers`) have exactly A1's state counts: A2 changes nothing with the V1 features off. The V1 configurations grew (approval 104,240 → 211,448): GitHub stamps are spaced and internal jobs no longer move the clock, so more orderings are distinct. Every acceptance configuration is within the budget. `previewd_a2.cfg` is over the state budget (17 M) and within the time budget; it is a regression run, repeated when the revoke rule or the internal seq changes. `previewd_a2-trust.cfg` runs with 4 GitHub actions: with 5 it passed 33 M states without finishing.
 
-Three configurations were over budget with the bounds first planned and were reduced or split without dropping a property (V1-model.md, A1-1). `previewd-grace.cfg` was added after coverage showed that `Grace = 1` leaves the recovery path unchecked (A1-12). TLC found one design bug in A0: a grant of the current head re-queued a parked job that was no longer the latest intent. The grant rule now judges the latest job (A1-3).
+A1 results, before A2: previewd 686,226 states (9 min 05 s), workers 48,386, approval 104,240, reapproval 110,752, approval-reboot 95,710, mixed 390,624, prune 203,029, ttl 8,896, grace 58,876, all with no error.
+
+Times are wall clock; they are an upper bound.
+
+Three configurations were over budget with the bounds first planned and were reduced or split without dropping a property (V1-model.md, A1-1). `previewd-grace.cfg` was added after coverage showed that `Grace = 1` leaves the recovery path unchecked (A1-12). TLC found one design bug in A0: a grant of the current head re-queued a parked job that was no longer the latest intent. The grant rule now judges the latest job (A1-3). The A2 state-machine test found two more beyond these bounds (V1-model.md section 11): a revocation judged against any active deploy rather than the latest intent (A2-1), and internal jobs ordered above in-flight deliveries (A2-2).
 
 ### Coverage
 
-`-coverage` was run on every configuration except `previewd.cfg`, whose actions `previewd-workers.cfg` covers. In the union, every action produces new states, and none of the 1,028 sub-expressions of the translated actions is left unevaluated. Each feature action is covered by the configurations that target it: `Revalidate` by approval, reapproval, approval-reboot, mixed and grace; `Expire` by ttl; `Prune` by prune; the trusted-opener permission loss by mixed; the teardown fault by workers. The first pass, without `previewd-grace.cfg`, left the `Grace > 1` branches of `Revalidate` unevaluated (A1-12).
+`-coverage` was run on every configuration except `previewd.cfg`, whose actions `previewd-workers.cfg` covers. In the union, every action produces new states, and none of the 1,028 sub-expressions of the translated actions is left unevaluated. Each feature action is covered by the configurations that target it: `Revalidate` by approval, reapproval, approval-reboot, mixed and grace; `Expire` by ttl; `Prune` by prune; the trusted-opener permission loss by mixed; the teardown fault by workers. The first pass, without `previewd-grace.cfg`, left the `Grace > 1` branches of `Revalidate` unevaluated (A1-12). Coverage was not re-run after A2; the changed branches (revoke rule, internal seq, re-validation revocation) are exercised by the Go mutants V1-M05, M13, M20 and M21.
 
 ## Mutation check (V1-model.md section 7)
+
+The TLA+ mutants below were run on the A1 translation and not re-run after A2. Since A2, `TestV1Model_Mutants` (`internal/store/jobs_spbt_v1_props_test.go`) applies every V1 mutant, plus V1-M06b (arrival order), V1-M20 (the A1 revoke rule) and V1-M21 (the A1 internal seq), to the Go reference model at every `make check`, with at least 1,000 runs each: all killed by the property named below or by `RegressionA21`/`RegressionA22`, and V1-M15 and V1-M16 survive. On the A1 model, TLC reproduces both A2 bugs with `previewd_a2.tla`: `RegressionA21` alone at depth 10 (44,748 states), `RegressionA22` alone at depth 7 (1,499 states), and in the trust variant at depth 8 (2,714 states).
 
 Each mutant changes one rule of the translated model and must be rejected. TLC stops at the first violated property. Where that was not the property A0 named, the mutant was run again without the first property, and the named property caught it too (marked ✓²).
 
@@ -154,7 +173,7 @@ Not repeated: the D5 *plan* formula (a property, not a model change; Safety 2 is
 
 ## Not modeled
 
-- Time: backoff, timeouts, the clock-skew window and the approval time binding (V1-I7). One global clock abstracts UUIDv1 ticks and `now`.
+- Time: backoff, timeouts, the clock-skew window and the approval time binding (V1-I7). One global clock abstracts UUIDv1 ticks and `now`; GitHub stamps are `Stamp(clock) = clock × K`, and an internal job takes `MaxSeq(e) + 1`, between two stamps (A2-2).
 - Docker errors inside the sweep, and rollback failures after a failed deploy step.
 - Payload identity: a body resent under a new delivery ID is refused by the store's payload hash (Go tests). In the model a delivery is its seq.
 - Secret sections, approver identity matching (`login#id`), TLS to GHES, the CIDR filter, the startup preflight and the BuildKit probe: Go unit, property and E2E tests (V1 spec, task list).

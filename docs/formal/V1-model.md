@@ -1,6 +1,6 @@
 # V1 formal model design (task A0)
 
-Status: accepted 2026-10-08; implemented by A1 (`previewd.tla`). Section 10 lists what modeling changed, written back as A0 requires. Prerequisite of task A1 in `docs/specs/V1-previewd.md`: A1 implements exactly this design in `previewd.tla`. Any deviation found while modeling is written back here first.
+Status: accepted 2026-10-08; implemented by A1 (`previewd.tla`). Section 10 lists what modeling changed, written back as A0 requires. Section 11 lists the two design bugs the A2 state-machine test found beyond the TLC bounds, and the rules that replaced them. Prerequisite of task A1 in `docs/specs/V1-previewd.md`: A1 implements exactly this design in `previewd.tla`. Any deviation found while modeling is written back here first.
 
 The MVP model (`previewd.tla`, `docs/formal/README.md`) stays the base. V1 adds commit identity, trust, approvals, revocation, re-validation, pruning and expiry. Every MVP property keeps holding with the V1 features disabled (section 6.1).
 
@@ -33,7 +33,7 @@ GitHub becomes an explicit process with its own state. The MVP model's "any ts, 
 | `open[e]` | `BOOLEAN` | PR open |
 | `approvedGH[e]` | `SUBSET Commits` | commits with a currently valid approval by an approver who still has write access |
 | `openerOK[e]` | `BOOLEAN` | the PR's opener still has write access (D-V1-5) |
-| `clock` | `0..MaxClock` | one global clock. GitHub stamps deliveries with it, and previewd stamps internal jobs and revocations with it. This abstracts UUIDv1 ticks and `now` with clocks synchronized within the skew bound (V1-I7 stays outside the model). |
+| `clock` | `0..MaxClock` | one global clock. GitHub stamps deliveries with it (`Stamp(clock)`, A2-2), and a re-validation records its revocation at the current stamp; internal jobs take `MaxSeq(e) + 1` and do not move it. This abstracts UUIDv1 ticks and `now` with clocks synchronized within the skew bound (V1-I7 stays outside the model). |
 | `inflight` | set of deliveries | emitted, not yet received; the network reorders freely |
 
 A label approval is modeled as a review approval of the head commit at labeling time, and a label removal as a dismissal. Under D-V1-3 the two paths have the same semantics, so one modeled path covers both.
@@ -87,8 +87,8 @@ Transition rules beyond the MVP:
 - **`ReceiveWebhook` `deploy`/`teardown`:** MVP rules, with the stale check against `max(MaxSeq(e), watermark[e])`. An accepted `synchronize` also records a `revoke` (ts of the delivery) for every other commit of `e`. No teardown job is queued.
 - **`ReceiveWebhook` `grant`:** recorded, then acted on only for an environment that is not trusted and whose grant is live. Both cases judge the **latest** job (section 10, A1-3):
   - if the latest job is the parked deploy of `(e, commit)`, it becomes `QUEUED`;
-  - otherwise a deploy with `origin = "approval"` and `seq = ++clock` is queued if `head[e] = commit` and `open[e]` (a GHES read, atomic in the model), unless the latest job already deploys that commit (`QUEUED`, `IN_PROGRESS`, `PENDING_APPROVAL` or `SUCCESS`).
-- **`ReceiveWebhook` `revoke`:** recorded. If the environment runs that commit and no grant of it stays live, a teardown is queued (`origin = "revocation"`, `seq = ++clock`).
+  - otherwise a deploy with `origin = "approval"` and `seq = MaxSeq(e) + 1` (A2-2) is queued if `head[e] = commit` and `open[e]` (a GHES read, atomic in the model), unless the latest job already deploys that commit (`QUEUED`, `IN_PROGRESS`, `PENDING_APPROVAL` or `SUCCESS`).
+- **`ReceiveWebhook` `revoke`:** recorded. If the environment is not trusted, no grant of that commit stays live, and the **latest** job deploys that commit (`QUEUED`, `IN_PROGRESS`, `PENDING_APPROVAL` or `SUCCESS`), a teardown is queued (`origin = "revocation"`, `seq = MaxSeq(e) + 1`). When the latest job deploys another commit, that intent already removes this one (A2-1).
 - **`AuthorizeDeploy`:**
   - trusted environment: allow (`authz = "trusted"`);
   - untrusted environment with `LiveApproval(e, j.commit) ∧ j.commit ∈ approvedGH[e]`: allow (`authz = "approved"`);
@@ -96,9 +96,9 @@ Transition rules beyond the MVP:
   - GHES fault: `QUEUED`, attempt counted, nothing changed on the host.
 - **`Revalidate(e)`:**
   - if allowed (trusted, or approved in GitHub truth and live in the DB): reset `revalFails[e]`;
-  - if not: record an internal `revoke` and queue a teardown (`origin = "revalidation"`, `seq = ++clock`);
+  - if not: record an internal `revoke` at the current stamp and queue a teardown (`origin = "revalidation"`, `seq = MaxSeq(e) + 1`);
   - GHES fault: `revalFails[e] + 1`, and at `Grace` the same teardown.
-- **`Expire(e)`:** a teardown with `origin = "ttl"`, `seq = ++clock`.
+- **`Expire(e)`:** a teardown with `origin = "ttl"`, `seq = MaxSeq(e) + 1`.
 - **`Prune`:** delete one terminal job that is not the highest-seq job of its environment and not the builder of what runs there (A1-6), after raising `watermark[e]` to at least its seq. Or delete one delivery record whose ts is at most `MaxSeq(env)`, added to `prunedDeliveries`. Which job or delivery is unconstrained: an over-approximation of "older than the retention".
 - **`StartupSweep`:** MVP rules. `PENDING_APPROVAL` jobs are untouched. A re-armed deploy goes through `AuthorizeDeploy` again, so an untrusted environment comes back after a reboot only with a re-validated approval.
 
@@ -217,17 +217,26 @@ The task list names the test for each.
 
 ## 8. Mapping to the state-machine test (A2)
 
-| Model action | Store method (V1 spec 3.4) | SPBT command |
-|---|---|---|
-| `ReceiveWebhook` deploy/teardown | `Enqueue` (watermark-aware) | `ReceiveWebhook` (existing, plus commit) |
-| `ReceiveWebhook` grant | `Approve` | `Approve(env, commit)` |
-| `ReceiveWebhook` revoke | `Revoke` | `Revoke(env, commit)` |
-| `AuthorizeDeploy` allow / park / fault | `Classify`, `Park`, `Requeue` | `Authorize(outcome)` with a fake GitHub truth |
-| `Revalidate`, `Expire` | `LiveUntrusted`, `Expired`, `EnqueueInternal` | `Revalidate`, `Expire` |
-| `Prune` | `Prune` | `Prune` |
-| GitHub actions, `Tick` | none (test-side truth) | `Push`, `PermissionLoss`, `AdvanceClock` |
+Implemented in `internal/store/jobs_spbt_v1_test.go` (reference model and commands), `jobs_spbt_v1_props_test.go` (properties, drain, mutants) and `jobs_spbt_v1_store_test.go` (the store backend, build tag `v1spbt`, which pins the store API until D3).
 
-The SPBT reference model implements sections 1 to 4 independently of the store, as in Phase 3.
+| Model action | Store method (V1 spec 3.4, as A2 pins it) | SPBT command |
+|---|---|---|
+| GitHub `opened`/`reopened`, `synchronize`, `closed` | none (test-side truth) | `Open`, `Push`, `Close` |
+| GitHub approval, dismissal, redelivery | none | `Approve`, `Dismiss`, `Redeliver`, `ForgedRedelivery` (a body resent under a new ID) |
+| GitHub `PermissionLoss`, `Tick` | none | `PermissionLoss`, `Tick` |
+| `ReceiveWebhook` deploy/teardown | `Enqueue` (stale against the watermark too) | `ReceiveWebhook` |
+| `ReceiveWebhook` grant | `Approve` | `ReceiveWebhook` |
+| `ReceiveWebhook` revoke | `Revoke` | `ReceiveWebhook` |
+| `AcquireJob` | `Acquire` | `AcquireJob` |
+| `AuthorizeDeploy` allow / park / fault | `Classify`, `Park` (after `Classify` untrusted is refused without a live approval), `Requeue` | `Step` on a worker at `AuthorizeDeploy` |
+| deploy and teardown steps | `Finish`, `Requeue` | `Step` |
+| `Revalidate`, `Expire` | `ApprovalLive`, `Expired`, `EnqueueInternal` | `Revalidate`, `Expire` |
+| `Prune` | `Prune` | `Prune` |
+| `SimulateCrash`, `StartupSweep` | `Close`, `NewStore`, `StartupSweep` | `SimulateCrash` |
+
+The reference model implements sections 1 to 4 independently of the store, as in Phase 3, with the TLA+ model's rules one for one. After every command `Check` compares every table with the model (when a store is driven) and judges the model with every property of section 5 and A1-4, plus the A2 regression properties; the action properties compare the states before and after the command. After the random rounds, the fair processes run with GitHub quiet and no fault, and the liveness properties are checked. Between rounds the run may settle (the fair processes reach quiescence) and may end with a quiet round (no new delivery, silent permission changes), so the commands reach running environments that GitHub then stops allowing.
+
+Each mutant of section 7 is applied to the reference model's algorithm and must be killed by the property A1 named (`TestV1Model_Mutants`), with at least 1,000 runs per mutant. This proves that the commands reach every guarded path and that the Go properties are as strong as the TLA+ ones; at D3 the same commands and properties judge the store.
 
 ## 9. Spec changes from this design
 
@@ -270,3 +279,41 @@ A1 (`previewd.tla`) follows sections 1 to 9 except for the points below. Each wa
 - **A1-10, V1-M10 is checked on `previewd.cfg`.** On a trusted PR, the extra teardown of the first draft's `synchronize` makes the new head's deploy skipped, which `LivenessHeadDeployed` catches. On an untrusted PR, the re-approval path now re-queues a deploy and masks it.
 - **A1-11, `JobBound = 3 × MaxWebhooks`,** checked by `TypeOK` (`nextId ≤ JobBound + 1`) rather than assumed.
 - **A1-12, `previewd-grace.cfg` added (a coverage finding).** With `Grace = 1` in every configuration, `-coverage` showed two `Revalidate` branches never evaluated: a GHES failure below the limit (`revalFails[e] + 1 < Grace`) and the reset after a successful check (`revalFails[e] > 0` and allowed again). They were never model-checked, not merely uncovered. `previewd-grace.cfg` (`Grace = 2`, two GHES faults, one untrusted environment, one commit) exercises both, and the escalation after two consecutive failures. Section 6.2 is corrected: a larger `Grace` adds the recovery path, it does not only delay the teardown.
+
+## 11. Deviations found during A2
+
+The state-machine test (section 8) explores runs far beyond the TLC bounds: up to three environments, two commits, unbounded GitHub actions, crashes, faults and pruning in one run. It found two design bugs in the A1 model. Both violate `LivenessHeadDeployed`: an open head that GitHub allows, and that the DB records as approved, is never deployed. Both need five or more GitHub actions on two commits, above every configuration of section 6.1 (A1-1 reduced them to stay within budget). TLC reproduces both on the A1 model with the regression properties of `previewd_a2.tla`, which name the step or state that dooms the intent, so a safety search reaches them where liveness does not fit the budget. On the current model both hold: `previewd_a2.cfg` (5 actions, 17,241,260 states) and `previewd_a2-trust.cfg` (4 actions, 3,156,312 states), and the nine configurations of section 6.1 pass with every property (`README.md`).
+
+- **A2-1, a revocation judged against any active deploy, not the latest intent.** The A1 rule queued a revocation teardown when the environment ran the revoked commit or had any active deploy of it. TLC trace (A1 model, `RegressionA21` alone, depth 10, 44,748 states):
+  1. `opened(c1)`, approve c1, `synchronize(c2)`, approve c2, dismiss c1 are emitted;
+  2. the deploy of c1 is queued; the grant of c2 queues an approval deploy of c2, the latest intent;
+  3. the revocation of c1 matches the stale queued deploy of c1 and queues a teardown above the deploy of c2;
+  4. the worker takes the teardown and skips the deploy of the head.
+
+  This is the A1-3 bug in the revoke rule. **Rule now:** a revocation queues a teardown only when the latest job deploys the revoked commit (`HeadIntentPresent`, the predicate of the grant rule). When the latest job deploys another commit, that intent removes the revoked version itself: `ExecuteDeploy` replaces it and the park destroys it. `SafetyRevocationPending` still holds, because that newer intent is the pending replacement. `RunningCommit` and `ActiveDeployOf` are removed. Regression: `RegressionA21` (action property: a revocation teardown is created only above a latest intent that deploys its commit), and mutant V1-M20 (the A1 rule) in the Go test.
+
+- **A2-2, an internal job ordered by previewd's clock, not by the queue.** In A1, every internal job took `seq = clock + 1`, above every stamp GitHub had given so far, including deliveries still in flight. A push that GitHub sent before the internal job was created, but that previewd received after, was then stale, and its intent was lost. First found by the Go test on a same-repo PR whose opener lost write access (D-V1-5), where nothing re-queues the lost head:
+  1. c2 is approved while the PR is trusted: recorded, nothing to act on;
+  2. the opener loses write access, then c1 is pushed, approved and dismissed, and c2 is pushed;
+  3. the dismissal is processed before the push of c2 arrives: its revocation teardown takes `clock + 1`, above the push's stamp;
+  4. the push of c2 is stale. c2 is the open head, approved in GitHub and live in the DB, and is never deployed.
+
+  TLC reproduces the mechanism on the A1 model with `RegressionA22` (a deploy delivery in flight, newer than every delivery of its environment ever recorded, is already stale): depth 7, 1,499 states (depth 8, 2,714 states, in the trusted variant with 4 GitHub actions). **Rule now:** an internal job takes `MaxSeq(e) + 1`. It still supersedes every recorded intent of its environment (`SafetyInternalJobsAreNewest`), and it loses to any delivery GitHub sent after the latest recorded intent, even one still in flight. In the model, GitHub stamps are `Stamp(clock) = clock × K` with `K = JobBound + 1`: at most `JobBound` internal jobs follow one stamp, so an internal seq is never a stamp. In the store a seq is UUIDv1 ticks and an internal job is one tick (100 ns) above `MaxSeq`. Internal jobs no longer move the clock, so `ClockBound = MaxWebhooks + MaxTicks`. A re-validation records its revocation at the current stamp (GitHub truth now voids every grant it sent so far). Safety does not depend on the old ordering: a delivery that now wins over an internal teardown goes through `AuthorizeDeploy`, which reads the DB and GitHub truth again. Regression: `RegressionA22`, and mutant V1-M21 (the A1 rule) in the Go test.
+
+- **A2-3, `SafetyUniqueDelivery` per environment.** The first internal job of two environments with no job yet (an approval of a head whose `opened` delivery is still in flight) both take seq 1. The store's constraint is `UNIQUE (preview_id, seq)`, and every rule compares seqs within one environment, so the property is now stated per environment.
+
+- **A2-4, store API pinned by the test (V1 spec 3.4 updated).** Writing the store backend forced the points the spec left open:
+  - `Approve` and `Revoke` receive the GitHub truth the API read in the same step (`Trusted`, and for a grant `OpenHead` and the PR's `Source`), as the model's single step does;
+  - `Classify(untrusted)` refuses without a live approval of the lease's commit in the same transaction (`ErrNotApproved`), so the DB half of `SafetyAuthorizeChecksBoth` holds in the store itself;
+  - `Requeue` accepts a deploy until it is classified (GHES unavailable during `AuthorizeDeploy`), and refuses it after, as before;
+  - `Finish` takes `now` (`finished_at`); `Delivery` carries `ReceivedAt`;
+  - `ApprovalLive(env, commit)` replaces `LiveUntrusted`: under D-V1-5 the Revalidator checks every running environment and needs the DB half of `Allowed`;
+  - `EnqueueInternal` takes the revocation reason, and revokes a live approval of the running commit in the same transaction;
+  - `Prune` takes the builders of every existing environment (A1-6 needs the host's view).
+
+- **A2-5, spec gaps left to B1 and D3.**
+  - The `approvals` table of spec 3.1 keys a row by `(repo, pr, commit, approver, via)` and needs a grant. The model records revocations of commits that never had a grant: a new head revokes every other commit, and a dismissal can arrive before its grant. A late, older grant must stay dead. B1 must store a revocation without a prior grant, per `(env, commit)`. The test compares `ApprovalLive` for every environment and commit, so either representation is judged.
+  - The spec's event matrix revoked approvals on `closed` (`pr_closed`). The model does not, and GitHub keeps approvals across close and reopen: a reopened PR deploys only if `AuthorizeDeploy` finds the approval live in both the DB and GitHub. The matrix now follows the model. The `pr_closed` and `revalidation_unavailable` reasons stay in the vocabulary, unused by the queue.
+
+
+- **A2-6 (open, owner decision before D4 and D6), a revoked version can outlive a GHES outage.** Security review of A2-1. When a revocation finds that the latest job deploys another commit, no teardown is queued: that newer deploy removes the revoked version when `AuthorizeDeploy` runs it (replaced, or destroyed by the park). While GHES is unavailable, `AuthorizeDeploy` requeues that deploy with backoff and changes nothing on the host, so the revoked version keeps running for the whole outage. The Revalidator does not bound it either: `NeedsRevalidation` requires the builder to be the latest job, so the fail-closed grace never starts. The A1 rule removed it at once, since a teardown needs no GHES, but A1 lost the new head (A2-1). The model's liveness holds only because GHES faults are bounded. Severity MEDIUM (V1 spec invariant: authorized code only, revocable). Proposed rule, to model before D4: in the GHES-unavailable branch of `AuthorizeDeploy`, destroy the running version first when its builder was authorized by approval and its approval is no longer live in the DB (a DB read, no GHES call), as the park does; then requeue. To check: an action property (a GHES-unavailable `AuthorizeDeploy` never leaves running an approval-authorized version whose approval is not live in the DB), a configuration with `MaxGhesFaults` large enough to cover the outage, and a mutant that skips the removal.

@@ -20,9 +20,10 @@
 (* constant is 0 or empty: previewd.cfg and previewd-workers.cfg are the   *)
 (* MVP regression configurations.                                          *)
 (*                                                                         *)
-(* Abstractions: one global clock stamps GitHub deliveries and previewd's  *)
-(* internal jobs (UUIDv1 ticks and now, synchronized within the skew      *)
-(* bound); each label is one atomic step; Docker deploy faults are         *)
+(* Abstractions: one global clock stamps GitHub deliveries (UUIDv1 ticks  *)
+(* and now, synchronized within the skew bound); an internal job takes     *)
+(* the seq just above its environment's latest intent (A2-2); each label  *)
+(* is one atomic step; Docker deploy faults are                            *)
 (* unbounded and terminal, teardown and GHES faults bounded; secrets       *)
 (* sections, TLS, the preflight and the build probe are tested in Go.     *)
 (***************************************************************************)
@@ -58,15 +59,21 @@ AuthzValues == {"none", "trusted", "approved"}
 SecretChannels == {"ramfs_ro_bind", "tmpfs", "container_env", "build_arg"}
 DiskBackedChannels == {"tmpfs", "container_env", "build_arg"}
 
-\* Upper bound of the clock: GitHub emissions, plus at most one internal job
-\* per revoke or grant delivery, plus re-validation and expiry teardowns
-\* (each needs a deploy, of which there are at most 2 * MaxWebhooks), plus
-\* ticks. TypeOK fails if the model ever exceeds it.
-ClockBound == 7 * MaxWebhooks + MaxTicks
+\* Upper bound of the clock: GitHub emissions plus ticks. Internal jobs do
+\* not move it (A2-2). TypeOK fails if the model ever exceeds it.
+ClockBound == MaxWebhooks + MaxTicks
 
 \* Upper bound of job IDs, checked by TypeOK rather than assumed: the
 \* completion property quantifies over 1..JobBound.
 JobBound == 3 * MaxWebhooks
+
+\* GitHub stamps a delivery Stamp(clock), a multiple of K. An internal job
+\* takes MaxSeq(e) + 1: at most JobBound of them follow one stamp, so an
+\* internal seq is never a stamp, and a delivery GitHub sent after the
+\* latest recorded intent stays newer than every internal job (A2-2).
+K == JobBound + 1
+Stamp(t) == t * K
+SeqBound == Stamp(ClockBound) + JobBound
 
 ASSUME MaxWebhooks \in Nat \ {0}
 ASSUME EnvIDs # {} /\ Workers # {} /\ Commits # {} /\ NoCommit \notin Commits
@@ -79,7 +86,7 @@ Max(S) == CHOOSE x \in S : \A y \in S : y <= x
 
 EnvRecords == [state: {"absent", "running"}, network_bound: BOOLEAN,
                secrets_mounted: BOOLEAN, route_published: BOOLEAN,
-               secrets_persisted_to_disk: BOOLEAN, deployed_ts: 0..ClockBound,
+               secrets_persisted_to_disk: BOOLEAN, deployed_ts: 0..SeqBound,
                commit: Commits \cup {NoCommit}]
 
 Absent == [state |-> "absent", network_bound |-> FALSE, secrets_mounted |-> FALSE,
@@ -188,16 +195,14 @@ define
     BuilderSucceeded(e) == \E j \in Builder(e) : db_jobs[j].status = "SUCCESS"
     BuilderIsLatest(e) == JobsOf(e) # {} /\ Latest(e) \in Builder(e)
 
-    RunningCommit(e, c) == Exists(e) /\ environments[e].commit = c
     PendingOf(j, e, c) == /\ db_jobs[j].env_id = e /\ db_jobs[j].commit = c
                           /\ db_jobs[j].status = "PENDING_APPROVAL"
-    ActiveDeployOf(e, c) == \E j \in JobsOf(e) :
-                                /\ db_jobs[j].type = "deploy" /\ db_jobs[j].commit = c
-                                /\ db_jobs[j].status \in {"QUEUED", "IN_PROGRESS", "PENDING_APPROVAL"}
 
-    \* The latest intent of e already deploys c: a grant needs no new job.
-    \* Judged on the latest job only: an older queued deploy behind a newer
-    \* teardown will be skipped, so it does not count.
+    \* The latest intent of e deploys c: a grant needs no new job (A1-3), and
+    \* a revocation of c needs a teardown (A2-1). Judged on the latest job
+    \* only: an older queued deploy behind a newer intent will be skipped,
+    \* and a running version behind a newer deploy will be replaced or
+    \* removed by it, so neither counts.
     HeadIntentPresent(e, c) ==
         /\ JobsOf(e) # {}
         /\ db_jobs[Latest(e)].type = "deploy"
@@ -260,11 +265,11 @@ define
         /\ clock \in 0..ClockBound
         /\ ghActions \in 0..MaxWebhooks
         /\ \A d \in emitted \cup inflight :
-              d \in [ts: 1..ClockBound, kind: DeliveryKinds, env: EnvIDs, commit: Commits]
+              d \in [ts: {Stamp(t) : t \in 1..ClockBound}, kind: DeliveryKinds, env: EnvIDs, commit: Commits]
         /\ DOMAIN db_jobs \subseteq 1..(nextId - 1)
         /\ nextId <= JobBound + 1
         /\ \A j \in DOMAIN db_jobs :
-              db_jobs[j] \in [type: JobTypes, env_id: EnvIDs, ts: 1..ClockBound,
+              db_jobs[j] \in [type: JobTypes, env_id: EnvIDs, ts: 1..SeqBound,
                               status: Statuses, commit: Commits, origin: Origins,
                               authz: AuthzValues, authzEpoch: 0..MaxCrashes]
         /\ environments \in [EnvIDs -> EnvRecords]
@@ -305,8 +310,11 @@ define
                       db_jobs[k].status \in {"SUCCESS", "FAILED"}
                           => db_jobs[k].ts <= environments[e].deployed_ts
 
+    \* Per environment, as the store's UNIQUE (preview_id, seq): two
+    \* environments' first internal jobs may share a seq (A2-2).
     SafetyUniqueDelivery ==
-        \A j, k \in DOMAIN db_jobs : j # k => db_jobs[j].ts # db_jobs[k].ts
+        \A j, k \in DOMAIN db_jobs :
+            j # k /\ db_jobs[j].env_id = db_jobs[k].env_id => db_jobs[j].ts # db_jobs[k].ts
 
     SafetyOneJobPerEnv ==
         \A e \in EnvIDs :
@@ -374,18 +382,19 @@ define
             \/ db_jobs[j].type = "deploy" /\ db_jobs[j].commit = c /\ db_jobs[j].status = "FAILED"
 end define;
 
-\* Append one internal job above every seq of its environment.
+\* Append one internal job just above the latest seq of its environment:
+\* it supersedes every recorded intent, and loses to any delivery GitHub
+\* sent after that intent, even one still in flight (A2-2).
 macro Internal(e, typ, c, o) begin
-    db_jobs := db_jobs @@ (nextId :> NewJob(typ, e, clock + 1, c, o));
+    db_jobs := db_jobs @@ (nextId :> NewJob(typ, e, MaxSeq(e) + 1, c, o));
     nextId := nextId + 1;
-    maxTs[e] := clock + 1;
-    clock := clock + 1;
+    maxTs[e] := MaxSeq(e) + 1;
 end macro;
 
 \* GitHub stamps and sends one delivery.
 macro Emit(k, e, c) begin
-    inflight := inflight \cup {Delivery(clock + 1, k, e, c)};
-    emitted := emitted \cup {Delivery(clock + 1, k, e, c)};
+    inflight := inflight \cup {Delivery(Stamp(clock + 1), k, e, c)};
+    emitted := emitted \cup {Delivery(Stamp(clock + 1), k, e, c)};
     clock := clock + 1;
     ghActions := ghActions + 1;
 end macro;
@@ -507,8 +516,12 @@ ReceiveWebhook:
             else
                 with A = approvalsDB \cup {ApprovalRecord("revoke", d.env, d.commit, d.ts)} do
                     approvalsDB := A;
+                    \* Judged on the latest intent (A2-1): when it deploys
+                    \* another commit, that intent already removes this one
+                    \* (ExecuteDeploy replaces it, the park destroys it), and
+                    \* a teardown above it would skip the new head.
                     if /\ ~Trusted(d.env) /\ ~LiveIn(A, d.env, d.commit)
-                       /\ (RunningCommit(d.env, d.commit) \/ ActiveDeployOf(d.env, d.commit)) then
+                       /\ HeadIntentPresent(d.env, d.commit) then
                         Internal(d.env, "teardown", d.commit, "revocation");
                     end if;
                 end with;
@@ -705,9 +718,10 @@ Revalidate:
                     revalFails[e] := 0;
                 else
                     revalFails[e] := 0;
+                    \* GitHub truth now: every grant it sent so far is void.
                     if LiveApproval(e, environments[e].commit) then
                         approvalsDB := approvalsDB \cup
-                            {ApprovalRecord("revoke", e, environments[e].commit, clock + 1)};
+                            {ApprovalRecord("revoke", e, environments[e].commit, Stamp(clock))};
                     end if;
                     Internal(e, "teardown", environments[e].commit, "revalidation");
                 end if;
@@ -846,12 +860,10 @@ Builder(e) == {j \in JobsOf(e) : /\ db_jobs[j].type = "deploy"
 BuilderSucceeded(e) == \E j \in Builder(e) : db_jobs[j].status = "SUCCESS"
 BuilderIsLatest(e) == JobsOf(e) # {} /\ Latest(e) \in Builder(e)
 
-RunningCommit(e, c) == Exists(e) /\ environments[e].commit = c
 PendingOf(j, e, c) == /\ db_jobs[j].env_id = e /\ db_jobs[j].commit = c
                       /\ db_jobs[j].status = "PENDING_APPROVAL"
-ActiveDeployOf(e, c) == \E j \in JobsOf(e) :
-                            /\ db_jobs[j].type = "deploy" /\ db_jobs[j].commit = c
-                            /\ db_jobs[j].status \in {"QUEUED", "IN_PROGRESS", "PENDING_APPROVAL"}
+
+
 
 
 
@@ -918,11 +930,11 @@ TypeOK ==
     /\ clock \in 0..ClockBound
     /\ ghActions \in 0..MaxWebhooks
     /\ \A d \in emitted \cup inflight :
-          d \in [ts: 1..ClockBound, kind: DeliveryKinds, env: EnvIDs, commit: Commits]
+          d \in [ts: {Stamp(t) : t \in 1..ClockBound}, kind: DeliveryKinds, env: EnvIDs, commit: Commits]
     /\ DOMAIN db_jobs \subseteq 1..(nextId - 1)
     /\ nextId <= JobBound + 1
     /\ \A j \in DOMAIN db_jobs :
-          db_jobs[j] \in [type: JobTypes, env_id: EnvIDs, ts: 1..ClockBound,
+          db_jobs[j] \in [type: JobTypes, env_id: EnvIDs, ts: 1..SeqBound,
                           status: Statuses, commit: Commits, origin: Origins,
                           authz: AuthzValues, authzEpoch: 0..MaxCrashes]
     /\ environments \in [EnvIDs -> EnvRecords]
@@ -963,8 +975,11 @@ SafetyMonotonicity ==
                   db_jobs[k].status \in {"SUCCESS", "FAILED"}
                       => db_jobs[k].ts <= environments[e].deployed_ts
 
+
+
 SafetyUniqueDelivery ==
-    \A j, k \in DOMAIN db_jobs : j # k => db_jobs[j].ts # db_jobs[k].ts
+    \A j, k \in DOMAIN db_jobs :
+        j # k /\ db_jobs[j].env_id = db_jobs[k].env_id => db_jobs[j].ts # db_jobs[k].ts
 
 SafetyOneJobPerEnv ==
     \A e \in EnvIDs :
@@ -1084,8 +1099,8 @@ GitHubActs == /\ pc["github"] = "GitHubActs"
                          \E c \in (IF head[e] = NoCommit THEN Commits ELSE {head[e]}):
                            /\ open' = [open EXCEPT ![e] = TRUE]
                            /\ head' = [head EXCEPT ![e] = c]
-                           /\ inflight' = (inflight \cup {Delivery(clock + 1, "deploy", e, c)})
-                           /\ emitted' = (emitted \cup {Delivery(clock + 1, "deploy", e, c)})
+                           /\ inflight' = (inflight \cup {Delivery(Stamp(clock + 1), "deploy", e, c)})
+                           /\ emitted' = (emitted \cup {Delivery(Stamp(clock + 1), "deploy", e, c)})
                            /\ clock' = clock + 1
                            /\ ghActions' = ghActions + 1
                     /\ UNCHANGED <<approvedGH, openerOK, permLosses, ticks>>
@@ -1093,24 +1108,24 @@ GitHubActs == /\ pc["github"] = "GitHubActs"
                     /\ \E e \in {x \in EnvIDs : open[x]}:
                          \E c \in Commits:
                            /\ head' = [head EXCEPT ![e] = c]
-                           /\ inflight' = (inflight \cup {Delivery(clock + 1, "deploy", e, c)})
-                           /\ emitted' = (emitted \cup {Delivery(clock + 1, "deploy", e, c)})
+                           /\ inflight' = (inflight \cup {Delivery(Stamp(clock + 1), "deploy", e, c)})
+                           /\ emitted' = (emitted \cup {Delivery(Stamp(clock + 1), "deploy", e, c)})
                            /\ clock' = clock + 1
                            /\ ghActions' = ghActions + 1
                     /\ UNCHANGED <<open, approvedGH, openerOK, permLosses, ticks>>
                  \/ /\ ghActions < MaxWebhooks
                     /\ \E e \in {x \in EnvIDs : open[x]}:
                          /\ open' = [open EXCEPT ![e] = FALSE]
-                         /\ inflight' = (inflight \cup {Delivery(clock + 1, "teardown", e, (head[e]))})
-                         /\ emitted' = (emitted \cup {Delivery(clock + 1, "teardown", e, (head[e]))})
+                         /\ inflight' = (inflight \cup {Delivery(Stamp(clock + 1), "teardown", e, (head[e]))})
+                         /\ emitted' = (emitted \cup {Delivery(Stamp(clock + 1), "teardown", e, (head[e]))})
                          /\ clock' = clock + 1
                          /\ ghActions' = ghActions + 1
                     /\ UNCHANGED <<head, approvedGH, openerOK, permLosses, ticks>>
                  \/ /\ ghActions < MaxWebhooks
                     /\ \E e \in {x \in EnvIDs : open[x] /\ head[x] # NoCommit /\ ApprovalsRelevant(x)}:
                          /\ approvedGH' = [approvedGH EXCEPT ![e] = approvedGH[e] \cup {head[e]}]
-                         /\ inflight' = (inflight \cup {Delivery(clock + 1, "grant", e, (head[e]))})
-                         /\ emitted' = (emitted \cup {Delivery(clock + 1, "grant", e, (head[e]))})
+                         /\ inflight' = (inflight \cup {Delivery(Stamp(clock + 1), "grant", e, (head[e]))})
+                         /\ emitted' = (emitted \cup {Delivery(Stamp(clock + 1), "grant", e, (head[e]))})
                          /\ clock' = clock + 1
                          /\ ghActions' = ghActions + 1
                     /\ UNCHANGED <<head, open, openerOK, permLosses, ticks>>
@@ -1118,8 +1133,8 @@ GitHubActs == /\ pc["github"] = "GitHubActs"
                     /\ \E e \in EnvIDs:
                          \E c \in approvedGH[e]:
                            /\ approvedGH' = [approvedGH EXCEPT ![e] = approvedGH[e] \ {c}]
-                           /\ inflight' = (inflight \cup {Delivery(clock + 1, "revoke", e, c)})
-                           /\ emitted' = (emitted \cup {Delivery(clock + 1, "revoke", e, c)})
+                           /\ inflight' = (inflight \cup {Delivery(Stamp(clock + 1), "revoke", e, c)})
+                           /\ emitted' = (emitted \cup {Delivery(Stamp(clock + 1), "revoke", e, c)})
                            /\ clock' = clock + 1
                            /\ ghActions' = ghActions + 1
                     /\ UNCHANGED <<head, open, openerOK, permLosses, ticks>>
@@ -1175,52 +1190,46 @@ ReceiveWebhook == /\ pc["api"] = "ReceiveWebhook"
                                                                                       {ApprovalRecord("revoke", d.env, c, d.ts) : c \in Commits \ {d.commit}})
                                                               ELSE /\ TRUE
                                                                    /\ UNCHANGED approvalsDB
-                                  /\ clock' = clock
                              ELSE /\ IF d.kind = "grant"
                                         THEN /\ LET A == approvalsDB \cup {ApprovalRecord("grant", d.env, d.commit, d.ts)} IN
                                                   /\ approvalsDB' = A
                                                   /\ IF ~Trusted(d.env) /\ LiveIn(A, d.env, d.commit)
                                                         THEN /\ IF JobsOf(d.env) # {} /\ PendingOf(Latest(d.env), d.env, d.commit)
                                                                    THEN /\ db_jobs' = [db_jobs EXCEPT ![Latest(d.env)].status = "QUEUED"]
-                                                                        /\ UNCHANGED << clock, 
-                                                                                        nextId, 
+                                                                        /\ UNCHANGED << nextId, 
                                                                                         maxTs >>
                                                                    ELSE /\ IF /\ open[d.env] /\ head[d.env] = d.commit
                                                                               /\ ~HeadIntentPresent(d.env, d.commit)
-                                                                              THEN /\ db_jobs' = db_jobs @@ (nextId :> NewJob("deploy", (d.env), clock + 1, (d.commit), "approval"))
+                                                                              THEN /\ db_jobs' = db_jobs @@ (nextId :> NewJob("deploy", (d.env), MaxSeq((d.env)) + 1, (d.commit), "approval"))
                                                                                    /\ nextId' = nextId + 1
-                                                                                   /\ maxTs' = [maxTs EXCEPT ![(d.env)] = clock + 1]
-                                                                                   /\ clock' = clock + 1
+                                                                                   /\ maxTs' = [maxTs EXCEPT ![(d.env)] = MaxSeq((d.env)) + 1]
                                                                               ELSE /\ TRUE
-                                                                                   /\ UNCHANGED << clock, 
-                                                                                                   db_jobs, 
+                                                                                   /\ UNCHANGED << db_jobs, 
                                                                                                    nextId, 
                                                                                                    maxTs >>
                                                         ELSE /\ TRUE
-                                                             /\ UNCHANGED << clock, 
-                                                                             db_jobs, 
+                                                             /\ UNCHANGED << db_jobs, 
                                                                              nextId, 
                                                                              maxTs >>
                                         ELSE /\ LET A == approvalsDB \cup {ApprovalRecord("revoke", d.env, d.commit, d.ts)} IN
                                                   /\ approvalsDB' = A
                                                   /\ IF /\ ~Trusted(d.env) /\ ~LiveIn(A, d.env, d.commit)
-                                                        /\ (RunningCommit(d.env, d.commit) \/ ActiveDeployOf(d.env, d.commit))
-                                                        THEN /\ db_jobs' = db_jobs @@ (nextId :> NewJob("teardown", (d.env), clock + 1, (d.commit), "revocation"))
+                                                        /\ HeadIntentPresent(d.env, d.commit)
+                                                        THEN /\ db_jobs' = db_jobs @@ (nextId :> NewJob("teardown", (d.env), MaxSeq((d.env)) + 1, (d.commit), "revocation"))
                                                              /\ nextId' = nextId + 1
-                                                             /\ maxTs' = [maxTs EXCEPT ![(d.env)] = clock + 1]
-                                                             /\ clock' = clock + 1
+                                                             /\ maxTs' = [maxTs EXCEPT ![(d.env)] = MaxSeq((d.env)) + 1]
                                                         ELSE /\ TRUE
-                                                             /\ UNCHANGED << clock, 
-                                                                             db_jobs, 
+                                                             /\ UNCHANGED << db_jobs, 
                                                                              nextId, 
                                                                              maxTs >>
                                   /\ UNCHANGED deliveries
                   /\ pc' = [pc EXCEPT !["api"] = "ReceiveWebhook"]
-                  /\ UNCHANGED << head, open, approvedGH, openerOK, ghActions, 
-                                  permLosses, ticks, emitted, watermark, 
-                                  environments, deployedAt, revalFails, daemon, 
-                                  crashes, faults, ghesFaults, prunes, 
-                                  prunedDeliveries, job, epoch >>
+                  /\ UNCHANGED << head, open, approvedGH, openerOK, clock, 
+                                  ghActions, permLosses, ticks, emitted, 
+                                  watermark, environments, deployedAt, 
+                                  revalFails, daemon, crashes, faults, 
+                                  ghesFaults, prunes, prunedDeliveries, job, 
+                                  epoch >>
 
 Api == ReceiveWebhook
 
@@ -1422,47 +1431,44 @@ Revalidate == /\ pc["revalidator"] = "Revalidate"
                       /\ ghesFaults' = ghesFaults + 1
                       /\ IF revalFails[e] + 1 >= Grace
                             THEN /\ revalFails' = [revalFails EXCEPT ![e] = 0]
-                                 /\ db_jobs' = db_jobs @@ (nextId :> NewJob("teardown", e, clock + 1, (environments[e].commit), "revalidation"))
+                                 /\ db_jobs' = db_jobs @@ (nextId :> NewJob("teardown", e, MaxSeq(e) + 1, (environments[e].commit), "revalidation"))
                                  /\ nextId' = nextId + 1
-                                 /\ maxTs' = [maxTs EXCEPT ![e] = clock + 1]
-                                 /\ clock' = clock + 1
+                                 /\ maxTs' = [maxTs EXCEPT ![e] = MaxSeq(e) + 1]
                             ELSE /\ revalFails' = [revalFails EXCEPT ![e] = revalFails[e] + 1]
-                                 /\ UNCHANGED << clock, db_jobs, nextId, maxTs >>
+                                 /\ UNCHANGED << db_jobs, nextId, maxTs >>
                       /\ UNCHANGED approvalsDB
                    \/ /\ revalFails[e] > 0 \/ ~Allowed(e, environments[e].commit)
                       /\ IF Allowed(e, environments[e].commit)
                             THEN /\ revalFails' = [revalFails EXCEPT ![e] = 0]
-                                 /\ UNCHANGED << clock, db_jobs, nextId, 
-                                                 approvalsDB, maxTs >>
+                                 /\ UNCHANGED << db_jobs, nextId, approvalsDB, 
+                                                 maxTs >>
                             ELSE /\ revalFails' = [revalFails EXCEPT ![e] = 0]
                                  /\ IF LiveApproval(e, environments[e].commit)
                                        THEN /\ approvalsDB' = (           approvalsDB \cup
-                                                               {ApprovalRecord("revoke", e, environments[e].commit, clock + 1)})
+                                                               {ApprovalRecord("revoke", e, environments[e].commit, Stamp(clock))})
                                        ELSE /\ TRUE
                                             /\ UNCHANGED approvalsDB
-                                 /\ db_jobs' = db_jobs @@ (nextId :> NewJob("teardown", e, clock + 1, (environments[e].commit), "revalidation"))
+                                 /\ db_jobs' = db_jobs @@ (nextId :> NewJob("teardown", e, MaxSeq(e) + 1, (environments[e].commit), "revalidation"))
                                  /\ nextId' = nextId + 1
-                                 /\ maxTs' = [maxTs EXCEPT ![e] = clock + 1]
-                                 /\ clock' = clock + 1
+                                 /\ maxTs' = [maxTs EXCEPT ![e] = MaxSeq(e) + 1]
                       /\ UNCHANGED ghesFaults
               /\ pc' = [pc EXCEPT !["revalidator"] = "Revalidate"]
-              /\ UNCHANGED << head, open, approvedGH, openerOK, ghActions, 
-                              permLosses, ticks, emitted, inflight, deliveries, 
-                              watermark, environments, deployedAt, daemon, 
-                              crashes, faults, prunes, prunedDeliveries, job, 
-                              epoch >>
+              /\ UNCHANGED << head, open, approvedGH, openerOK, clock, 
+                              ghActions, permLosses, ticks, emitted, inflight, 
+                              deliveries, watermark, environments, deployedAt, 
+                              daemon, crashes, faults, prunes, 
+                              prunedDeliveries, job, epoch >>
 
 Revalidator == Revalidate
 
 Expire == /\ pc["expirer"] = "Expire"
           /\ daemon = "up"
           /\ \E e \in {x \in EnvIDs : Expirable(x)}:
-               /\ db_jobs' = db_jobs @@ (nextId :> NewJob("teardown", e, clock + 1, (environments[e].commit), "ttl"))
+               /\ db_jobs' = db_jobs @@ (nextId :> NewJob("teardown", e, MaxSeq(e) + 1, (environments[e].commit), "ttl"))
                /\ nextId' = nextId + 1
-               /\ maxTs' = [maxTs EXCEPT ![e] = clock + 1]
-               /\ clock' = clock + 1
+               /\ maxTs' = [maxTs EXCEPT ![e] = MaxSeq(e) + 1]
           /\ pc' = [pc EXCEPT !["expirer"] = "Expire"]
-          /\ UNCHANGED << head, open, approvedGH, openerOK, ghActions, 
+          /\ UNCHANGED << head, open, approvedGH, openerOK, clock, ghActions, 
                           permLosses, ticks, emitted, inflight, deliveries, 
                           approvalsDB, watermark, environments, deployedAt, 
                           revalFails, daemon, crashes, faults, ghesFaults, 
