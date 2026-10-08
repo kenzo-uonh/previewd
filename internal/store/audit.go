@@ -43,6 +43,7 @@ const (
 const (
 	auditDetailWriteAccess = "write_access"
 	auditDetailNotApproved = "not_approved"
+	auditDetailOptIn       = "opt_in"
 )
 
 // auditDetails is the closed vocabulary of detail for kind; ok is false for
@@ -66,7 +67,7 @@ func auditDetails(kind AuditKind) (details []string, ok bool) {
 	case AuditTTLExpired:
 		return []string{string(OriginTTL)}, true
 	case AuditFullSecretsOptIn:
-		return []string{"opt_in"}, true
+		return []string{auditDetailOptIn}, true
 	}
 	return nil, false
 }

@@ -119,7 +119,7 @@ func newAuthRig(t *testing.T) *authRig {
 
 // approve records a live approval of authCommit by account (login as the
 // webhook named it), as the API does on a review or a label event.
-func (a *authRig) approve(via store.ApprovalVia, reviewID int64, login string, account int64) {
+func (a *rig) approve(via store.ApprovalVia, reviewID int64, login string, account int64) {
 	a.t.Helper()
 	a.seq++
 	id := fmt.Sprintf("approval-%d", a.seq)
@@ -182,7 +182,7 @@ func (a *authRig) mustBeUntrustedApproved(why string) {
 	if err != nil || d.Trust != store.TrustUntrusted || d.Approval == nil || d.Approval.ApproverID != approverID {
 		a.t.Fatalf("%s: Authorize = %+v, %v; want untrusted on approver %d", why, d, err, approverID)
 	}
-	if err := a.queue.Classify(context.Background(), a.lease, d.Trust); err != nil {
+	if err := a.queue.Classify(context.Background(), a.lease, store.Classification(d)); err != nil {
 		a.t.Fatalf("%s: Classify = %v", why, err)
 	}
 }
@@ -201,7 +201,7 @@ func TestAuthorizeTrusted(t *testing.T) {
 			if strings.Join(a.gh.calls, ",") != "pull_request" {
 				t.Fatalf("calls %v, want the pull request only", a.gh.calls)
 			}
-			if err := a.queue.Classify(context.Background(), a.lease, d.Trust); err != nil {
+			if err := a.queue.Classify(context.Background(), a.lease, store.Classification(d)); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -270,7 +270,7 @@ func TestAuthorizeReviewNoLongerApproved(t *testing.T) {
 			a.approve(store.ApprovalViaReview, 100, "lead-dev", approverID)
 			a.gh.reviews = reviews
 			a.mustRefuse(name)
-			if err := a.queue.Classify(context.Background(), a.lease, store.TrustTrusted); err != nil {
+			if err := a.queue.Classify(context.Background(), a.lease, store.Classification{Trust: store.TrustTrusted}); err != nil {
 				t.Fatal(err) // the lease is still unclassified: nothing was recorded
 			}
 		})
@@ -491,5 +491,179 @@ func TestLatestVerdict(t *testing.T) {
 	}
 	if rv, ok := latestVerdict(rs, 9); ok {
 		t.Fatalf("an account without review: %+v", rv)
+	}
+}
+
+// running authorizes, classifies and finishes the rig's deploy, and returns
+// it as store.Running lists it: the builder the Revalidator checks.
+func (a *authRig) running() store.Job {
+	a.t.Helper()
+	d, err := a.authorize()
+	if err != nil {
+		a.t.Fatalf("Authorize = %v", err)
+	}
+	ctx := context.Background()
+	if err := a.queue.Classify(ctx, a.lease, store.Classification(d)); err != nil {
+		a.t.Fatal(err)
+	}
+	if err := a.queue.Finish(ctx, a.lease, store.StatusSuccess, a.now); err != nil {
+		a.t.Fatal(err)
+	}
+	jobs, err := a.queue.Running(ctx)
+	if err != nil || len(jobs) != 1 {
+		a.t.Fatalf("Running = %+v, %v", jobs, err)
+	}
+	a.gh.calls = nil
+	return jobs[0]
+}
+
+func (a *authRig) revalidate(j store.Job) error {
+	a.t.Helper()
+	auth, err := NewAuthorizer(a.cfg)
+	if err != nil {
+		a.t.Fatal(err)
+	}
+	return auth.Revalidate(context.Background(), j)
+}
+
+// mustRevoke: Revalidate refuses with a RevokedError carrying reason.
+func (a *authRig) mustRevoke(j store.Job, reason store.RevocationReason, why string) {
+	a.t.Helper()
+	err := a.revalidate(j)
+	var rev *RevokedError
+	if !errors.As(err, &rev) || !errors.Is(err, ErrNotApproved) || errors.Is(err, ErrUnavailable) || rev.Reason != reason {
+		a.t.Fatalf("%s: Revalidate = %v; want a RevokedError with reason %q", why, err, reason)
+	}
+}
+
+// D-V1-5: a version built trusted stays only while its PR is trusted now.
+// An opener downgraded (or the head repository gone) revokes it whatever
+// approval exists; there is no approval of its own to revoke.
+func TestRevalidateTrustedEnvironment(t *testing.T) {
+	a := newAuthRig(t)
+	j := a.running()
+	if j.Trust != store.TrustTrusted {
+		t.Fatalf("builder trust %s", j.Trust)
+	}
+	if err := a.revalidate(j); err != nil {
+		t.Fatalf("still trusted: %v", err)
+	}
+	a.gh.pr.OpenerPermission = "read" // offboarded
+	a.approveByReview()               // an approval does not keep a trusted build alive
+	a.mustRevoke(j, "", "opener downgraded")
+	a.gh.pr.OpenerPermission, a.gh.pr.HeadRepo = "write", ""
+	a.mustRevoke(j, "", "head repository deleted")
+
+	// A version deployed before V1 (unclassified, full secret set) is judged
+	// as a trusted one.
+	j.Trust = store.TrustUnclassified
+	a.mustRevoke(j, "", "pre-V1 version, no longer trusted")
+	a.gh.pr.HeadRepo = "acme/app"
+	if err := a.revalidate(j); err != nil {
+		t.Fatalf("pre-V1 version, trusted: %v", err)
+	}
+}
+
+// A version built on an approval stays while the approval is confirmed
+// again (or the PR became trusted); each loss carries its reason.
+func TestRevalidateUntrustedEnvironment(t *testing.T) {
+	setup := func(t *testing.T) (*authRig, store.Job) {
+		a := newAuthRig(t)
+		a.gh.pr.HeadRepo = "outsider/app"
+		a.approveByReview()
+		j := a.running()
+		if j.Trust != store.TrustUntrusted {
+			t.Fatalf("builder trust %s", j.Trust)
+		}
+		return a, j
+	}
+	a, j := setup(t)
+	if err := a.revalidate(j); err != nil {
+		t.Fatalf("still approved: %v", err)
+	}
+	for name, tc := range map[string]struct {
+		mutate func(*authRig)
+		reason store.RevocationReason
+	}{
+		"dismissed": {func(a *authRig) {
+			a.gh.reviews = []vcs.ReviewState{review(100, "lead-dev", approverID, "DISMISSED", authCommit)}
+		}, store.RevokedDismissed},
+		"changes requested": {func(a *authRig) {
+			a.gh.reviews = append(a.gh.reviews, review(101, "lead-dev", approverID, "CHANGES_REQUESTED", authCommit))
+		}, store.RevokedChangesRequested},
+		"approver downgraded": {func(a *authRig) { a.gh.perms[approverID] = "read" }, store.RevokedPermissionLost},
+		"login taken over":    {func(a *authRig) { a.gh.accounts = map[string]int64{"lead-dev": 99} }, store.RevokedPermissionLost},
+		"approver delisted": {func(a *authRig) {
+			a.cfg.Approvers = map[string][]validate.Approver{"acme/app": {{Login: "other", ID: 8}}}
+		}, store.RevokedApproverRemoved},
+	} {
+		t.Run(name, func(t *testing.T) {
+			a, j := setup(t)
+			tc.mutate(a)
+			a.mustRevoke(j, tc.reason, name)
+		})
+	}
+	t.Run("approval revoked in the DB", func(t *testing.T) {
+		a, j := setup(t)
+		a.seq++
+		if _, err := a.queue.EnqueueInternal(context.Background(), testEnv, store.OriginRevalidation, store.RevokedDismissed, a.now,
+			store.AuditEvent{Kind: store.AuditTeardown, EnvID: testEnv, Repo: "acme/app", PRNumber: 7, Detail: string(store.OriginRevalidation)}); err != nil {
+			t.Fatal(err)
+		}
+		a.mustRevoke(j, "", "no live grant")
+	})
+	t.Run("pull request trusted now", func(t *testing.T) {
+		a, j := setup(t)
+		a.gh.pr.HeadRepo = "acme/app"
+		a.gh.reviews = nil
+		if err := a.revalidate(j); err != nil {
+			t.Fatalf("an approved version whose PR became trusted: %v", err)
+		}
+	})
+	t.Run("GHES unavailable", func(t *testing.T) {
+		for _, call := range []string{"pull_request", "reviews", "permission:lead-dev"} {
+			a, j := setup(t)
+			a.gh.fail[call] = errors.New("connection refused")
+			if err := a.revalidate(j); !errors.Is(err, ErrUnavailable) || errors.Is(err, ErrNotApproved) {
+				t.Fatalf("%s down: %v, want ErrUnavailable only", call, err)
+			}
+		}
+	})
+	t.Run("label removed", func(t *testing.T) {
+		a := newAuthRig(t)
+		a.cfg.LabelApproval = true
+		a.gh.pr.HeadRepo, a.gh.pr.Labels = "outsider/app", []string{"previewd-approved"}
+		a.approve(store.ApprovalViaLabel, 0, "lead-dev", approverID)
+		j := a.running()
+		a.gh.pr.Labels = nil
+		a.mustRevoke(j, store.RevokedUnlabeled, "label removed")
+	})
+	t.Run("not a running version", func(t *testing.T) {
+		a, j := setup(t)
+		j.Status = store.StatusFailed
+		if err := a.revalidate(j); err == nil || errors.Is(err, ErrNotApproved) {
+			t.Fatalf("a FAILED job revalidated: %v", err)
+		}
+	})
+}
+
+// D-V1-1: the opt-in applies to approved untrusted deploys of the listed
+// repositories only, never to a trusted one.
+func TestAuthorizeFullSecretsOptIn(t *testing.T) {
+	a := newAuthRig(t)
+	a.cfg.FullSecretsRepos = map[string]bool{"acme/app": true}
+	if d, err := a.authorize(); err != nil || d.Trust != store.TrustTrusted || d.FullSecrets {
+		t.Fatalf("trusted with the opt-in listed: %+v, %v", d, err)
+	}
+	b := newAuthRig(t)
+	b.gh.pr.HeadRepo = "outsider/app"
+	b.approveByReview()
+	b.cfg.FullSecretsRepos = map[string]bool{"acme/web": true}
+	if d, err := b.authorize(); err != nil || d.FullSecrets {
+		t.Fatalf("another repository listed: %+v, %v", d, err)
+	}
+	b.cfg.FullSecretsRepos = map[string]bool{"acme/app": true}
+	if d, err := b.authorize(); err != nil || d.Trust != store.TrustUntrusted || !d.FullSecrets {
+		t.Fatalf("listed repository: %+v, %v", d, err)
 	}
 }

@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
+	"sync"
 	"syscall"
 	"time"
 
@@ -134,16 +137,48 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Approval gating (V1 F1): GHES truth through the GitHub App (C3),
+	// judged by the deploy gate (D4) before any build.
+	ghes, err := newGHESClient(cfg, logger)
+	if err != nil {
+		logger.Error("GHES client refused", "ghes_url", cfg.GHESURL, "error", err)
+		os.Exit(1)
+	}
+	if cfg.LabelApproval {
+		logger.Error("Opt-in active: an approver's label approves untrusted code",
+			"opt_in", "PREVIEWD_LABEL_APPROVAL", "label", cfg.ApprovalLabel)
+	}
+	if len(cfg.FullSecretsRepos) > 0 {
+		logger.Error("Opt-in active: approved untrusted deploys of these repositories receive the trusted secret section",
+			"opt_in", "PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS", "repositories", slices.Sorted(maps.Keys(cfg.FullSecretsRepos)))
+	}
+	authorizer, err := orchestrator.NewAuthorizer(orchestrator.AuthorizerConfig{
+		GitHub:           ghes,
+		Approvals:        db,
+		Approvers:        cfg.Approvers,
+		LabelApproval:    cfg.LabelApproval,
+		ApprovalLabel:    cfg.ApprovalLabel,
+		FullSecretsRepos: cfg.FullSecretsRepos,
+		Logger:           logger,
+	})
+	if err != nil {
+		logger.Error("Authorizer initialization failure", "error", err)
+		os.Exit(1)
+	}
+
 	reconciler, err := orchestrator.NewReconciler(orchestrator.ReconcilerConfig{
-		Queue:   db,
-		Engine:  engine,
-		Routes:  routes,
-		Stager:  stager,
-		Secrets: injector,
-		Fetch:   vcs.FetchRepository,
-		Logger:  logger,
-		Domain:  cfg.TraefikDomain,
-		AppPort: appPort,
+		Queue:              db,
+		Engine:             engine,
+		Routes:             routes,
+		Stager:             stager,
+		Secrets:            injector,
+		Authorizer:         authorizer,
+		Fetch:              vcs.FetchRepository,
+		Logger:             logger,
+		Domain:             cfg.TraefikDomain,
+		AppPort:            appPort,
+		RevalidateInterval: cfg.RevalidateInterval,
+		RevalidateGrace:    cfg.RevalidateGrace,
 	})
 	if err != nil {
 		logger.Error("Reconciler initialization failure", "error", err)
@@ -160,22 +195,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	workersDone := make(chan struct{})
-	go func() {
-		reconciler.Run(ctx, cfg.MaxConcurrentBuilds)
-		close(workersDone)
-	}()
-
-	// Approval gating (V1 F1): GHES truth through the GitHub App (C3).
-	ghes, err := newGHESClient(cfg, logger)
-	if err != nil {
-		logger.Error("GHES client refused", "ghes_url", cfg.GHESURL, "error", err)
-		os.Exit(1)
-	}
-	if cfg.LabelApproval {
-		logger.Error("Opt-in active: an approver's label approves untrusted code",
-			"opt_in", "PREVIEWD_LABEL_APPROVAL", "label", cfg.ApprovalLabel)
-	}
+	var background sync.WaitGroup
+	background.Go(func() { reconciler.Run(ctx, cfg.MaxConcurrentBuilds) })
+	// Re-validation of every running environment (D-V1-5, V1-I4).
+	background.Go(func() { reconciler.Revalidate(ctx) })
+	logger.Info("Re-validation loop running", "interval", cfg.RevalidateInterval, "grace", cfg.RevalidateGrace)
 	apiServer, err := api.NewServer(logger, cfg, webhookSecret, db, reconciler, ghes)
 	if err != nil {
 		logger.Error("API server refused", "error", err)
@@ -235,7 +259,7 @@ func main() {
 
 	// Workers stop taking jobs; an interrupted job rolls back and records its
 	// outcome before the database closes.
-	<-workersDone
+	background.Wait()
 
 	logger.Info("Agent exited cleanly.")
 }

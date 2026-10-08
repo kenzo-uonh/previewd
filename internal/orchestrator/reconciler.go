@@ -7,11 +7,20 @@ package orchestrator
 //	Startup        StartupSweep: host inventory -> queue sweep -> destroy
 //	               what the database does not keep -> route post-condition
 //	worker loop    AcquireJob, then
-//	  deploy       ExecuteDeploy (remove previous version, fetch, network,
-//	               build, stage secrets), StartContainer, PublishRoute,
-//	               CommitDeploy; any failure rolls back and records FAILED
+//	  deploy       AuthorizeDeploy (V1, docs/formal/V1-model.md): classify
+//	               the lease from GHES and record it (Classify), or park it
+//	               (remove the previous version, PENDING_APPROVAL), or
+//	               requeue it unclassified (GHES unavailable: remove a revoked
+//	               version first, A2-6; park at the attempt ceiling); then
+//	               ExecuteDeploy (remove previous version, fetch, network,
+//	               build, stage the secret section of its trust),
+//	               StartContainer, PublishRoute, CommitDeploy; any failure
+//	               rolls back and records FAILED
 //	  teardown     ExecuteTeardown, CommitTeardown; a failure requeues with
 //	               backoff, never FAILED
+//	Revalidator    every interval, each running environment is re-checked
+//	               (D-V1-5); one no longer authorized, or unverifiable past
+//	               the grace period, gets an internal teardown
 
 import (
 	"context"
@@ -34,11 +43,32 @@ type Queue interface {
 	Finish(ctx context.Context, l store.Lease, status store.JobStatus, now time.Time) error
 	Requeue(ctx context.Context, l store.Lease, notBefore time.Time) error
 	StartupSweep(ctx context.Context, now time.Time, observed []store.Observation) (store.SweepResult, error)
+	// AuthorizeDeploy (V1).
+	Classify(ctx context.Context, l store.Lease, c store.Classification) error
+	Park(ctx context.Context, l store.Lease) error
+	RunningVersion(ctx context.Context, envID string) (store.Job, bool, error)
+	ApprovalLive(ctx context.Context, envID, commitSHA string) (bool, error)
+	// Revalidator (D-V1-5).
+	Running(ctx context.Context) ([]store.Job, error)
+	EnqueueInternal(ctx context.Context, envID string, origin store.Origin, reason store.RevocationReason, now time.Time, audit store.AuditEvent) (int64, error)
 }
 
-// SecretSource returns the secrets to stage for a deploy.
+// Authorizer is the deploy gate (GHESAuthorizer).
+type Authorizer interface {
+	// Authorize classifies a leased deploy: ErrUnavailable requeues it,
+	// ErrNotApproved parks it, anything else deploys nothing.
+	Authorize(ctx context.Context, l store.Lease) (Decision, error)
+	// Revalidate re-checks the running version a SUCCESS deploy built:
+	// ErrNotApproved (a *RevokedError) tears it down, ErrUnavailable counts
+	// toward the grace period.
+	Revalidate(ctx context.Context, j store.Job) error
+}
+
+// SecretSource returns the secret section a deploy receives (V1-I2): the
+// trusted section of repo, or its untrusted section, never the trusted one
+// for an untrusted deploy unless fullOptIn (D-V1-1). secrets.Injector.
 type SecretSource interface {
-	GetSecrets() map[string]string
+	Section(repo string, untrusted, fullOptIn bool) (map[string]string, error)
 }
 
 // FetchFunc checks out commitSHA of cloneURL into destDir (vcs.FetchRepository).
@@ -46,19 +76,37 @@ type FetchFunc func(ctx context.Context, cloneURL, commitSHA, destDir string) er
 
 // ReconcilerConfig wires the reconciler. Every dependency is required.
 type ReconcilerConfig struct {
-	Queue   Queue
-	Engine  Engine
-	Routes  RoutePublisher
-	Stager  SecretStager
-	Secrets SecretSource
-	Fetch   FetchFunc
-	Logger  *slog.Logger
-	Domain  string
-	AppPort int
+	Queue      Queue
+	Engine     Engine
+	Routes     RoutePublisher
+	Stager     SecretStager
+	Secrets    SecretSource
+	Authorizer Authorizer
+	Fetch      FetchFunc
+	Logger     *slog.Logger
+	Domain     string
+	AppPort    int
+	// RevalidateInterval and RevalidateGrace are
+	// PREVIEWD_APPROVAL_REVALIDATE_INTERVAL and _GRACE (default 10 m, 1 h);
+	// the grace is never shorter than the interval.
+	RevalidateInterval time.Duration
+	RevalidateGrace    time.Duration
+	// AuthorizeMaxAttempts is the ceiling of AuthorizeDeploy attempts that
+	// cannot classify a deploy (GHES unavailable, more than 1,000 reviews,
+	// approvals changed during the read): the last one parks the deploy
+	// instead of requeuing it (default 10).
+	AuthorizeMaxAttempts int64
 	// Now and PollInterval default to time.Now and 2 s.
 	Now          func() time.Time
 	PollInterval time.Duration
 }
+
+// Defaults of ReconcilerConfig.
+const (
+	defaultRevalidateInterval   = 10 * time.Minute
+	defaultRevalidateGrace      = time.Hour
+	defaultAuthorizeMaxAttempts = 10
+)
 
 // Reconciler runs the startup sweep and the deployment workers.
 type Reconciler struct {
@@ -69,8 +117,20 @@ type Reconciler struct {
 // NewReconciler validates cfg.
 func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 	if cfg.Queue == nil || cfg.Engine == nil || cfg.Routes == nil || cfg.Stager == nil ||
-		cfg.Secrets == nil || cfg.Fetch == nil || cfg.Logger == nil {
+		cfg.Secrets == nil || cfg.Authorizer == nil || cfg.Fetch == nil || cfg.Logger == nil {
 		return nil, errors.New("reconciler: every dependency is required")
+	}
+	if cfg.RevalidateInterval <= 0 {
+		cfg.RevalidateInterval = defaultRevalidateInterval
+	}
+	if cfg.RevalidateGrace <= 0 {
+		cfg.RevalidateGrace = max(defaultRevalidateGrace, cfg.RevalidateInterval)
+	}
+	if cfg.RevalidateGrace < cfg.RevalidateInterval {
+		return nil, fmt.Errorf("reconciler: re-validation grace %s is shorter than the interval %s", cfg.RevalidateGrace, cfg.RevalidateInterval)
+	}
+	if cfg.AuthorizeMaxAttempts <= 0 {
+		cfg.AuthorizeMaxAttempts = defaultAuthorizeMaxAttempts
 	}
 	if cfg.Domain == "" || cfg.AppPort <= 0 || cfg.AppPort > 65535 {
 		return nil, fmt.Errorf("reconciler: invalid domain %q or application port %d", cfg.Domain, cfg.AppPort)
@@ -231,8 +291,13 @@ func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
 }
 
 func (r *Reconciler) deploy(ctx context.Context, l store.Lease, log *slog.Logger) {
+	d, ok := r.authorizeDeploy(ctx, l, log)
+	if !ok {
+		return
+	}
+	log = log.With("trust", string(d.Trust))
 	log.Info("Deploying environment")
-	err := r.runDeploy(ctx, l, log)
+	err := r.runDeploy(ctx, l, d, log)
 	cctx, cancel := cleanupContext(ctx)
 	defer cancel()
 	if err == nil {
@@ -253,8 +318,15 @@ func (r *Reconciler) deploy(ctx context.Context, l store.Lease, log *slog.Logger
 	}
 }
 
-func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, log *slog.Logger) (err error) {
+func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, log *slog.Logger) (err error) {
 	env := l.EnvID
+	// The secret section of the deploy's trust (V1-I2), read before anything
+	// changes on the host. Only an explicit trusted verdict gets the trusted
+	// section.
+	section, err := r.cfg.Secrets.Section(l.Source.Repo, d.Trust != store.TrustTrusted, d.FullSecrets)
+	if err != nil {
+		return fmt.Errorf("secrets: %w", err)
+	}
 
 	// ExecuteDeploy: remove the previous version, fetch, create the internal
 	// network, build, stage the secrets on ramfs.
@@ -280,7 +352,7 @@ func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, log *slog.Log
 	if err := r.cfg.Engine.Build(ctx, dir, tag); err != nil {
 		return fmt.Errorf("build: %w", err)
 	}
-	secretsDir, err := r.cfg.Stager.Stage(env, r.cfg.Secrets.GetSecrets())
+	secretsDir, err := r.cfg.Stager.Stage(env, section)
 	if err != nil {
 		return fmt.Errorf("stage secrets: %w", err)
 	}
@@ -320,7 +392,218 @@ func (r *Reconciler) teardown(ctx context.Context, l store.Lease, log *slog.Logg
 	log.Info("Environment torn down")
 }
 
+// authorizeDeploy is AuthorizeDeploy: the lease is classified from GHES and
+// the verdict recorded with the approval the authorizer confirmed, or the
+// deploy is parked or requeued. ok is true only for a deploy classified in
+// the database; nothing of an unclassified deploy reaches the host but the
+// removal of the version it supersedes.
+func (r *Reconciler) authorizeDeploy(ctx context.Context, l store.Lease, log *slog.Logger) (Decision, bool) {
+	d, err := r.cfg.Authorizer.Authorize(ctx, l)
+	cctx, cancel := cleanupContext(ctx)
+	defer cancel()
+	switch {
+	case errors.Is(err, ErrNotApproved):
+		r.park(cctx, l, log, err)
+		return Decision{}, false
+	case err != nil:
+		r.retryAuthorization(cctx, l, log, err)
+		return Decision{}, false
+	}
+	err = r.cfg.Queue.Classify(cctx, l, store.Classification(d))
+	switch {
+	case errors.Is(err, store.ErrLeaseLost):
+		log.Error("Lease lost before the deploy was classified: nothing deployed", "error", err)
+		return Decision{}, false
+	case err != nil:
+		// ErrApprovalChanged or ErrNotApproved: the approvals changed between
+		// the GHES read and the record, so the grant to audit is not the one
+		// confirmed. Any other failure recorded nothing either. Authorize
+		// again, within the ceiling.
+		r.retryAuthorization(cctx, l, log, fmt.Errorf("record the classification: %w", err))
+		return Decision{}, false
+	}
+	attrs := []any{"trust", string(d.Trust)}
+	if d.Approval != nil {
+		attrs = append(attrs, "approver_login", d.Approval.ApproverLogin, "approver_id", d.Approval.ApproverID,
+			"approved_via", string(d.Approval.Via), "review_id", d.Approval.ReviewID)
+	}
+	log.Info("Deploy authorized", attrs...)
+	if d.FullSecrets {
+		log.Error("Opt-in active: an approved untrusted deploy receives the trusted secret section",
+			"opt_in", "PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS")
+	}
+	return d, true
+}
+
+// park refuses an unauthorized deploy: the version it supersedes is
+// removed, then the job waits in PENDING_APPROVAL for an approval of its
+// exact commit or a newer intent. When that removal fails the deploy is
+// requeued instead, so no superseded version keeps running behind a parked
+// job.
+func (r *Reconciler) park(ctx context.Context, l store.Lease, log *slog.Logger, cause error) {
+	if err := Teardown(ctx, r.cfg.Engine, r.cfg.Routes, r.cfg.Stager, l.EnvID); err != nil {
+		notBefore := r.cfg.Now().Add(teardownBackoff(l.Attempts))
+		log.Error("Could not remove the superseded version of a refused deploy: requeued", "error", err, "cause", cause, "not_before", notBefore)
+		if rqErr := r.cfg.Queue.Requeue(ctx, l, notBefore); rqErr != nil {
+			log.Error("Could not requeue the refused deploy: the next startup sweep fails it", "error", rqErr)
+		}
+		return
+	}
+	if err := r.cfg.Queue.Park(ctx, l); err != nil {
+		log.Error("Could not park the refused deploy: the next startup sweep fails it", "error", err, "cause", cause)
+		return
+	}
+	log.Warn("Deploy refused: parked until an approval of its exact commit", "reason", cause)
+}
+
+// retryAuthorization handles a deploy AuthorizeDeploy could not classify.
+// Below the ceiling it is requeued unclassified with backoff, after the
+// removal of a running version whose approval the database no longer
+// holds live (A2-6, a DB read, no GHES call). At the ceiling it is parked
+// instead of requeued forever: a persistent outage, or a pull request whose
+// reviews cannot be read whole (more than 1,000), never deploys.
+func (r *Reconciler) retryAuthorization(ctx context.Context, l store.Lease, log *slog.Logger, cause error) {
+	if l.Attempts+1 >= r.cfg.AuthorizeMaxAttempts {
+		log.Error("Deploy still unclassified at the attempt ceiling: parked", "attempts", l.Attempts+1, "error", cause)
+		r.park(ctx, l, log, cause)
+		return
+	}
+	if err := r.removeRevokedVersion(ctx, l.EnvID, log); err != nil {
+		log.Error("Could not check or remove a revoked version: the next attempt retries", "error", err)
+	}
+	notBefore := r.cfg.Now().Add(authorizeBackoff(l.Attempts))
+	log.Warn("Deploy not classified: requeued", "error", cause, "attempt", l.Attempts+1, "not_before", notBefore)
+	if err := r.cfg.Queue.Requeue(ctx, l, notBefore); err != nil {
+		log.Error("Could not requeue the unclassified deploy: the next startup sweep fails it", "error", err)
+	}
+}
+
+// removeRevokedVersion destroys the version running in envID when it was
+// built on an approval that is no longer live in the database (A2-6).
+func (r *Reconciler) removeRevokedVersion(ctx context.Context, envID string, log *slog.Logger) error {
+	v, ok, err := r.cfg.Queue.RunningVersion(ctx, envID)
+	if err != nil || !ok || v.Trust != store.TrustUntrusted {
+		return err
+	}
+	live, err := r.cfg.Queue.ApprovalLive(ctx, envID, v.Source.CommitSHA)
+	if err != nil || live {
+		return err
+	}
+	if err := Teardown(ctx, r.cfg.Engine, r.cfg.Routes, r.cfg.Stager, envID); err != nil {
+		return fmt.Errorf("remove the revoked version built by job %d: %w", v.ID, err)
+	}
+	log.Warn("Removed a running version whose approval was revoked (A2-6)", "builder_job_id", v.ID, "revoked_commit", v.Source.CommitSHA)
+	return nil
+}
+
+// authorizeBackoff doubles from 30 s and stops at 10 minutes: with the
+// default ceiling, a deploy waits about an hour for GHES before it parks.
+func authorizeBackoff(attempts int64) time.Duration {
+	return min(30*time.Second<<min(max(attempts, 0), 5), 10*time.Minute)
+}
+
 // teardownBackoff doubles from 1 s and stops at 5 minutes.
 func teardownBackoff(attempts int64) time.Duration {
 	return min(time.Second<<min(max(attempts, 0), 9), 5*time.Minute)
+}
+
+// Revalidate runs the re-validation loop (D-V1-5, V1-I4) until ctx is done.
+// Every interval, each running environment (store.Running) is re-checked
+// against GHES. One that is no longer authorized gets an internal teardown
+// at once; one that cannot be checked is kept until it has failed to be
+// checked for the grace period, then torn down (fail closed). The failure
+// count lives in memory: a restart begins a new grace period, and the
+// startup sweep re-arms only through AuthorizeDeploy.
+func (r *Reconciler) Revalidate(ctx context.Context) {
+	failing := map[string]time.Time{} // environment -> first consecutive unverifiable check
+	t := time.NewTicker(r.cfg.RevalidateInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			r.revalidateOnce(ctx, failing)
+		}
+	}
+}
+
+// revalidateOnce checks every running environment once. failing carries
+// the unverifiable streaks across passes.
+func (r *Reconciler) revalidateOnce(ctx context.Context, failing map[string]time.Time) {
+	jobs, err := r.cfg.Queue.Running(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			r.cfg.Logger.Error("Re-validation: could not list the running environments", "error", err)
+		}
+		return
+	}
+	running := make(map[string]bool, len(jobs))
+	for _, j := range jobs {
+		if ctx.Err() != nil {
+			return
+		}
+		running[j.EnvID] = true
+		log := r.cfg.Logger.With("environment_id", j.EnvID, "builder_job_id", j.ID, "trust", string(j.Trust),
+			"repository", j.Source.Repo, "pr_number", j.Source.PRNumber, "commit_sha", j.Source.CommitSHA)
+		err := r.cfg.Authorizer.Revalidate(ctx, j)
+		now := r.cfg.Now()
+		switch {
+		case err == nil:
+			if since, ok := failing[j.EnvID]; ok {
+				log.Info("Re-validation succeeded again", "unverifiable_since", since)
+				delete(failing, j.EnvID)
+			}
+		case ctx.Err() != nil:
+			return
+		case errors.Is(err, ErrNotApproved):
+			var reason store.RevocationReason
+			var rev *RevokedError
+			if errors.As(err, &rev) {
+				reason = rev.Reason
+			}
+			log.Warn("Environment no longer authorized: tearing down", "reason", string(reason), "error", err)
+			r.revalidationTeardown(ctx, j, reason, string(store.OriginRevalidation), log)
+			delete(failing, j.EnvID)
+		default:
+			since, ok := failing[j.EnvID]
+			if !ok {
+				since, failing[j.EnvID] = now, now
+			}
+			if now.Sub(since) < r.cfg.RevalidateGrace {
+				log.Warn("Environment could not be re-validated: kept within the grace period",
+					"error", err, "unverifiable_since", since, "grace", r.cfg.RevalidateGrace)
+				continue
+			}
+			log.Error("Environment unverifiable past the grace period: tearing down (fail closed)",
+				"error", err, "unverifiable_since", since, "grace", r.cfg.RevalidateGrace)
+			r.revalidationTeardown(ctx, j, "", string(store.RevokedRevalidationUnavailable), log)
+			delete(failing, j.EnvID)
+		}
+	}
+	for env := range failing {
+		if !running[env] {
+			delete(failing, env)
+		}
+	}
+}
+
+// revalidationTeardown queues the internal teardown of j's environment,
+// pinned to j's commit: when a newer intent for another commit was
+// recorded since the check, the store refuses it and that intent's own
+// AuthorizeDeploy decides. With a reason, the live approval of the commit
+// is revoked in the same transaction.
+func (r *Reconciler) revalidationTeardown(ctx context.Context, j store.Job, reason store.RevocationReason, detail string, log *slog.Logger) {
+	cctx, cancel := cleanupContext(ctx)
+	defer cancel()
+	src := j.Source
+	id, err := r.cfg.Queue.EnqueueInternal(cctx, j.EnvID, store.OriginRevalidation, reason, r.cfg.Now(), store.AuditEvent{
+		Kind: store.AuditTeardown, EnvID: j.EnvID, Repo: src.Repo, PRNumber: src.PRNumber, CommitSHA: src.CommitSHA, Detail: detail,
+	})
+	if err != nil {
+		log.Error("Could not queue the re-validation teardown: the next pass retries", "error", err)
+		return
+	}
+	log.Info("Re-validation teardown queued", "teardown_job_id", id)
+	r.Notify()
 }

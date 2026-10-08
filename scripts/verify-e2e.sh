@@ -187,7 +187,9 @@ else
   sudo mount -t ramfs -o mode=0700,nosuid,nodev,noexec ramfs "$STAGING_DIR"
   sudo chown "$(id -u):$(id -g)" "$STAGING_DIR"
 fi
-printf 'E2E_TOKEN=%s\n' "$E2E_SECRET" > "$MOCK_DIR/secrets.env"
+# Sectioned secrets file (D5): the trusted PR below must receive the
+# [e2e/mock] value, never the :untrusted one.
+printf '[e2e/mock]\nE2E_TOKEN=%s\n[e2e/mock:untrusted]\nE2E_TOKEN=untrusted-%s\n' "$E2E_SECRET" "$E2E_SECRET" > "$MOCK_DIR/secrets.env"
 chmod 0600 "$MOCK_DIR/secrets.env"
 
 # start_agent: run the daemon in the background on the E2E state (database,
@@ -357,6 +359,9 @@ done
 echo "    ok: orphan, foreign and partial route files removed; the kept environment and its route survive the crash"
 
 echo "==> 2f. A build that fails in a RUN step is recorded as a build failure..."
+# AuthorizeDeploy reads the PR from GHES before any build (D6): same
+# repository, opener with write, so the broken build is trusted and runs.
+fake_put pulls/e2e/mock/1000 "{\"state\":\"open\",\"head_sha\":\"$BROKEN_SHA\",\"head_repo\":\"e2e/mock\",\"opener\":{\"login\":\"e2e-opener\",\"id\":4242}}"
 BROKEN_BODY=$(printf '{"action":"opened","number":1000,"pull_request":{"number":1000,"head":{"ref":"e2e/broken","sha":"%s","repo":{"full_name":"e2e/mock"}},"user":{"login":"e2e-opener","id":4242},"updated_at":"%s"},"repository":{"full_name":"e2e/mock","clone_url":"file://%s/mock.git"},"sender":{"login":"e2e-opener","id":4242}}' "$BROKEN_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$MOCK_DIR")
 reply=$(send_webhook pull_request "$BROKEN_BODY")
 BROKEN_ENV=$(printf '%s' "$reply" | sed -n 's/.*"environment_id":"\([a-z0-9-]*\)".*/\1/p')

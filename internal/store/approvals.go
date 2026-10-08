@@ -70,6 +70,7 @@ func (r RevocationReason) valid() bool {
 // Approval errors.
 var (
 	ErrNotApproved        = errors.New("no live approval of the commit")
+	ErrApprovalChanged    = errors.New("the newest live approval is not the one confirmed on GHES")
 	ErrAlreadyClassified  = errors.New("the deploy is already classified")
 	ErrInvalidGrant       = errors.New("invalid grant")
 	ErrInvalidRevocation  = errors.New("invalid revocation")
@@ -475,21 +476,42 @@ func (s *Store) EnqueueInternal(ctx context.Context, envID string, origin Origin
 	return jobID, nil
 }
 
+// Classification is AuthorizeDeploy's verdict on one leased deploy, as the
+// authorizer confirmed it against GHES (orchestrator.Decision).
+type Classification struct {
+	Trust Trust // TrustTrusted or TrustUntrusted
+	// Approval is the grant the authorizer confirmed: required for an
+	// untrusted deploy, nil for a trusted one.
+	Approval *Approval
+	// FullSecrets is the D-V1-1 opt-in: an approved untrusted deploy gets
+	// the trusted section. Untrusted only; audited with the verdict.
+	FullSecrets bool
+}
+
 // Classify records AuthorizeDeploy's verdict on a leased, unclassified
-// deploy, with its audit row, in one transaction:
+// deploy, with its audit rows, in one transaction:
 //   - trusted (GHES: same repository, opener with write access): kind
 //     trusted_deploy, the opener as actor;
-//   - untrusted only with a live approval of the lease's commit, read in the
-//     same transaction (ErrNotApproved otherwise, nothing changed): kind
-//     untrusted_deploy, the approver of the newest live grant as actor.
+//   - untrusted only when the newest live grant of the lease's commit, read
+//     in the same transaction, is exactly c.Approval, the grant the
+//     authorizer confirmed on GHES: ErrNotApproved when none is live,
+//     ErrApprovalChanged when another grant is now the newest (recorded
+//     between the GHES read and this step), nothing changed either way.
+//     Kind untrusted_deploy, that approver as actor; with FullSecrets, a
+//     full_secrets_opt_in row by the same approver follows.
 //
-// The audit row carries the wall clock.
-func (s *Store) Classify(ctx context.Context, l Lease, trust Trust) error {
+// The audit rows carry the wall clock.
+func (s *Store) Classify(ctx context.Context, l Lease, c Classification) error {
 	if _, err := s.requireSwept(); err != nil {
 		return err
 	}
-	if trust != TrustTrusted && trust != TrustUntrusted {
-		return fmt.Errorf("classify job %d: trust %s is not trusted or untrusted", l.JobID, quoted(string(trust)))
+	switch {
+	case c.Trust == TrustTrusted && (c.Approval != nil || c.FullSecrets):
+		return fmt.Errorf("classify job %d: a trusted deploy runs on no approval and no opt-in", l.JobID)
+	case c.Trust == TrustUntrusted && c.Approval == nil:
+		return fmt.Errorf("classify job %d untrusted: no confirmed approval: %w", l.JobID, ErrNotApproved)
+	case c.Trust != TrustTrusted && c.Trust != TrustUntrusted:
+		return fmt.Errorf("classify job %d: trust %s is not trusted or untrusted", l.JobID, quoted(string(c.Trust)))
 	}
 	return s.inTx(ctx, "classify", func(tx *sql.Tx) error {
 		j, err := leasedDeploy(ctx, tx, "classify", l)
@@ -499,22 +521,34 @@ func (s *Store) Classify(ctx context.Context, l Lease, trust Trust) error {
 		src := j.Source
 		ev := AuditEvent{Kind: AuditTrustedDeploy, EnvID: j.EnvID, Repo: src.Repo, PRNumber: src.PRNumber,
 			CommitSHA: src.CommitSHA, ActorLogin: src.OpenerLogin, ActorID: src.OpenerID, Detail: auditDetailWriteAccess}
-		if trust == TrustUntrusted {
+		if c.Trust == TrustUntrusted {
 			g, live, err := newestLiveGrant(ctx, tx, j.EnvID, src.CommitSHA)
-			if err != nil {
+			switch {
+			case err != nil:
 				return err
-			}
-			if !live {
+			case !live:
 				return fmt.Errorf("classify job %d untrusted: %w", l.JobID, ErrNotApproved)
+			case g != *c.Approval:
+				return fmt.Errorf("classify job %d untrusted: confirmed %s#%d (%s, review %d), newest live grant %s#%d (%s, review %d): %w",
+					l.JobID, quoted(c.Approval.ApproverLogin), c.Approval.ApproverID, quoted(string(c.Approval.Via)), c.Approval.ReviewID,
+					quoted(g.ApproverLogin), g.ApproverID, g.Via, g.ReviewID, ErrApprovalChanged)
 			}
 			ev.Kind, ev.ActorLogin, ev.ActorID, ev.Detail = AuditUntrustedDeploy, g.ApproverLogin, g.ApproverID, string(g.Via)
 		}
 		if err := updateLease(ctx, tx, "classify", l,
 			`UPDATE jobs SET trust = ? WHERE id = ? AND status = 'IN_PROGRESS' AND lease_epoch = ?`,
-			string(trust), l.JobID, l.Epoch); err != nil {
+			string(c.Trust), l.JobID, l.Epoch); err != nil {
 			return err
 		}
-		return appendAudit(ctx, tx, ev, time.Now())
+		now := time.Now()
+		if err := appendAudit(ctx, tx, ev, now); err != nil {
+			return err
+		}
+		if !c.FullSecrets {
+			return nil
+		}
+		ev.Kind, ev.Detail = AuditFullSecretsOptIn, auditDetailOptIn
+		return appendAudit(ctx, tx, ev, now)
 	})
 }
 

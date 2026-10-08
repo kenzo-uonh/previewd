@@ -165,7 +165,7 @@ func (b *v1StoreBackend) boot(t *rapid.T, now time.Time, observed []Observation)
 				t.Fatalf("requeue with stale lease %+v: got %v, want ErrLeaseLost", l, err)
 			}
 		case JobDeploy:
-			if err := b.store.Classify(b.ctx, l, TrustTrusted); !errors.Is(err, ErrLeaseLost) {
+			if err := b.store.Classify(b.ctx, l, Classification{Trust: TrustTrusted}); !errors.Is(err, ErrLeaseLost) {
 				t.Fatalf("classify with stale lease %+v: got %v, want ErrLeaseLost", l, err)
 			}
 			if err := b.store.Park(b.ctx, l); !errors.Is(err, ErrLeaseLost) {
@@ -233,7 +233,19 @@ func (b *v1StoreBackend) lease(t *rapid.T, jobID int64) Lease {
 }
 
 func (b *v1StoreBackend) classify(t *rapid.T, jobID int64, trust v1Trust) bool {
-	err := b.store.Classify(b.ctx, b.lease(t, jobID), Trust(trust))
+	l := b.lease(t, jobID)
+	c := Classification{Trust: Trust(trust)}
+	if c.Trust == TrustUntrusted {
+		// The authorizer confirms the newest live grant on GHES and hands it
+		// over; with none live, Classify must answer ErrNotApproved.
+		a, live, err := b.store.LiveApproval(b.ctx, l.EnvID, l.Source.CommitSHA)
+		b.must(t, err, "live approval")
+		c.Approval = &a
+		if !live {
+			c.Approval = &Approval{EnvID: l.EnvID, CommitSHA: l.Source.CommitSHA}
+		}
+	}
+	err := b.store.Classify(b.ctx, l, c)
 	if errors.Is(err, ErrNotApproved) {
 		return true
 	}

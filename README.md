@@ -8,7 +8,7 @@
 *   **Orchestration:** Docker API (`github.com/moby/moby/client`). Each environment runs on its own internal bridge network (no default route, no egress), shared only with the Traefik container. PR containers run with every capability dropped, `no-new-privileges`, a read-only root file system with no writable mount (no tmpfs), a memory limit without swap and a task limit. An application that must write at run time is not supported yet.
 *   **Ingress & Routing:** Traefik with the file provider only. previewd writes one route document per environment into `PREVIEWD_ROUTES_DIR` and removes it at teardown. Traefik has no Docker socket and reads no container label, so nothing in a PR image can add or change a route. Its entry point listens only on its fixed `previewd-proxy` address, never on the environment networks it joins, so a PR container cannot reach other environments through it. previewd refuses to start if the Traefik container mounts a socket, enables the Docker provider, is privileged or is not running.
 *   **Persistence:** CGO-free SQLite (`modernc.org/sqlite`) storing minimal environment metadata to ensure crash recovery.
-*   **Security Context:** Secrets are loaded into memory from a local secrets file. For each environment they are staged on a host ramfs directory (`/run/previewd/secrets/<env-id>/`, one file per key) and bind-mounted read-only into the container at `/run/secrets`. They never pass through container environment variables, the Docker API, `docker inspect`, image layers or disk.
+*   **Security Context:** Secrets are loaded into memory from a local secrets file, split per repository and per trust level (`[owner/repo]`, `[owner/repo:untrusted]`). For each environment, the section of its trust is staged on a host ramfs directory (`/run/previewd/secrets/<env-id>/`, one file per key) and bind-mounted read-only into the container at `/run/secrets`. They never pass through container environment variables, the Docker API, `docker inspect`, image layers or disk.
 
 ## Codebase Structure
 
@@ -166,7 +166,22 @@ Operational parameters enforce hardware boundaries and are managed exclusively v
 * `PREVIEWD_ALLOW_UNLOCKED_MEMORY`: Set exactly `1` to start when `mlockall` cannot be applied. By default the daemon locks all current and future memory before reading any secret, and refuses to start unless `RLIMIT_MEMLOCK` is unlimited (systemd `LimitMEMLOCK=infinity`). The opt-in is logged as an error at every start.
 
 
-* `PREVIEWD_SECRETS_PATH`: Path to the local air-gapped secrets file (default: secrets.env).
+* `PREVIEWD_SECRETS_PATH`: Path to the local air-gapped secrets file (default: secrets.env), at most 1 MiB. Every key lives in a section:
+
+  ```ini
+  [acme/app]
+  DB_PASSWORD=...        # trusted deploys: same-repository PRs opened by a writer
+  [acme/app:untrusted]
+  DB_PASSWORD=...        # approved fork or external PRs
+  ```
+
+  A key outside any section, a line without `=`, an invalid key, a header that is not `[owner/repo]` or `[owner/repo:untrusted]`, or a section or key declared twice refuses to start; errors name the line, never its content. An untrusted deploy receives its `:untrusted` section only, an empty set when there is none, never the trusted one. A missing file is an empty set.
+
+
+* `PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS`: Comma-separated `owner/repo` list (D-V1-1 escape hatch): approved untrusted deploys of these repositories receive the trusted section. Logged as an error at every start and every such deploy, and audited (`full_secrets_opt_in`).
+
+
+* `PREVIEWD_APPROVAL_REVALIDATE_INTERVAL` (default `10m`, 1m..1h) and `PREVIEWD_APPROVAL_REVALIDATE_GRACE` (default `1h`, at least the interval, at most 24h): every interval, each running environment is re-checked against GHES; see Reconciliation.
 
 
 * `PREVIEWD_SECRETS_STAGING_DIR`: Host directory where each environment's secrets are staged (default: `/run/previewd/secrets`). Must be on **ramfs**, owned by the previewd user, mode `0700`. The daemon refuses to start otherwise and re-checks the filesystem type before every job.
@@ -256,7 +271,9 @@ The database is at schema version 3. The first start of this version migrates a 
 
 Workers (`PREVIEWD_MAX_BUILDS`) take the newest queued job of an environment with no job in progress; older queued jobs of that environment are skipped.
 
-- **Deploy:** remove the previous version, fetch the commit, create the internal network, build, stage secrets, start the container, publish the route document, commit SUCCESS. Any failure removes everything and records FAILED.
+- **Authorize (before anything is fetched or built):** the pull request is read from GHES. Trusted (head in the repository, opener with admin, maintain or write) or untrusted with a live approval confirmed on GHES (the approver, by account ID, still listed, their latest review still `APPROVED` on the exact commit, still with write access). The verdict is recorded with the approval it confirmed; if a newer approval was recorded meanwhile, the deploy is requeued and authorized again. Not approved: the previous version is removed and the job waits in `PENDING_APPROVAL` until an approval of its exact commit or a newer push. GHES unavailable: requeued unclassified (30 s doubling to 10 min), after removing a running version whose approval was revoked; after 10 attempts the deploy is parked instead.
+- **Deploy:** remove the previous version, fetch the commit, create the internal network, build, stage the secret section of its trust, start the container, publish the route document, commit SUCCESS. Any failure removes everything and records FAILED.
+- **Re-validation:** every `PREVIEWD_APPROVAL_REVALIDATE_INTERVAL`, each environment whose latest job is a successful deploy is re-checked. A version built trusted needs its PR still trusted (an offboarded opener tears it down, whatever approval exists); one built on an approval needs that approval confirmed again. One no longer authorized gets a teardown at once, its approval revoked in the same transaction; one GHES cannot verify for `PREVIEWD_APPROVAL_REVALIDATE_GRACE` is torn down (fail closed). The grace count is kept in memory: a restart starts a new one.
 - **Teardown:** remove route, container, network, image and staging. A failure requeues it with backoff (1 s doubling to 5 min); a teardown never ends FAILED.
 
 At every start, before the API listens, the startup sweep runs:

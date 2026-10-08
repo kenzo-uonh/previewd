@@ -178,3 +178,55 @@ func TestLoadWebhookSecretIsACredential(t *testing.T) {
 		}
 	}
 }
+
+// The D-V1-1 opt-in list and the re-validation bounds fail closed.
+func TestLoadRevalidationAndFullSecrets(t *testing.T) {
+	minimalEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.FullSecretsRepos) != 0 || cfg.RevalidateInterval != 10*time.Minute || cfg.RevalidateGrace != time.Hour {
+		t.Fatalf("defaults = %+v", cfg)
+	}
+	t.Setenv("PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS", "acme/app,acme/web")
+	t.Setenv("PREVIEWD_APPROVAL_REVALIDATE_INTERVAL", "5m")
+	t.Setenv("PREVIEWD_APPROVAL_REVALIDATE_GRACE", "5m")
+	if cfg, err = Load(); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.FullSecretsRepos["acme/app"] || !cfg.FullSecretsRepos["acme/web"] || len(cfg.FullSecretsRepos) != 2 ||
+		cfg.RevalidateInterval != 5*time.Minute || cfg.RevalidateGrace != 5*time.Minute {
+		t.Fatalf("set = %+v", cfg)
+	}
+	// An interval above the default grace raises the default grace to it.
+	t.Setenv("PREVIEWD_APPROVAL_REVALIDATE_GRACE", "")
+	t.Setenv("PREVIEWD_APPROVAL_REVALIDATE_INTERVAL", "1h")
+	if cfg, err = Load(); err != nil || cfg.RevalidateGrace != time.Hour {
+		t.Fatalf("grace with a 1h interval = %+v, %v", cfg, err)
+	}
+	t.Setenv("PREVIEWD_APPROVAL_REVALIDATE_INTERVAL", "")
+	for key, bad := range map[string]string{
+		"PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS": "acme/app,,acme/web",
+		"PREVIEWD_APPROVAL_REVALIDATE_INTERVAL":    "30s",
+		"PREVIEWD_APPROVAL_REVALIDATE_GRACE":       "25h",
+	} {
+		t.Setenv(key, bad)
+		if _, err := Load(); err == nil {
+			t.Errorf("%s=%q accepted", key, bad)
+		}
+		t.Setenv(key, "")
+	}
+	for _, bad := range []string{"acme/app,acme/app", "acme", "acme/app ", "../x/y"} {
+		t.Setenv("PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS", bad)
+		if _, err := Load(); err == nil {
+			t.Errorf("PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS=%q accepted", bad)
+		}
+	}
+	t.Setenv("PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS", "")
+	t.Setenv("PREVIEWD_APPROVAL_REVALIDATE_INTERVAL", "20m")
+	t.Setenv("PREVIEWD_APPROVAL_REVALIDATE_GRACE", "10m")
+	if _, err := Load(); err == nil {
+		t.Error("a grace shorter than the interval accepted")
+	}
+}

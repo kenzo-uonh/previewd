@@ -359,7 +359,7 @@ func (m *previewdMachine) acquire(t *rapid.T, w int) bool {
 	if lease.Type == JobDeploy {
 		// AuthorizeDeploy: the MVP has no approval gate, every PR is
 		// trusted. A classified deploy is never requeued (failDeploy).
-		m.must(t, m.store.Classify(m.ctx, lease, TrustTrusted), "classify deploy")
+		m.must(t, m.store.Classify(m.ctx, lease, Classification{Trust: TrustTrusted}), "classify deploy")
 		m.jobs[wantID-1].Trust = TrustTrusted
 		m.workers[w].next = stepExecuteDeploy
 	}

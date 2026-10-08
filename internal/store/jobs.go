@@ -317,6 +317,14 @@ const (
 	queryLatestJob = `SELECT ` + jobColumns + ` FROM jobs WHERE preview_id = ? ORDER BY seq DESC LIMIT 1`
 	queryJobByID   = `SELECT ` + jobColumns + ` FROM jobs WHERE id = ?`
 	queryAllJobs   = `SELECT ` + jobColumns + ` FROM jobs ORDER BY id`
+	// queryRunning: environments whose latest job is a SUCCESS deploy, the
+	// builder of what runs there, in environment order.
+	queryRunning = `SELECT ` + jobColumns + ` FROM jobs j
+		WHERE j.type = 'deploy' AND j.status = 'SUCCESS'
+		  AND NOT EXISTS (SELECT 1 FROM jobs n WHERE n.preview_id = j.preview_id AND n.seq > j.seq)
+		ORDER BY j.preview_id`
+	// queryNewestSuccess: the newest SUCCESS job of an environment.
+	queryNewestSuccess = `SELECT ` + jobColumns + ` FROM jobs WHERE preview_id = ? AND status = 'SUCCESS' ORDER BY seq DESC LIMIT 1`
 )
 
 type rowScanner interface {
@@ -749,26 +757,58 @@ func rearm(ctx context.Context, tx *sql.Tx, kept map[string]bool) error {
 	return nil
 }
 
+// Running returns, per environment, its latest job when that job is a
+// SUCCESS deploy: the builder of a version that runs and that no newer
+// intent will replace. The Revalidator checks each one (D-V1-5); an
+// environment with a newer job is left to that job's AuthorizeDeploy.
+func (s *Store) Running(ctx context.Context) ([]Job, error) {
+	return s.listJobs(ctx, "running environments", queryRunning)
+}
+
+// RunningVersion returns the newest SUCCESS job of envID when it is a
+// deploy: the builder of the version that may still run there, whatever
+// newer job is queued (A2-6). It over-approximates: a deploy that failed
+// since removed that version, and removing it again is harmless.
+func (s *Store) RunningVersion(ctx context.Context, envID string) (Job, bool, error) {
+	if !validPreviewID(envID) {
+		return Job{}, false, fmt.Errorf("running version: %w: environment %s", ErrInvalidInternalJob, quoted(envID))
+	}
+	j, err := scanJob(s.db.QueryRowContext(ctx, queryNewestSuccess, envID))
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return Job{}, false, nil
+	case err != nil:
+		return Job{}, false, fmt.Errorf("running version of %s: %w", envID, err)
+	case j.Type != JobDeploy:
+		return Job{}, false, nil
+	}
+	return j, true, nil
+}
+
 // Jobs returns every job, oldest first.
-func (s *Store) Jobs(ctx context.Context) (jobs []Job, err error) {
-	rows, err := s.db.QueryContext(ctx, queryAllJobs)
+func (s *Store) Jobs(ctx context.Context) ([]Job, error) {
+	return s.listJobs(ctx, "list jobs", queryAllJobs)
+}
+
+func (s *Store) listJobs(ctx context.Context, what, query string) (jobs []Job, err error) {
+	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("list jobs: %w", err)
+		return nil, fmt.Errorf("%s: %w", what, err)
 	}
 	defer func() {
 		if closeErr := rows.Close(); closeErr != nil {
-			err = errors.Join(err, fmt.Errorf("close job list: %w", closeErr))
+			err = errors.Join(err, fmt.Errorf("%s: close: %w", what, closeErr))
 		}
 	}()
 	for rows.Next() {
 		j, err := scanJob(rows)
 		if err != nil {
-			return nil, fmt.Errorf("scan job: %w", err)
+			return nil, fmt.Errorf("%s: scan job: %w", what, err)
 		}
 		jobs = append(jobs, j)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list jobs: %w", err)
+		return nil, fmt.Errorf("%s: %w", what, err)
 	}
 	return jobs, nil
 }

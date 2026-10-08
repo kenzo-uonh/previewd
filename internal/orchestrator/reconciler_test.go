@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"maps"
@@ -92,21 +93,27 @@ func (h *hostEngine) Observe(context.Context) (map[string]EngineState, error) {
 	return maps.Clone(h.envs), nil
 }
 
-// memStager is a fake secret stager.
+// memStager is a fake secret stager; content keeps what each environment
+// was last given.
 type memStager struct {
 	mu      sync.Mutex
 	staged  map[string]bool
+	content map[string]map[string]string
 	failErr error
 	listErr error
 }
 
-func (m *memStager) Stage(env string, _ map[string]string) (string, error) {
+func (m *memStager) Stage(env string, secrets map[string]string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.failErr != nil {
 		return "", m.failErr
 	}
 	m.staged[env] = true
+	if m.content == nil {
+		m.content = map[string]map[string]string{}
+	}
+	m.content[env] = maps.Clone(secrets)
 	return "/run/previewd/secrets/" + env, nil
 }
 
@@ -123,9 +130,53 @@ func (m *memStager) List() ([]string, error) {
 	return slices.Sorted(maps.Keys(m.staged)), m.listErr
 }
 
-type staticSecrets map[string]string
+// sectionSecrets is the sectioned secrets file of acme/app (V1-I2).
+type sectionSecrets struct{}
 
-func (s staticSecrets) GetSecrets() map[string]string { return s }
+func (sectionSecrets) Section(repo string, untrusted, fullOptIn bool) (map[string]string, error) {
+	if repo != "acme/app" {
+		return map[string]string{}, nil
+	}
+	if untrusted && !fullOptIn {
+		return map[string]string{"TOKEN": "sandbox-value"}, nil
+	}
+	return map[string]string{"TOKEN": "trusted-value"}, nil
+}
+
+// fakeAuthorizer is the gate the reconciler tests drive: authorize and
+// revalidate answer for each call; by default every deploy is trusted and
+// every running environment still authorized.
+type fakeAuthorizer struct {
+	mu         sync.Mutex
+	authorize  func(store.Lease) (Decision, error)
+	revalidate func(store.Job) error
+	authorized int
+}
+
+func (f *fakeAuthorizer) Authorize(_ context.Context, l store.Lease) (Decision, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.authorized++
+	if f.authorize == nil {
+		return Decision{Trust: store.TrustTrusted}, nil
+	}
+	return f.authorize(l)
+}
+
+func (f *fakeAuthorizer) Revalidate(_ context.Context, j store.Job) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.revalidate == nil {
+		return nil
+	}
+	return f.revalidate(j)
+}
+
+func (f *fakeAuthorizer) set(authorize func(store.Lease) (Decision, error), revalidate func(store.Job) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.authorize, f.revalidate = authorize, revalidate
+}
 
 type rig struct {
 	t        *testing.T
@@ -138,6 +189,10 @@ type rig struct {
 	fetchErr error
 	now      time.Time
 	seq      int64
+	auth     *fakeAuthorizer
+	// interval and grace of the Revalidator; 0 for the defaults.
+	interval, grace time.Duration
+	maxAttempts     int64
 }
 
 func newRig(t *testing.T) *rig {
@@ -154,7 +209,7 @@ func newRig(t *testing.T) *rig {
 	r := &rig{
 		t: t, dbPath: filepath.Join(dir, "previewd.sqlite"),
 		engine: newHostEngine(), stager: &memStager{staged: map[string]bool{}},
-		routes: pub, routeDir: routeDir, now: time.UnixMilli(1_800_000_000_000),
+		routes: pub, routeDir: routeDir, now: time.UnixMilli(1_800_000_000_000), auth: &fakeAuthorizer{},
 	}
 	r.open()
 	return r
@@ -187,7 +242,8 @@ func (r *rig) reconciler() *Reconciler {
 	r.t.Helper()
 	rec, err := NewReconciler(ReconcilerConfig{
 		Queue: r.queue, Engine: r.engine, Routes: r.routes, Stager: r.stager,
-		Secrets: staticSecrets{"TOKEN": "value"},
+		Secrets: sectionSecrets{}, Authorizer: r.auth,
+		RevalidateInterval: r.interval, RevalidateGrace: r.grace, AuthorizeMaxAttempts: r.maxAttempts,
 		Fetch: func(context.Context, string, string, string) error {
 			return r.fetchErr
 		},
@@ -202,13 +258,20 @@ func (r *rig) reconciler() *Reconciler {
 
 func (r *rig) enqueue(typ store.JobType) {
 	r.t.Helper()
+	r.enqueueCommit(typ, "0123456789abcdef0123456789abcdef01234567")
+}
+
+// enqueueCommit queues a webhook job for commit: a deploy of another commit
+// is a push, which revokes the approvals of every other commit.
+func (r *rig) enqueueCommit(typ store.JobType, commit string) {
+	r.t.Helper()
 	r.seq++
 	id := string(rune('a'+r.seq)) + "-delivery"
 	sum := sha256.Sum256([]byte(id))
 	v, _, err := r.queue.Enqueue(context.Background(), store.Delivery{
 		ID: id, PayloadSHA256: hex.EncodeToString(sum[:]), EnvID: testEnv, Type: typ, Seq: r.seq,
 		Source: store.Source{Repo: "acme/app", HeadRepo: "acme/app", PRNumber: 7, OpenerLogin: "opener", OpenerID: 4242,
-			CommitSHA: "0123456789abcdef0123456789abcdef01234567", CloneURL: "https://git.example.internal/acme/app.git"},
+			CommitSHA: commit, CloneURL: "https://git.example.internal/acme/app.git"},
 		ReceivedAt: r.now,
 	})
 	if err != nil || v != store.VerdictAccepted {
@@ -488,5 +551,385 @@ func TestObservationsMergeSources(t *testing.T) {
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("observations = %+v, want %+v", got, want)
+	}
+}
+
+// untrusted is the authorizer's answer for an untrusted PR: the newest live
+// approval of the lease's commit, as GHES would confirm it, or a refusal.
+func (r *rig) untrusted(fullSecrets bool) func(store.Lease) (Decision, error) {
+	return func(l store.Lease) (Decision, error) {
+		a, live, err := r.queue.LiveApproval(context.Background(), l.EnvID, l.Source.CommitSHA)
+		if err != nil {
+			return Decision{}, err
+		}
+		if !live {
+			return Decision{}, refuse("", "no live approval")
+		}
+		return Decision{Trust: store.TrustUntrusted, Approval: &a, FullSecrets: fullSecrets}, nil
+	}
+}
+
+// step acquires the next job at r.now and runs it on this goroutine.
+func (r *rig) step(rec *Reconciler) store.Lease {
+	r.t.Helper()
+	l, ok, err := r.queue.Acquire(context.Background(), r.now)
+	if err != nil || !ok {
+		r.t.Fatalf("Acquire = %v, %v", ok, err)
+	}
+	rec.process(context.Background(), l)
+	return l
+}
+
+func (r *rig) jobs() []store.Job {
+	r.t.Helper()
+	jobs, err := r.queue.Jobs(context.Background())
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	return jobs
+}
+
+func (r *rig) started() *Reconciler {
+	r.t.Helper()
+	rec := r.reconciler()
+	if err := rec.Startup(context.Background()); err != nil {
+		r.t.Fatal(err)
+	}
+	return rec
+}
+
+// built reports whether the engine was asked to build since the last reset.
+func (r *rig) built() bool {
+	r.engine.mu.Lock()
+	defer r.engine.mu.Unlock()
+	return slices.Contains(r.engine.calls, "build") || slices.Contains(r.engine.calls, "deploy")
+}
+
+func (r *rig) running() bool {
+	r.engine.mu.Lock()
+	defer r.engine.mu.Unlock()
+	return r.engine.envs[testEnv].Running
+}
+
+// V1-I2: each deploy stages the secret section of its own trust; an
+// untrusted deploy never receives the trusted value unless its repository
+// is opted in (D-V1-1).
+func TestAuthorizeDeployStagesTheSectionOfItsTrust(t *testing.T) {
+	for name, tc := range map[string]struct {
+		untrusted, full bool
+		want            string
+	}{
+		"trusted":                  {false, false, "trusted-value"},
+		"untrusted":                {true, false, "sandbox-value"},
+		"untrusted, D-V1-1 opt-in": {true, true, "trusted-value"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newRig(t)
+			rec := r.started()
+			want := store.TrustTrusted
+			if tc.untrusted {
+				r.approve(store.ApprovalViaReview, 100, "lead-dev", approverID)
+				r.auth.set(r.untrusted(tc.full), nil)
+				want = store.TrustUntrusted
+			}
+			r.enqueue(store.JobDeploy)
+			jobs := r.drain(rec)
+			if j := jobs[len(jobs)-1]; j.Status != store.StatusSuccess || j.Trust != want {
+				t.Fatalf("deploy = %+v, want SUCCESS %s", j, want)
+			}
+			if got := r.stager.content[testEnv]["TOKEN"]; got != tc.want {
+				t.Fatalf("staged TOKEN = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// V1-I1: a refused deploy is parked before anything is fetched or built,
+// and the version it supersedes is removed with its route and secrets.
+func TestAuthorizeDeployParksAndRemovesThePreviousVersion(t *testing.T) {
+	r := newRig(t)
+	rec := r.started()
+	r.enqueue(store.JobDeploy)
+	r.drain(rec)
+	if !r.running() {
+		t.Fatal("the trusted version is not running")
+	}
+	r.engine.calls = nil
+	r.auth.set(func(store.Lease) (Decision, error) {
+		return Decision{}, refuse("", "fork without approval")
+	}, nil)
+	r.enqueue(store.JobDeploy)
+	r.step(rec)
+	jobs := r.jobs()
+	if j := jobs[len(jobs)-1]; j.Status != store.StatusPendingApproval || j.Trust != store.TrustUnclassified {
+		t.Fatalf("refused deploy = %+v, want PENDING_APPROVAL, unclassified", j)
+	}
+	if r.built() || r.running() || r.stager.staged[testEnv] || len(r.routeFiles()) != 0 {
+		t.Fatalf("after the park: calls %v, staged %v, routes %v", r.engine.calls, r.stager.staged, r.routeFiles())
+	}
+}
+
+// GHES unavailable: requeued unclassified with backoff, nothing built; at
+// the attempt ceiling the deploy is parked instead of requeued forever.
+func TestAuthorizeDeployUnavailableParksAtTheCeiling(t *testing.T) {
+	r := newRig(t)
+	r.maxAttempts = 4
+	rec := r.started()
+	r.auth.set(func(store.Lease) (Decision, error) {
+		return Decision{}, fmt.Errorf("%w: more than 1000 reviews: refusing a partial list", ErrUnavailable)
+	}, nil)
+	r.enqueue(store.JobDeploy)
+	for attempt := int64(1); attempt < r.maxAttempts; attempt++ {
+		r.step(rec)
+		j := r.jobs()[0]
+		wantNotBefore := r.now.Add(authorizeBackoff(attempt - 1)).UnixMilli()
+		if j.Status != store.StatusQueued || j.Trust != store.TrustUnclassified || j.Attempts != attempt || j.NotBefore != wantNotBefore {
+			t.Fatalf("attempt %d: %+v, want QUEUED unclassified, attempts %d, not_before %d", attempt, j, attempt, wantNotBefore)
+		}
+		if _, ok, err := r.queue.Acquire(context.Background(), r.now); err != nil || ok {
+			t.Fatalf("attempt %d: acquired before its backoff: %v, %v", attempt, ok, err)
+		}
+		r.now = r.now.Add(authorizeBackoff(attempt - 1))
+	}
+	r.step(rec)
+	if j := r.jobs()[0]; j.Status != store.StatusPendingApproval || j.Trust != store.TrustUnclassified {
+		t.Fatalf("at the ceiling: %+v, want PENDING_APPROVAL", j)
+	}
+	if r.built() || r.auth.authorized != int(r.maxAttempts) {
+		t.Fatalf("built %v, authorized %d times", r.built(), r.auth.authorized)
+	}
+	if _, ok, err := r.queue.Acquire(context.Background(), r.now.Add(24*time.Hour)); err != nil || ok {
+		t.Fatalf("a parked deploy was acquired again: %v, %v", ok, err)
+	}
+}
+
+// A2-6: while GHES is unavailable, a running version built on an approval
+// the database no longer holds live (here revoked by a push) is removed
+// before the new deploy is requeued; a trusted version is left running.
+func TestAuthorizeDeployUnavailableRemovesARevokedVersion(t *testing.T) {
+	const pushed = "fedcba9876543210fedcba9876543210fedcba98"
+	for _, approved := range []bool{true, false} {
+		t.Run(fmt.Sprintf("built on an approval=%v", approved), func(t *testing.T) {
+			r := newRig(t)
+			rec := r.started()
+			if approved {
+				r.approve(store.ApprovalViaReview, 100, "lead-dev", approverID)
+				r.auth.set(r.untrusted(false), nil)
+			}
+			r.enqueue(store.JobDeploy)
+			r.drain(rec)
+			if !r.running() {
+				t.Fatal("not running")
+			}
+			r.auth.set(func(store.Lease) (Decision, error) {
+				return Decision{}, fmt.Errorf("%w: connection refused", ErrUnavailable)
+			}, nil)
+			r.enqueueCommit(store.JobDeploy, pushed) // revokes every other commit (new_head)
+			r.step(rec)
+			if j := r.jobs()[1]; j.Status != store.StatusQueued || j.Attempts != 1 {
+				t.Fatalf("the push = %+v, want requeued", j)
+			}
+			if r.running() == approved {
+				t.Fatalf("running = %v after the outage, want %v", r.running(), !approved)
+			}
+		})
+	}
+}
+
+// The approval the authorizer confirmed must be the one Classify audits: a
+// grant recorded between the GHES read and the record requeues the deploy
+// unclassified, and the next attempt deploys on the newest grant.
+func TestAuthorizeDeployRequeuesWhenTheApprovalChanged(t *testing.T) {
+	r := newRig(t)
+	rec := r.started()
+	r.approve(store.ApprovalViaReview, 100, "lead-dev", approverID)
+	confirm := r.untrusted(false)
+	first := true
+	r.auth.set(func(l store.Lease) (Decision, error) {
+		d, err := confirm(l)
+		if first {
+			first = false
+			r.approve(store.ApprovalViaReview, 200, "second", 8) // not re-read on GHES
+		}
+		return d, err
+	}, nil)
+	r.enqueue(store.JobDeploy)
+	r.step(rec)
+	if j := r.jobs()[0]; j.Status != store.StatusQueued || j.Trust != store.TrustUnclassified || j.Attempts != 1 {
+		t.Fatalf("after a changed approval: %+v, want requeued unclassified", j)
+	}
+	if r.built() {
+		t.Fatal("built on an approval that was not the newest")
+	}
+	r.now = r.now.Add(authorizeBackoff(0))
+	r.step(rec)
+	if j := r.jobs()[0]; j.Status != store.StatusSuccess || j.Trust != store.TrustUntrusted {
+		t.Fatalf("second attempt: %+v", j)
+	}
+}
+
+// D-V1-5, V1-I4: an opener downgraded while a trusted environment runs is
+// torn down within one re-validation interval, by the running loop.
+func TestRevalidatorTearsDownADowngradedTrustedOpenerWithinOneInterval(t *testing.T) {
+	r := newRig(t)
+	r.interval, r.grace = 400*time.Millisecond, time.Hour
+	rec := r.started()
+	r.enqueue(store.JobDeploy)
+	r.drain(rec)
+	if !r.running() || r.jobs()[0].Trust != store.TrustTrusted {
+		t.Fatalf("trusted version not running: %+v", r.jobs())
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Go(func() { rec.Run(ctx, 1) })
+	wg.Go(func() { rec.Revalidate(ctx) })
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
+
+	downgraded := time.Now()
+	r.auth.set(nil, func(j store.Job) error {
+		if j.Trust != store.TrustTrusted {
+			return fmt.Errorf("unexpected builder trust %s", j.Trust)
+		}
+		return refuse("", "opener lead-dev#4242 now has read permission")
+	})
+	deadline := downgraded.Add(r.interval + 300*time.Millisecond) // one interval, plus scheduling slack
+	for r.running() {
+		if time.Now().After(deadline) {
+			t.Fatalf("still running %s after the downgrade (interval %s)", time.Since(downgraded), r.interval)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	var teardown store.Job
+	for _, j := range r.jobs() {
+		if j.Type == store.JobTeardown {
+			teardown = j
+		}
+	}
+	if teardown.Origin != store.OriginRevalidation {
+		t.Fatalf("no re-validation teardown: %+v", r.jobs())
+	}
+	if r.stager.staged[testEnv] || len(r.routeFiles()) != 0 {
+		t.Fatalf("leftovers: staged %v routes %v", r.stager.staged, r.routeFiles())
+	}
+}
+
+// A revoked approval tears the untrusted environment down with its reason,
+// and the approval is revoked in the same transaction as the teardown.
+func TestRevalidatorRevokesALostApproval(t *testing.T) {
+	r := newRig(t)
+	rec := r.started()
+	r.approve(store.ApprovalViaReview, 100, "lead-dev", approverID)
+	r.auth.set(r.untrusted(false), nil)
+	r.enqueue(store.JobDeploy)
+	r.drain(rec)
+	r.auth.set(nil, func(store.Job) error {
+		return refuse(store.RevokedDismissed, "review 100 is DISMISSED")
+	})
+	rec.revalidateOnce(context.Background(), map[string]time.Time{})
+	jobs := r.jobs()
+	if j := jobs[len(jobs)-1]; j.Type != store.JobTeardown || j.Origin != store.OriginRevalidation || j.Status != store.StatusQueued {
+		t.Fatalf("latest job %+v, want a queued re-validation teardown", j)
+	}
+	if live, err := r.queue.ApprovalLive(context.Background(), testEnv, authCommit); err != nil || live {
+		t.Fatalf("approval still live: %v, %v", live, err)
+	}
+	r.drain(rec)
+	if r.running() {
+		t.Fatal("the revoked environment still runs")
+	}
+}
+
+// V1-I4 grace: an environment GHES cannot verify is kept until it has been
+// unverifiable for the grace period, then torn down; a success in between
+// starts a new streak. An authorized environment is never touched.
+func TestRevalidatorGracePeriod(t *testing.T) {
+	r := newRig(t)
+	r.interval, r.grace = 10*time.Minute, 30*time.Minute
+	rec := r.started()
+	r.enqueue(store.JobDeploy)
+	r.drain(rec)
+	down := true
+	r.auth.set(nil, func(store.Job) error {
+		if down {
+			return fmt.Errorf("%w: connection refused", ErrUnavailable)
+		}
+		return nil
+	})
+	failing := map[string]time.Time{}
+	teardowns := func() int {
+		n := 0
+		for _, j := range r.jobs() {
+			if j.Type == store.JobTeardown {
+				n++
+			}
+		}
+		return n
+	}
+	start := r.now
+	for _, tc := range []struct {
+		at        time.Duration
+		down      bool
+		teardowns int
+	}{
+		{0, true, 0}, {10 * time.Minute, true, 0}, {20 * time.Minute, true, 0},
+		{25 * time.Minute, false, 0}, // recovered: the streak ends
+		{30 * time.Minute, true, 0}, {50 * time.Minute, true, 0},
+		{60 * time.Minute, true, 1}, // 30 minutes unverifiable
+	} {
+		r.now, down = start.Add(tc.at), tc.down
+		rec.revalidateOnce(context.Background(), failing)
+		if got := teardowns(); got != tc.teardowns {
+			t.Fatalf("at +%s (down %v): %d teardowns, want %d", tc.at, tc.down, got, tc.teardowns)
+		}
+	}
+	if len(failing) != 0 {
+		t.Fatalf("streak kept after the teardown: %v", failing)
+	}
+	jobs := r.jobs()
+	if j := jobs[len(jobs)-1]; j.Origin != store.OriginRevalidation {
+		t.Fatalf("teardown %+v", j)
+	}
+}
+
+// After a reboot wiped its staged secrets, an untrusted environment comes
+// back only through AuthorizeDeploy: without a live approval it is parked,
+// never rebuilt.
+func TestRebootRebuildsAnUntrustedEnvironmentOnlyWithAnApproval(t *testing.T) {
+	for _, approved := range []bool{true, false} {
+		t.Run(fmt.Sprintf("approved=%v", approved), func(t *testing.T) {
+			r := newRig(t)
+			rec := r.started()
+			r.approve(store.ApprovalViaReview, 100, "lead-dev", approverID)
+			r.auth.set(r.untrusted(false), nil)
+			r.enqueue(store.JobDeploy)
+			r.drain(rec)
+			if !approved {
+				// Dismissed on GHES while the host was down; the dismissal
+				// webhook was lost, so the DB grant is still live.
+				r.auth.set(func(store.Lease) (Decision, error) {
+					return Decision{}, refuse(store.RevokedDismissed, "review 100 is DISMISSED")
+				}, nil)
+			}
+			r.crash()
+			r.stager.staged = map[string]bool{} // ramfs wiped by the reboot
+			r.engine.calls = nil
+			before := r.auth.authorized
+			rec = r.started()
+			jobs := r.drain(rec)
+			if r.auth.authorized != before+1 {
+				t.Fatalf("the re-armed deploy skipped AuthorizeDeploy (%d calls)", r.auth.authorized-before)
+			}
+			last := jobs[len(jobs)-1]
+			switch {
+			case approved && (last.Status != store.StatusSuccess || last.Trust != store.TrustUntrusted || !r.running()):
+				t.Fatalf("approved: %+v running %v", last, r.running())
+			case !approved && (last.Status != store.StatusPendingApproval || r.running() || slices.Contains(r.engine.calls, "build")):
+				t.Fatalf("not approved: %+v running %v calls %v", last, r.running(), r.engine.calls)
+			}
+		})
 	}
 }

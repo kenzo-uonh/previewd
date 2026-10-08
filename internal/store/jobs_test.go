@@ -264,7 +264,7 @@ func TestLeaseTransitionRules(t *testing.T) {
 	if dl.Attempts != 1 {
 		t.Fatalf("requeued deploy lease = %+v, want 1 attempt", dl)
 	}
-	if err := s.Classify(context.Background(), dl, TrustTrusted); err != nil {
+	if err := s.Classify(context.Background(), dl, Classification{Trust: TrustTrusted}); err != nil {
 		t.Fatalf("Classify: %v", err)
 	}
 	if err := s.Requeue(context.Background(), dl, t0); !errors.Is(err, ErrDeployCannotRetry) {

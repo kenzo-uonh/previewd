@@ -5,6 +5,7 @@ import (
 	"net/netip"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/kenzo-uonh/previewd/internal/validate"
@@ -32,6 +33,12 @@ type Config struct {
 	LabelApproval  bool   // PREVIEWD_LABEL_APPROVAL opt-in
 	ApprovalLabel  string // the label that approves when LabelApproval is set
 	DeliveryMaxAge time.Duration
+	// FullSecretsRepos is the D-V1-1 opt-in: approved untrusted deploys of
+	// these repositories get the trusted secret section.
+	FullSecretsRepos map[string]bool
+	// Re-validation of running environments (D-V1-5, V1-I4).
+	RevalidateInterval time.Duration
+	RevalidateGrace    time.Duration
 
 	// WebhookSecretCredential names the systemd credential holding the
 	// webhook HMAC secret: read from $CREDENTIALS_DIRECTORY, never from the
@@ -56,11 +63,14 @@ const (
 	defaultAppKeyCredential        = "github-app-key" // #nosec G101 -- the name of a systemd credential, not a credential
 	defaultWebhookSecretCredential = "webhook_secret" // #nosec G101 -- the name of a systemd credential, not a credential
 	// legacyWebhookSecretEnv held the secret itself before V1: refused.
-	legacyWebhookSecretEnv = "PREVIEWD_WEBHOOK_SECRET" // #nosec G101 -- an environment variable name, not a credential
-	defaultApprovalLabel   = "previewd-approved"
-	defaultDeliveryMaxAge  = 15 * time.Minute
-	minDeliveryMaxAge      = time.Minute
-	maxDeliveryMaxAge      = 2 * time.Hour
+	legacyWebhookSecretEnv    = "PREVIEWD_WEBHOOK_SECRET" // #nosec G101 -- an environment variable name, not a credential
+	defaultApprovalLabel      = "previewd-approved"
+	defaultDeliveryMaxAge     = 15 * time.Minute
+	minDeliveryMaxAge         = time.Minute
+	maxDeliveryMaxAge         = 2 * time.Hour
+	defaultRevalidateInterval = 10 * time.Minute
+	defaultRevalidateGrace    = time.Hour
+	maxRevalidateGrace        = 24 * time.Hour
 )
 
 // defaultStagingDir mirrors secrets.DefaultStagingDir; config imports
@@ -179,6 +189,19 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	fullSecrets, err := repoSet("PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS")
+	if err != nil {
+		return nil, err
+	}
+	revalInterval, err := boundedDuration("PREVIEWD_APPROVAL_REVALIDATE_INTERVAL", defaultRevalidateInterval, time.Minute, time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	revalGrace, err := boundedDuration("PREVIEWD_APPROVAL_REVALIDATE_GRACE", max(defaultRevalidateGrace, revalInterval), revalInterval, maxRevalidateGrace)
+	if err != nil {
+		return nil, err
+	}
+
 	ghesURL, err := validate.GHESURL(os.Getenv("PREVIEWD_GHES_URL"))
 	if err != nil {
 		return nil, fmt.Errorf("PREVIEWD_GHES_URL is required: %w", err)
@@ -229,6 +252,9 @@ func Load() (*Config, error) {
 		LabelApproval:       labelApproval,
 		ApprovalLabel:       approvalLabel,
 		DeliveryMaxAge:      maxAge,
+		FullSecretsRepos:    fullSecrets,
+		RevalidateInterval:  revalInterval,
+		RevalidateGrace:     revalGrace,
 
 		WebhookSecretCredential: webhookSecretCred,
 		GHESURL:                 ghesURL,
@@ -240,6 +266,27 @@ func Load() (*Config, error) {
 		AllowPlaintextWebhooks:  plaintext,
 		WebhookAllowedCIDRs:     cidrs,
 	}, nil
+}
+
+// repoSet reads a comma-separated owner/repo list. Unset or empty is the
+// empty set; an empty entry, an invalid name or a repository listed twice
+// is a configuration error.
+func repoSet(name string) (map[string]bool, error) {
+	out := map[string]bool{}
+	v := os.Getenv(name)
+	if v == "" {
+		return out, nil
+	}
+	for i, repo := range strings.Split(v, ",") {
+		if err := validate.RepoFullName(repo); err != nil {
+			return nil, fmt.Errorf("invalid %s entry %d: %w", name, i+1, err)
+		}
+		if out[repo] {
+			return nil, fmt.Errorf("invalid %s: %s listed twice", name, repo)
+		}
+		out[repo] = true
+	}
+	return out, nil
 }
 
 // credentialName reads a systemd credential name, def when unset.

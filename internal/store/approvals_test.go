@@ -177,7 +177,8 @@ func TestClassifyUntrustedFailsClosed(t *testing.T) {
 	revoke(t, s, commitA, 5)
 	approve(t, s, grantOf(commitB, 11)) // another commit
 	before := auditKinds(t, s)
-	if err := s.Classify(ctx, l, TrustUntrusted); !errors.Is(err, ErrNotApproved) {
+	stale := Approval{EnvID: envA, CommitSHA: commitA, ApproverLogin: "approver", ApproverID: 7, Via: ApprovalViaReview, ReviewID: 99}
+	if err := s.Classify(ctx, l, Classification{Trust: TrustUntrusted, Approval: &stale}); !errors.Is(err, ErrNotApproved) {
 		t.Fatalf("Classify without approval: %v, want ErrNotApproved", err)
 	}
 	if jobs, err := s.Jobs(ctx); err != nil || jobs[0].Trust != TrustUnclassified {
@@ -187,10 +188,14 @@ func TestClassifyUntrustedFailsClosed(t *testing.T) {
 		t.Fatalf("refused Classify wrote audit %v", got[len(before):])
 	}
 	approve(t, s, grantOf(commitA, 12))
-	if err := s.Classify(ctx, l, TrustUntrusted); err != nil {
+	confirmed, live, err := s.LiveApproval(ctx, envA, commitA)
+	if err != nil || !live {
+		t.Fatalf("LiveApproval = %v, %v", live, err)
+	}
+	if err := s.Classify(ctx, l, Classification{Trust: TrustUntrusted, Approval: &confirmed}); err != nil {
 		t.Fatalf("Classify with a live approval: %v", err)
 	}
-	if err := s.Classify(ctx, l, TrustTrusted); !errors.Is(err, ErrAlreadyClassified) {
+	if err := s.Classify(ctx, l, Classification{Trust: TrustTrusted}); !errors.Is(err, ErrAlreadyClassified) {
 		t.Fatalf("second Classify: %v, want ErrAlreadyClassified", err)
 	}
 	var actor string
@@ -539,5 +544,117 @@ func TestLiveApprovalNamesTheNewestLiveGrant(t *testing.T) {
 		if _, _, err := s.LiveApproval(ctx, bad[0], bad[1]); !errors.Is(err, ErrInvalidGrant) {
 			t.Errorf("LiveApproval(%q, %q) = %v, want ErrInvalidGrant", bad[0], bad[1], err)
 		}
+	}
+}
+
+// Classify takes the grant the authorizer confirmed on GHES: a grant
+// recorded since (another approver, not re-read on GHES) is
+// ErrApprovalChanged, and nothing changes; the confirmed newest grant is
+// classified and audited, with the D-V1-1 opt-in in the same transaction.
+func TestClassifyRefusesAnApprovalChangedSinceAuthorize(t *testing.T) {
+	s, _ := sweptStore(t)
+	ctx := context.Background()
+	enqueueAt(t, s, "d1", JobDeploy, 10, commitA)
+	l := acquire(t, s)
+	approve(t, s, grantOf(commitA, 11))
+	confirmed, _, err := s.LiveApproval(ctx, envA, commitA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newer := grantOf(commitA, 12)
+	newer.ApproverLogin, newer.ApproverID, newer.ReviewID = "second", 8, 120
+	approve(t, s, newer)
+	before := auditKinds(t, s)
+	err = s.Classify(ctx, l, Classification{Trust: TrustUntrusted, Approval: &confirmed, FullSecrets: true})
+	if !errors.Is(err, ErrApprovalChanged) {
+		t.Fatalf("Classify on a superseded grant: %v, want ErrApprovalChanged", err)
+	}
+	if jobs, err := s.Jobs(ctx); err != nil || jobs[0].Trust != TrustUnclassified || jobs[0].Status != StatusInProgress {
+		t.Fatalf("refused Classify changed the job: %+v, %v", jobs, err)
+	}
+	if got := auditKinds(t, s); !slices.Equal(got, before) {
+		t.Fatalf("refused Classify wrote audit %v", got[len(before):])
+	}
+	// The lease is still unclassified: the reconciler requeues it.
+	if err := s.Requeue(ctx, l, t0); err != nil {
+		t.Fatalf("Requeue after ErrApprovalChanged: %v", err)
+	}
+	l = acquire(t, s)
+	confirmed, _, err = s.LiveApproval(ctx, envA, commitA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Classify(ctx, l, Classification{Trust: TrustUntrusted, Approval: &confirmed, FullSecrets: true}); err != nil {
+		t.Fatalf("Classify on the confirmed newest grant: %v", err)
+	}
+	got := auditKinds(t, s)
+	if want := []string{"untrusted_deploy/review", "full_secrets_opt_in/opt_in"}; !slices.Equal(got[len(got)-2:], want) {
+		t.Fatalf("audit tail %v, want %v", got[len(got)-2:], want)
+	}
+	var actor string
+	var actorID int64
+	if err := s.db.QueryRowContext(ctx, `SELECT actor_login, actor_id FROM audit_events WHERE kind = 'full_secrets_opt_in'`).Scan(&actor, &actorID); err != nil {
+		t.Fatal(err)
+	}
+	if actor != "second" || actorID != 8 {
+		t.Fatalf("full_secrets_opt_in actor = %s#%d, want second#8", actor, actorID)
+	}
+}
+
+// Fail closed: an untrusted verdict without a confirmed approval, or a
+// trusted verdict carrying an approval or the opt-in, is refused unchanged.
+func TestClassifyRefusesInconsistentVerdicts(t *testing.T) {
+	s, _ := sweptStore(t)
+	ctx := context.Background()
+	enqueueAt(t, s, "d1", JobDeploy, 10, commitA)
+	l := acquire(t, s)
+	approve(t, s, grantOf(commitA, 11))
+	a, _, err := s.LiveApproval(ctx, envA, commitA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, c := range map[string]Classification{
+		"untrusted without approval": {Trust: TrustUntrusted},
+		"trusted with approval":      {Trust: TrustTrusted, Approval: &a},
+		"trusted with opt-in":        {Trust: TrustTrusted, FullSecrets: true},
+		"unclassified":               {Trust: TrustUnclassified},
+	} {
+		if err := s.Classify(ctx, l, c); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if jobs, err := s.Jobs(ctx); err != nil || jobs[0].Trust != TrustUnclassified {
+		t.Fatalf("a refused verdict changed the job: %+v, %v", jobs, err)
+	}
+}
+
+// Running lists environments whose latest job is a SUCCESS deploy;
+// RunningVersion names the newest SUCCESS deploy whatever is queued after it.
+func TestRunningAndRunningVersion(t *testing.T) {
+	s, _ := sweptStore(t)
+	ctx := context.Background()
+	if v, ok, err := s.RunningVersion(ctx, envA); err != nil || ok {
+		t.Fatalf("no job: %+v, %v, %v", v, ok, err)
+	}
+	enqueueAt(t, s, "d1", JobDeploy, 10, commitA)
+	finish(t, s, acquire(t, s), StatusSuccess)
+	running, err := s.Running(ctx)
+	if err != nil || len(running) != 1 || running[0].EnvID != envA || running[0].Source.CommitSHA != commitA {
+		t.Fatalf("Running = %+v, %v", running, err)
+	}
+	enqueueAt(t, s, "d2", JobDeploy, 20, commitB) // queued: a newer intent
+	if running, err := s.Running(ctx); err != nil || len(running) != 0 {
+		t.Fatalf("Running with a newer queued deploy = %+v, %v", running, err)
+	}
+	if v, ok, err := s.RunningVersion(ctx, envA); err != nil || !ok || v.Source.CommitSHA != commitA {
+		t.Fatalf("RunningVersion behind a queued deploy = %+v, %v, %v", v, ok, err)
+	}
+	enqueueAt(t, s, "t1", JobTeardown, 30, commitB)
+	finish(t, s, acquire(t, s), StatusSuccess)
+	if v, ok, err := s.RunningVersion(ctx, envA); err != nil || ok {
+		t.Fatalf("RunningVersion after a teardown = %+v, %v, %v", v, ok, err)
+	}
+	if _, _, err := s.RunningVersion(ctx, ""); err == nil {
+		t.Fatal("RunningVersion of an invalid environment accepted")
 	}
 }
