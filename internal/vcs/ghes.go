@@ -65,6 +65,10 @@ const (
 	maxQuotedReply  = 256
 )
 
+// ErrAccountMismatch: a login read from GHES resolves to another account ID
+// than the one asked for (a renamed account whose login was taken since).
+var ErrAccountMismatch = errors.New("the login names another account")
+
 // Account is a GitHub account: ID is the identity, Login the current name.
 type Account struct {
 	Login string
@@ -546,20 +550,49 @@ func (c *Client) PullRequest(ctx context.Context, repo string, number uint32) (P
 		if st.HeadRepo != repo {
 			return nil // a fork, or a deleted head: never trusted, no permission read
 		}
-		var perm permissionReply
-		if err := c.get(ctx, bearer, path+"/collaborators/"+url.PathEscape(st.Opener.Login)+"/permission", maxReplyBytes, &perm); err != nil {
-			return err
-		}
-		if perm.User == nil || perm.User.ID != st.Opener.ID {
-			return fmt.Errorf("permission reply is not about account %d (%s)", st.Opener.ID, st.Opener.Login)
-		}
-		st.OpenerPermission, err = perm.level()
+		st.OpenerPermission, err = c.permission(ctx, bearer, path, st.Opener)
 		return err
 	}, "pull_requests")
 	if err != nil {
 		return PRState{}, fmt.Errorf("read %s#%d: %w", repo, number, err)
 	}
 	return st, nil
+}
+
+// Permission reads who's permission on repo (admin, maintain, write,
+// triage, read or none) with one token (metadata:read), revoked before it
+// returns. It is read by who.Login, the login as GHES reported it, and must
+// come back for who.ID: otherwise the error wraps ErrAccountMismatch.
+func (c *Client) Permission(ctx context.Context, repo string, who Account) (string, error) {
+	path, err := repoPath(repo)
+	if err != nil {
+		return "", err
+	}
+	if err := validate.Login(who.Login); err != nil || who.ID < 1 {
+		return "", fmt.Errorf("permission of %q (id %d): invalid account", textutil.Truncate(who.Login, 64), who.ID)
+	}
+	var level string
+	err = c.withToken(ctx, repo, func(ctx context.Context, bearer string) error {
+		level, err = c.permission(ctx, bearer, path, who)
+		return err
+	}, "metadata")
+	if err != nil {
+		return "", fmt.Errorf("read the permission of %s#%d on %s: %w", who.Login, who.ID, repo, err)
+	}
+	return level, nil
+}
+
+// permission reads who's permission on the repository at path, by login,
+// and requires the reply to be about who.ID.
+func (c *Client) permission(ctx context.Context, bearer, path string, who Account) (string, error) {
+	var perm permissionReply
+	if err := c.get(ctx, bearer, path+"/collaborators/"+url.PathEscape(who.Login)+"/permission", maxReplyBytes, &perm); err != nil {
+		return "", err
+	}
+	if perm.User == nil || perm.User.ID != who.ID {
+		return "", fmt.Errorf("permission reply is not about account %d (%s): %w", who.ID, who.Login, ErrAccountMismatch)
+	}
+	return perm.level()
 }
 
 func (st *PRState) fill(pr pullRequestReply, repo string, number uint32) error {

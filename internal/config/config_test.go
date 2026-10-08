@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -49,7 +50,6 @@ func TestBoundedDuration(t *testing.T) {
 // minimalEnv sets the keys Load requires.
 func minimalEnv(t *testing.T) {
 	t.Helper()
-	t.Setenv("PREVIEWD_WEBHOOK_SECRET", "s3cret")
 	t.Setenv("PREVIEWD_GHES_URL", "https://ghes.corp")
 	t.Setenv("PREVIEWD_GITHUB_APP_ID", "31337")
 	t.Setenv("PREVIEWD_TLS_CERT_FILE", "/etc/previewd/tls.pem")
@@ -141,5 +141,40 @@ func TestLoadGHESAndListenerKeys(t *testing.T) {
 	t.Setenv("PREVIEWD_TLS_KEY_CREDENTIAL", "")
 	if cfg, err = Load(); err != nil || !cfg.AllowPlaintextWebhooks {
 		t.Fatalf("plaintext opt-in = %+v, %v", cfg, err)
+	}
+}
+
+// Zero secrets in the environment: the webhook secret is a systemd
+// credential name, and PREVIEWD_WEBHOOK_SECRET refuses to start whatever its
+// value (even empty), without its value in the error.
+func TestLoadWebhookSecretIsACredential(t *testing.T) {
+	minimalEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WebhookSecretCredential != "webhook_secret" {
+		t.Fatalf("default credential = %q", cfg.WebhookSecretCredential)
+	}
+	t.Setenv("PREVIEWD_WEBHOOK_SECRET_CREDENTIAL", "hook-hmac")
+	if cfg, err = Load(); err != nil || cfg.WebhookSecretCredential != "hook-hmac" {
+		t.Fatalf("named credential = %+v, %v", cfg, err)
+	}
+	for _, bad := range []string{"", "/etc/previewd/webhook_secret", "../webhook_secret", "a/b", ".."} {
+		t.Setenv("PREVIEWD_WEBHOOK_SECRET_CREDENTIAL", bad)
+		if _, err := Load(); err == nil {
+			t.Errorf("PREVIEWD_WEBHOOK_SECRET_CREDENTIAL=%q accepted", bad)
+		}
+	}
+	t.Setenv("PREVIEWD_WEBHOOK_SECRET_CREDENTIAL", "hook-hmac")
+	for _, legacy := range []string{"hook-s3cret-value", ""} {
+		t.Setenv("PREVIEWD_WEBHOOK_SECRET", legacy)
+		cfg, err := Load()
+		if err == nil || cfg != nil {
+			t.Fatalf("PREVIEWD_WEBHOOK_SECRET=%q accepted", legacy)
+		}
+		if legacy != "" && strings.Contains(err.Error(), legacy) {
+			t.Fatalf("the refusal quotes the secret: %v", err)
+		}
 	}
 }

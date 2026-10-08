@@ -512,3 +512,32 @@ func TestExpired(t *testing.T) {
 		t.Fatal("Expired with a zero TTL accepted")
 	}
 }
+
+// LiveApproval names the newest live grant of the commit (the one the
+// authorizer re-reads from GHES and Classify audits), and nothing once a
+// revocation newer than every grant is recorded.
+func TestLiveApprovalNamesTheNewestLiveGrant(t *testing.T) {
+	s, _ := sweptStore(t)
+	ctx := context.Background()
+	if _, ok, err := s.LiveApproval(ctx, envA, commitA); err != nil || ok {
+		t.Fatalf("no grant: live = %v, %v", ok, err)
+	}
+	approve(t, s, grantOf(commitA, 10))
+	newer := grantOf(commitA, 12)
+	newer.ApproverLogin, newer.ApproverID, newer.ReviewID = "second", 8, 120
+	approve(t, s, newer)
+	a, ok, err := s.LiveApproval(ctx, envA, commitA)
+	want := Approval{EnvID: envA, CommitSHA: commitA, ApproverLogin: "second", ApproverID: 8, Via: ApprovalViaReview, ReviewID: 120}
+	if err != nil || !ok || a != want {
+		t.Fatalf("LiveApproval = %+v, %v, %v; want %+v", a, ok, err, want)
+	}
+	revoke(t, s, commitA, 13)
+	if a, ok, err := s.LiveApproval(ctx, envA, commitA); err != nil || ok || a != (Approval{}) {
+		t.Fatalf("after a newer revocation: %+v, %v, %v", a, ok, err)
+	}
+	for _, bad := range [][2]string{{"", commitA}, {envA, "abc"}, {envA, ""}} {
+		if _, _, err := s.LiveApproval(ctx, bad[0], bad[1]); !errors.Is(err, ErrInvalidGrant) {
+			t.Errorf("LiveApproval(%q, %q) = %v, want ErrInvalidGrant", bad[0], bad[1], err)
+		}
+	}
+}

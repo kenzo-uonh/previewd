@@ -66,15 +66,21 @@ type Waker interface {
 type Server struct {
 	logger *slog.Logger
 	cfg    *config.Config
+	secret []byte // the webhook HMAC key, from its systemd credential
 	queue  Queue
 	waker  Waker
 	github GitHub
 	now    func() time.Time
 }
 
-// NewServer initializes the HTTP API controller.
-func NewServer(logger *slog.Logger, cfg *config.Config, queue Queue, waker Waker, github GitHub) *Server {
-	return &Server{logger: logger, cfg: cfg, queue: queue, waker: waker, github: github, now: time.Now}
+// NewServer initializes the HTTP API controller. webhookSecret is the HMAC
+// key every delivery is signed with (secrets.WebhookSecret); it is held in
+// memory only and must not be empty.
+func NewServer(logger *slog.Logger, cfg *config.Config, webhookSecret []byte, queue Queue, waker Waker, github GitHub) (*Server, error) {
+	if len(webhookSecret) == 0 {
+		return nil, errors.New("webhook secret is empty: webhooks are never accepted unsigned")
+	}
+	return &Server{logger: logger, cfg: cfg, secret: webhookSecret, queue: queue, waker: waker, github: github, now: time.Now}, nil
 }
 
 // Routes constructs the mux router with signature verification middleware.
@@ -87,7 +93,7 @@ func (s *Server) Routes() http.Handler {
 	// refused before the signature check reads the body.
 	webhookHandler := http.HandlerFunc(s.handleGitHubWebhook())
 	mux.Handle("POST /webhooks/github", SourceFilter(s.cfg.WebhookAllowedCIDRs, s.logger)(
-		ValidateGitHubSignature([]byte(s.cfg.WebhookSecret))(webhookHandler)))
+		ValidateGitHubSignature(s.secret)(webhookHandler)))
 
 	return mux
 }

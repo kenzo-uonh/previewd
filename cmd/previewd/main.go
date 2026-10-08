@@ -61,6 +61,14 @@ func main() {
 		)
 	}
 
+	// The webhook HMAC key: a systemd credential, read once memory is
+	// locked, held in memory only (never the environment, never a path).
+	webhookSecret, err := secrets.WebhookSecret(cfg.WebhookSecretCredential)
+	if err != nil {
+		logger.Error("Webhook secret refused", "credential", cfg.WebhookSecretCredential, "error", err)
+		os.Exit(1)
+	}
+
 	injector, err := secrets.NewInjector(cfg.SecretsPath)
 	if err != nil {
 		logger.Error("Secrets injector initialization failure", "error", err)
@@ -168,7 +176,11 @@ func main() {
 		logger.Error("Opt-in active: an approver's label approves untrusted code",
 			"opt_in", "PREVIEWD_LABEL_APPROVAL", "label", cfg.ApprovalLabel)
 	}
-	apiServer := api.NewServer(logger, cfg, db, reconciler, ghes)
+	apiServer, err := api.NewServer(logger, cfg, webhookSecret, db, reconciler, ghes)
+	if err != nil {
+		logger.Error("API server refused", "error", err)
+		os.Exit(1)
+	}
 	httpServer := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.APIPort),
 		Handler:           apiServer.Routes(),

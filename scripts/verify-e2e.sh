@@ -161,14 +161,16 @@ fake_ledger() { curl -sf --cacert "$PKI_DIR/ca.pem" "$GHES_URL/_fake/ledger"; }
 wait_for 15 "the fake GHES" fake_ledger
 fake_put pulls/e2e/mock/999 "{\"state\":\"open\",\"head_sha\":\"$MOCK_SHA\",\"head_repo\":\"e2e/mock\",\"opener\":{\"login\":\"e2e-opener\",\"id\":4242}}"
 fake_put permissions/e2e/mock/e2e-opener '{"id":4242,"permission":"write"}'
-# The App key and the listener key reach the daemon as systemd credentials:
-# by name under CREDENTIALS_DIRECTORY, never as a configured path.
+# The App key, the listener key and the webhook secret reach the daemon as
+# systemd credentials: by name under CREDENTIALS_DIRECTORY, never as a
+# configured path or an environment variable.
 CREDS_DIR="$MOCK_DIR/creds"
 mkdir -m 0700 "$CREDS_DIR"
 cp "$PKI_DIR/app-key.pem" "$CREDS_DIR/github-app-key"
 cp "$PKI_DIR/listener-key.pem" "$CREDS_DIR/listener-key"
+printf '%s' "$WEBHOOK_SECRET" > "$CREDS_DIR/webhook_secret"
 chmod 0400 "$CREDS_DIR"/*
-echo "    ok: fake GHES on $GHES_URL, test CA, App key and listener key as credentials"
+echo "    ok: fake GHES on $GHES_URL, test CA, App key, listener key and webhook secret as credentials"
 
 echo "==> Compiling CGO-free static binary..."
 make build
@@ -193,8 +195,7 @@ chmod 0600 "$MOCK_DIR/secrets.env"
 start_agent() {
   # Unlocked memory is accepted here (logged as an error): mlockall needs
   # LimitMEMLOCK=infinity, which the dev shell does not have.
-  PREVIEWD_WEBHOOK_SECRET="$WEBHOOK_SECRET" \
-    PREVIEWD_ALLOW_UNLOCKED_MEMORY=1 \
+  PREVIEWD_ALLOW_UNLOCKED_MEMORY=1 \
     PREVIEWD_SECRETS_PATH="$MOCK_DIR/secrets.env" \
     PREVIEWD_SECRETS_STAGING_DIR="$STAGING_DIR" \
     PREVIEWD_ALLOW_TMPFS_SECRETS="$ALLOW_TMPFS" \

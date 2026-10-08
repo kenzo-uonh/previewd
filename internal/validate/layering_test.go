@@ -39,7 +39,11 @@ var allowedImports = map[string][]string{
 	// in through injected functions and interfaces.
 	// textutil bounds untrusted daemon output (build errors quote the PR's
 	// Dockerfile) before it reaches an error or a log line.
-	"orchestrator": {"envid", "proxy", "store", "textutil"},
+	// The authorizer (D4) judges GHES truth with the vcs types and trust
+	// rule (vcs.PRState, vcs.Trusted, vcs.WriteAccess: one definition, shared
+	// with the webhook handler) and matches approvers on the
+	// validate.Approver list config parses.
+	"orchestrator": {"envid", "proxy", "store", "textutil", "validate", "vcs"},
 	// The handler writes to the queue and wakes the reconciler through
 	// consumer interfaces: no orchestrator import.
 	"api": {"config", "envid", "store", "validate", "vcs"},

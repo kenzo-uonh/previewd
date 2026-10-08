@@ -16,7 +16,6 @@ type Config struct {
 	DBPath              string
 	DockerHost          string
 	TraefikDomain       string
-	WebhookSecret       string
 	SecretsPath         string
 	SecretsStagingDir   string
 	RoutesDir           string
@@ -34,6 +33,11 @@ type Config struct {
 	ApprovalLabel  string // the label that approves when LabelApproval is set
 	DeliveryMaxAge time.Duration
 
+	// WebhookSecretCredential names the systemd credential holding the
+	// webhook HMAC secret: read from $CREDENTIALS_DIRECTORY, never from the
+	// environment or a configured path.
+	WebhookSecretCredential string
+
 	// GHES (V1 F4, C3): read as a GitHub App. The key is a systemd
 	// credential name, never a path.
 	GHESURL                string // https://host[:port]
@@ -49,11 +53,14 @@ type Config struct {
 }
 
 const (
-	defaultAppKeyCredential = "github-app-key" // #nosec G101 -- the name of a systemd credential, not a credential
-	defaultApprovalLabel    = "previewd-approved"
-	defaultDeliveryMaxAge   = 15 * time.Minute
-	minDeliveryMaxAge       = time.Minute
-	maxDeliveryMaxAge       = 2 * time.Hour
+	defaultAppKeyCredential        = "github-app-key" // #nosec G101 -- the name of a systemd credential, not a credential
+	defaultWebhookSecretCredential = "webhook_secret" // #nosec G101 -- the name of a systemd credential, not a credential
+	// legacyWebhookSecretEnv held the secret itself before V1: refused.
+	legacyWebhookSecretEnv = "PREVIEWD_WEBHOOK_SECRET" // #nosec G101 -- an environment variable name, not a credential
+	defaultApprovalLabel   = "previewd-approved"
+	defaultDeliveryMaxAge  = 15 * time.Minute
+	minDeliveryMaxAge      = time.Minute
+	maxDeliveryMaxAge      = 2 * time.Hour
 )
 
 // defaultStagingDir mirrors secrets.DefaultStagingDir; config imports
@@ -93,9 +100,18 @@ func Load() (*Config, error) {
 		traefikDomain = "local.previewd"
 	}
 
-	webhookSecret := os.Getenv("PREVIEWD_WEBHOOK_SECRET")
-	if webhookSecret == "" {
-		return nil, fmt.Errorf("PREVIEWD_WEBHOOK_SECRET is required: webhooks are never accepted unsigned")
+	// Zero secrets in the environment: a secret there is readable in
+	// /proc/<pid>/environ, inherited by children and kept in unit files.
+	// Its value is never read; its presence refuses to start, so it is
+	// never left in place believed to be in use.
+	if _, set := os.LookupEnv(legacyWebhookSecretEnv); set {
+		return nil, fmt.Errorf("%s is set: the webhook secret is never read from the environment; "+
+			"remove it and pass the secret as the systemd credential named by PREVIEWD_WEBHOOK_SECRET_CREDENTIAL (default %s)",
+			legacyWebhookSecretEnv, defaultWebhookSecretCredential)
+	}
+	webhookSecretCred, err := credentialName("PREVIEWD_WEBHOOK_SECRET_CREDENTIAL", defaultWebhookSecretCredential)
+	if err != nil {
+		return nil, err
 	}
 
 	secretsPath := os.Getenv("PREVIEWD_SECRETS_PATH")
@@ -200,7 +216,6 @@ func Load() (*Config, error) {
 		DBPath:              dbPath,
 		DockerHost:          dockerHost,
 		TraefikDomain:       traefikDomain,
-		WebhookSecret:       webhookSecret,
 		SecretsPath:         secretsPath,
 		SecretsStagingDir:   stagingDir,
 		RoutesDir:           routesDir,
@@ -215,14 +230,15 @@ func Load() (*Config, error) {
 		ApprovalLabel:       approvalLabel,
 		DeliveryMaxAge:      maxAge,
 
-		GHESURL:                ghesURL,
-		GHESCAFile:             os.Getenv("PREVIEWD_GHES_CA_FILE"),
-		GitHubAppID:            appID,
-		GitHubAppKeyCredential: appKey,
-		TLSCertFile:            certFile,
-		TLSKeyCredential:       keyCred,
-		AllowPlaintextWebhooks: plaintext,
-		WebhookAllowedCIDRs:    cidrs,
+		WebhookSecretCredential: webhookSecretCred,
+		GHESURL:                 ghesURL,
+		GHESCAFile:              os.Getenv("PREVIEWD_GHES_CA_FILE"),
+		GitHubAppID:             appID,
+		GitHubAppKeyCredential:  appKey,
+		TLSCertFile:             certFile,
+		TLSKeyCredential:        keyCred,
+		AllowPlaintextWebhooks:  plaintext,
+		WebhookAllowedCIDRs:     cidrs,
 	}, nil
 }
 

@@ -60,3 +60,32 @@ func TestCredentialRefuses(t *testing.T) {
 		}
 	}
 }
+
+// The webhook secret is the credential's bytes, trailing line breaks
+// dropped; one that is empty, missing or only line breaks refuses to start.
+func TestWebhookSecret(t *testing.T) {
+	dir := t.TempDir()
+	for name, content := range map[string]string{
+		"plain": "hook-s3cret", "echoed": "hook-s3cret\n", "crlf": "hook-s3cret\r\n", "inner": " hook s3cret\t",
+		"newlines": "\n\r\n", "empty": "",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o400); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("CREDENTIALS_DIRECTORY", dir)
+	for name, want := range map[string]string{"plain": "hook-s3cret", "echoed": "hook-s3cret", "crlf": "hook-s3cret", "inner": " hook s3cret\t"} {
+		if got, err := WebhookSecret(name); err != nil || string(got) != want {
+			t.Errorf("WebhookSecret(%s) = %q, %v; want %q", name, got, err, want)
+		}
+	}
+	for _, name := range []string{"newlines", "empty", "missing", "../plain"} {
+		if got, err := WebhookSecret(name); err == nil {
+			t.Errorf("WebhookSecret(%s) = %q, want an error", name, got)
+		}
+	}
+	t.Setenv("CREDENTIALS_DIRECTORY", "")
+	if _, err := WebhookSecret("plain"); err == nil {
+		t.Error("no credentials directory: accepted")
+	}
+}

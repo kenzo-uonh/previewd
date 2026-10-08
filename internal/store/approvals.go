@@ -130,15 +130,20 @@ const revokedSeqSQL = `max(
 // queryNewestLiveGrant selects the newest grant of (?1 env, ?2 commit) newer
 // than every revocation of it.
 const queryNewestLiveGrant = `
-	SELECT approver_login, approver_id, via FROM approvals
+	SELECT approver_login, approver_id, via, review_id FROM approvals
 	WHERE preview_id = ?1 AND commit_sha = ?2 AND granted_seq > ` + revokedSeqSQL + `
 	ORDER BY granted_seq DESC, id DESC LIMIT 1`
 
-// liveGrant is the newest grant of a live approval.
-type liveGrant struct {
-	ApproverLogin string
+// Approval is the newest grant of a live approval of (EnvID, CommitSHA):
+// who approved, how, and with which review (0 for a label). The authorizer
+// re-reads GHES for it before anything runs (V1 spec D4).
+type Approval struct {
+	EnvID         string
+	CommitSHA     string
+	ApproverLogin string // the login at the time of the grant; ApproverID is the identity
 	ApproverID    int64
 	Via           ApprovalVia
+	ReviewID      int64
 }
 
 type rowQuerier interface {
@@ -147,18 +152,18 @@ type rowQuerier interface {
 
 // newestLiveGrant returns the newest grant of (envID, commit) when the
 // approval is live: a grant newer than every revocation of it.
-func newestLiveGrant(ctx context.Context, q rowQuerier, envID, commit string) (liveGrant, bool, error) {
-	var g liveGrant
+func newestLiveGrant(ctx context.Context, q rowQuerier, envID, commit string) (Approval, bool, error) {
+	a := Approval{EnvID: envID, CommitSHA: commit}
 	var via string
-	err := q.QueryRowContext(ctx, queryNewestLiveGrant, envID, commit).Scan(&g.ApproverLogin, &g.ApproverID, &via)
+	err := q.QueryRowContext(ctx, queryNewestLiveGrant, envID, commit).Scan(&a.ApproverLogin, &a.ApproverID, &via, &a.ReviewID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return liveGrant{}, false, nil
+		return Approval{}, false, nil
 	}
 	if err != nil {
-		return liveGrant{}, false, fmt.Errorf("live approval of %s at %s: %w", envID, commit, err)
+		return Approval{}, false, fmt.Errorf("live approval of %s at %s: %w", envID, commit, err)
 	}
-	g.Via = ApprovalVia(via)
-	return g, true, nil
+	a.Via = ApprovalVia(via)
+	return a, true, nil
 }
 
 // ApprovalLive reports whether (envID, commitSHA) has a grant newer than
@@ -166,11 +171,18 @@ func newestLiveGrant(ctx context.Context, q rowQuerier, envID, commit string) (l
 // environment (D-V1-5), and AuthorizeDeploy's GHES-unavailable branch for the
 // running version (A2-6).
 func (s *Store) ApprovalLive(ctx context.Context, envID, commitSHA string) (bool, error) {
-	if !validPreviewID(envID) || !validCommit(commitSHA) {
-		return false, fmt.Errorf("approval live: %w: %s at %s", ErrInvalidGrant, quoted(envID), quoted(commitSHA))
-	}
-	_, live, err := newestLiveGrant(ctx, s.db, envID, commitSHA)
+	_, live, err := s.LiveApproval(ctx, envID, commitSHA)
 	return live, err
+}
+
+// LiveApproval returns the newest grant of (envID, commitSHA) when its
+// approval is live, and false otherwise. The authorizer checks that grant
+// against GHES (D4); Classify audits the same newest grant's approver.
+func (s *Store) LiveApproval(ctx context.Context, envID, commitSHA string) (Approval, bool, error) {
+	if !validPreviewID(envID) || !validCommit(commitSHA) {
+		return Approval{}, false, fmt.Errorf("live approval: %w: %s at %s", ErrInvalidGrant, quoted(envID), quoted(commitSHA))
+	}
+	return newestLiveGrant(ctx, s.db, envID, commitSHA)
 }
 
 // recordNewHead is the new-head revocation of an accepted deploy delivery:

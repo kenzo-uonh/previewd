@@ -108,7 +108,7 @@ func newHarness() *harness {
 	return &harness{
 		q: &fakeQueue{verdict: store.VerdictAccepted, job: true}, w: &countingWaker{}, gh: ghesDown, now: v1Time,
 		cfg: &config.Config{
-			WebhookSecret: testSecret, DeliveryMaxAge: 15 * time.Minute, ApprovalLabel: "previewd-approved",
+			DeliveryMaxAge: 15 * time.Minute, ApprovalLabel: "previewd-approved",
 			Approvers: map[string][]validate.Approver{"acme/app": {{Login: "lead-dev", ID: 7}}},
 		},
 	}
@@ -116,7 +116,10 @@ func newHarness() *harness {
 
 func (h *harness) send(t *testing.T, event, delivery, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	srv := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), h.cfg, h.q, h.w, h.gh)
+	srv, err := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), h.cfg, []byte(testSecret), h.q, h.w, h.gh)
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv.now = func() time.Time { return h.now }
 	req := httptest.NewRequest(http.MethodPost, "/webhooks/github", strings.NewReader(body))
 	req.Header.Set("X-GitHub-Event", event)
@@ -292,5 +295,16 @@ func TestWebhookSourceFilterOnRoute(t *testing.T) {
 	h.cfg.WebhookAllowedCIDRs = []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}
 	if rec := h.send(t, "pull_request", v1Delivery, prBody("opened")); rec.Code != http.StatusAccepted || len(h.q.got) != 1 {
 		t.Fatalf("allowed source: reply %d, recorded %d", rec.Code, h.q.recorded())
+	}
+}
+
+// Fail closed: a server without a webhook secret is never built, so no
+// delivery is checked against an empty key.
+func TestNewServerRefusesAnEmptySecret(t *testing.T) {
+	h := newHarness()
+	for _, secret := range [][]byte{nil, {}} {
+		if srv, err := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), h.cfg, secret, h.q, h.w, h.gh); err == nil || srv != nil {
+			t.Errorf("secret %q: server built", secret)
+		}
 	}
 }

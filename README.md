@@ -29,6 +29,7 @@
 │   ├── envid/                     # Environment ID: pr-<n>-<hash(repo, branch)>, a DNS label (leaf).
 │   ├── hardening/                 # mlockall with RLIMIT_MEMLOCK and VmLck checks (leaf, _linux/_other).
 │   ├── orchestrator/
+│   │   ├── authorizer.go          # D4 deploy gate: trusted/untrusted from GHES, approvals re-read (review, approver ID and write access).
 │   │   ├── docker.go              # Docker Driver implementation for the MVP.
 │   │   ├── engine.go              # Interface defining the Driver (Docker/Kubernetes).
 │   │   ├── environment.go         # EaaS lifecycle logic (Clone, Start, Stop, Destroy).
@@ -37,6 +38,7 @@
 │   │   ├── route.go               # Traefik file-provider route documents (validated, JSON-as-YAML), the only routing path.
 │   │   └── publish.go             # Atomic publish: temp file, fsync, rename, fsync dir.
 │   ├── secrets/
+│   │   ├── credential.go          # systemd credentials by name from $CREDENTIALS_DIRECTORY (App key, listener key, webhook secret).
 │   │   ├── injector.go            # Loads the secrets file into memory.
 │   │   └── stager*.go             # ramfs staging: fs-type, owner and mode checks, one file per key.
 │   ├── store/
@@ -158,7 +160,7 @@ Operational parameters enforce hardware boundaries and are managed exclusively v
 * `PREVIEWD_MAX_BUILDS`: Number of reconciler workers, i.e. jobs (deploys and teardowns) run at once; one job per environment at a time regardless (default: 2).
 
 
-* `PREVIEWD_WEBHOOK_SECRET`: HMAC secret of the GitHub webhook. **Required.** The daemon refuses to start without it, and an empty secret accepts nothing. Every webhook must carry the exact `X-Hub-Signature-256` for its body (at most 1 MiB).
+* `PREVIEWD_WEBHOOK_SECRET_CREDENTIAL` (default `webhook_secret`): Name of the systemd credential holding the HMAC secret of the GitHub webhook. **Required credential.** The secret is never read from the environment or from a configured path: the daemon refuses to start while `PREVIEWD_WEBHOOK_SECRET` is set (whatever its value, which is never read), and when the credential is missing, empty, or only line breaks. Trailing CR/LF bytes are dropped; every other byte is the key. Every webhook must carry the exact `X-Hub-Signature-256` for its body (at most 1 MiB). Changing the secret takes a restart.
 
 
 * `PREVIEWD_ALLOW_UNLOCKED_MEMORY`: Set exactly `1` to start when `mlockall` cannot be applied. By default the daemon locks all current and future memory before reading any secret, and refuses to start unless `RLIMIT_MEMLOCK` is unlimited (systemd `LimitMEMLOCK=infinity`). The opt-in is logged as an error at every start.
@@ -211,7 +213,7 @@ Operational parameters enforce hardware boundaries and are managed exclusively v
 
 * `PREVIEWD_WEBHOOK_ALLOWED_CIDRS`: Comma-separated prefixes (`10.0.0.0/8,fd00::/8`, no host bits) of the GHES addresses that may deliver webhooks. A peer outside them gets 403 before its body is read. Unset: any source (logged as a warning).
 
-Credentials are read by name from `$CREDENTIALS_DIRECTORY`, never from a configured path: pass them with `LoadCredentialEncrypted=github-app-key:/etc/credstore.encrypted/github-app-key` (or `LoadCredential=`) in the unit. In GHES, enable SSL verification on the webhook and make the listener certificate chain to a CA GHES trusts.
+Credentials are read by name from `$CREDENTIALS_DIRECTORY`, never from a configured path: pass them with `LoadCredentialEncrypted=github-app-key:/etc/credstore.encrypted/github-app-key` and `LoadCredentialEncrypted=webhook_secret:/etc/credstore.encrypted/webhook_secret` (or `LoadCredential=`) in the unit; `systemd-creds encrypt --name=webhook_secret - /etc/credstore.encrypted/webhook_secret` seals the secret from standard input. In GHES, enable SSL verification on the webhook and make the listener certificate chain to a CA GHES trusts.
 
 
 * `PREVIEWD_ROUTES_DIR`: Directory of the route documents, watched by Traefik's file provider (default: `/var/lib/previewd/routes`). Must exist (absolute path, not a symlink); the daemon refuses to start otherwise. Mounted read-only into Traefik.
@@ -240,7 +242,7 @@ ramfs is never swapped. A reboot discards it, together with every staged secret.
 ## Webhook Ingestion
 
 0. **Transport:** TLS 1.2+ from an allowed source (`PREVIEWD_WEBHOOK_ALLOWED_CIDRS`, checked before the body is read).
-1. **Signature:** the body is read up to 1 MiB (larger bodies get 413, never truncated). It must carry `X-Hub-Signature-256: sha256=<64 lowercase hex>`, equal to HMAC-SHA256 of the raw body under `PREVIEWD_WEBHOOK_SECRET`. Anything else gets 401.
+1. **Signature:** the body is read up to 1 MiB (larger bodies get 413, never truncated). It must carry `X-Hub-Signature-256: sha256=<64 lowercase hex>`, equal to HMAC-SHA256 of the raw body under the webhook secret (the `PREVIEWD_WEBHOOK_SECRET_CREDENTIAL` credential). Anything else gets 401.
 2. **Schema:** `pull_request` bodies need `action`, `number` (1 to 2^32-1), `pull_request.head.ref` (git ref rules), `pull_request.head.sha` (40 or 64 lowercase hex), `pull_request.head.repo` (`null` for a deleted fork, otherwise with `full_name`), `pull_request.user` and `sender` (login and numeric ID), `pull_request.updated_at` (RFC 3339), `repository.full_name` (`owner/repo`) and `repository.clone_url` (absolute, no credentials), for every action, `closed` included; `labeled` and `unlabeled` also need `label.name`. `pull_request_review` bodies need the same pull request fields (`pull_request.number`) and the review's `id`, `user`, `commit_id`, `state`, and `submitted_at` when submitted. The head repository and the opener are recorded with the job; trust is never decided from them. Acted on: `opened`, `reopened`, `synchronize`, `closed`, the approval label (below), and an approver's review that approves, requests changes or is dismissed. Other well-formed events and actions get 202 and are ignored.
 3. **Environment ID:** `pr-<number>-<10 hex of SHA-256(repo, head branch)>`. The same PR number in two repositories, or on two branches, never shares an environment.
 4. **Ordering:** `X-GitHub-Delivery` must be a canonical UUID version 1 (RFC 4122 variant). Its embedded timestamp, in 100-nanosecond intervals, orders the intents of one environment. Anything else gets 400, and so does a timestamp more than 5 minutes ahead of the host's clock. GitHub does not sign that header, and one forged far-future ID would otherwise make every later event of the environment stale. Ordering relies on the clock of the GitHub Enterprise Server that minted the IDs; keep it and the previewd host on NTP.

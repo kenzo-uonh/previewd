@@ -1,6 +1,7 @@
 package secrets
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -58,4 +59,22 @@ func Credential(name string) ([]byte, error) {
 		return nil, fmt.Errorf("credential %s is empty: %w", name, fs.ErrNotExist)
 	}
 	return data, nil
+}
+
+// WebhookSecret reads the webhook HMAC secret from the systemd credential
+// name (Credential's rules). Trailing CR and LF bytes are dropped, so a
+// credential written by echo or an editor signs as GitHub does; any other
+// byte is part of the secret. A secret that is empty after that is refused:
+// no webhook is ever accepted under an empty key.
+func WebhookSecret(name string) ([]byte, error) {
+	data, err := Credential(name)
+	if err != nil {
+		return nil, fmt.Errorf("webhook secret: %w", err)
+	}
+	secret := bytes.TrimRight(data, "\r\n")
+	if len(secret) == 0 {
+		clear(data)
+		return nil, fmt.Errorf("webhook secret: credential %s holds only line breaks", name)
+	}
+	return secret, nil
 }

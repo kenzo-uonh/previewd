@@ -15,6 +15,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -118,7 +119,7 @@ func newFakeGHES(t *testing.T) *fakeGHES {
 	mux.HandleFunc("GET /api/v3/elsewhere/pulls/7", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, f.prReply())
 	})
-	mux.HandleFunc("GET /api/v3/repos/acme/app/collaborators/opener/permission", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /api/v3/repos/acme/app/collaborators/{login}/permission", func(w http.ResponseWriter, r *http.Request) {
 		f.checkToken(r)
 		writeJSON(w, http.StatusOK, f.permReply())
 	})
@@ -572,5 +573,60 @@ func TestPullRequestRefusesInvalidNames(t *testing.T) {
 	}
 	if len(f.minted) != 0 {
 		t.Fatalf("tokens minted for invalid names: %d", len(f.minted))
+	}
+}
+
+// metadataToken is the access_tokens reply of a metadata:read token.
+func metadataToken() any {
+	return map[string]any{
+		"token": testToken, "expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		"permissions":  map[string]string{"metadata": "read"},
+		"repositories": []map[string]string{{"full_name": testRepo}},
+	}
+}
+
+// An approver's permission is read by the login GHES reports now, with a
+// metadata:read token revoked after use, and only for the same account ID:
+// a renamed approver is still found by ID, and a login taken over by another
+// account is refused with ErrAccountMismatch.
+func TestPermissionIsReadForTheSameAccountID(t *testing.T) {
+	f := newFakeGHES(t)
+	f.tokenReply = metadataToken
+	f.permReply = func() any {
+		return map[string]any{"permission": "admin", "role_name": "admin",
+			"user": map[string]any{"login": "lead-dev-renamed", "id": 7, "permissions": map[string]bool{"admin": true, "push": true, "pull": true}}}
+	}
+	c := f.client(t, nil)
+	level, err := c.Permission(context.Background(), testRepo, Account{Login: "lead-dev-renamed", ID: 7})
+	if err != nil || level != "admin" {
+		t.Fatalf("Permission = %q, %v", level, err)
+	}
+	if len(f.minted) != 1 || len(f.minted[0].Permissions) != 1 || f.minted[0].Permissions["metadata"] != "read" {
+		t.Fatalf("token requests %+v, want one with metadata:read only", f.minted)
+	}
+	if f.revoked.Load() != 1 || strings.Join(f.calls, ",") != "GET /api/v3/repos/acme/app/collaborators/lead-dev-renamed/permission" {
+		t.Fatalf("revoked %d, calls %v", f.revoked.Load(), f.calls)
+	}
+
+	// The login now belongs to account 99: never account 7's permission.
+	f.permReply = func() any {
+		return map[string]any{"permission": "admin", "role_name": "admin",
+			"user": map[string]any{"login": "lead-dev", "id": 99, "permissions": map[string]bool{"admin": true}}}
+	}
+	if level, err := c.Permission(context.Background(), testRepo, Account{Login: "lead-dev", ID: 7}); !errors.Is(err, ErrAccountMismatch) || level != "" {
+		t.Fatalf("taken-over login = %q, %v; want ErrAccountMismatch", level, err)
+	}
+	if f.revoked.Load() != 2 {
+		t.Fatalf("token revoked %d times after two reads, want 2", f.revoked.Load())
+	}
+
+	// An invalid account is refused before any token is minted.
+	for _, who := range []Account{{Login: "", ID: 7}, {Login: "lead-dev", ID: 0}, {Login: "../admin", ID: 7}} {
+		if _, err := c.Permission(context.Background(), testRepo, who); err == nil {
+			t.Errorf("Permission(%+v) accepted", who)
+		}
+	}
+	if len(f.minted) != 2 {
+		t.Fatalf("%d tokens minted, want 2: an invalid account must not reach GHES", len(f.minted))
 	}
 }
