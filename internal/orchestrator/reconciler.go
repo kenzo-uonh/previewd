@@ -515,7 +515,7 @@ func teardownBackoff(attempts int64) time.Duration {
 // count lives in memory: a restart begins a new grace period, and the
 // startup sweep re-arms only through AuthorizeDeploy.
 func (r *Reconciler) Revalidate(ctx context.Context) {
-	failing := map[string]time.Time{} // environment -> first consecutive unverifiable check
+	failing := map[string]*streak{}
 	t := time.NewTicker(r.cfg.RevalidateInterval)
 	defer t.Stop()
 	for {
@@ -528,9 +528,24 @@ func (r *Reconciler) Revalidate(ctx context.Context) {
 	}
 }
 
+// streak is one environment's run of consecutive unverifiable checks.
+type streak struct {
+	since    time.Time // the first of them
+	failures int64
+}
+
+// exhausted reports whether the streak has covered the grace period: by
+// count, ceil(grace/interval) intervals after its first check, so jitter in
+// the time a check returns never costs an extra interval; or by wall time,
+// when passes run later than the interval.
+func (s *streak) exhausted(now time.Time, interval, grace time.Duration) bool {
+	intervals := int64((grace + interval - 1) / interval)
+	return s.failures-1 >= intervals || now.Sub(s.since) >= grace
+}
+
 // revalidateOnce checks every running environment once. failing carries
 // the unverifiable streaks across passes.
-func (r *Reconciler) revalidateOnce(ctx context.Context, failing map[string]time.Time) {
+func (r *Reconciler) revalidateOnce(ctx context.Context, failing map[string]*streak) {
 	jobs, err := r.cfg.Queue.Running(ctx)
 	if err != nil {
 		if ctx.Err() == nil {
@@ -550,8 +565,8 @@ func (r *Reconciler) revalidateOnce(ctx context.Context, failing map[string]time
 		now := r.cfg.Now()
 		switch {
 		case err == nil:
-			if since, ok := failing[j.EnvID]; ok {
-				log.Info("Re-validation succeeded again", "unverifiable_since", since)
+			if st, ok := failing[j.EnvID]; ok {
+				log.Info("Re-validation succeeded again", "unverifiable_since", st.since, "failed_checks", st.failures)
 				delete(failing, j.EnvID)
 			}
 		case ctx.Err() != nil:
@@ -566,17 +581,19 @@ func (r *Reconciler) revalidateOnce(ctx context.Context, failing map[string]time
 			r.revalidationTeardown(ctx, j, reason, string(store.OriginRevalidation), log)
 			delete(failing, j.EnvID)
 		default:
-			since, ok := failing[j.EnvID]
+			st, ok := failing[j.EnvID]
 			if !ok {
-				since, failing[j.EnvID] = now, now
+				st = &streak{since: now}
+				failing[j.EnvID] = st
 			}
-			if now.Sub(since) < r.cfg.RevalidateGrace {
+			st.failures++
+			if !st.exhausted(now, r.cfg.RevalidateInterval, r.cfg.RevalidateGrace) {
 				log.Warn("Environment could not be re-validated: kept within the grace period",
-					"error", err, "unverifiable_since", since, "grace", r.cfg.RevalidateGrace)
+					"error", err, "unverifiable_since", st.since, "failed_checks", st.failures, "grace", r.cfg.RevalidateGrace)
 				continue
 			}
 			log.Error("Environment unverifiable past the grace period: tearing down (fail closed)",
-				"error", err, "unverifiable_since", since, "grace", r.cfg.RevalidateGrace)
+				"error", err, "unverifiable_since", st.since, "failed_checks", st.failures, "grace", r.cfg.RevalidateGrace)
 			r.revalidationTeardown(ctx, j, "", string(store.RevokedRevalidationUnavailable), log)
 			delete(failing, j.EnvID)
 		}

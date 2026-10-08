@@ -11,12 +11,18 @@ package store
 // transition it causes.
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/url"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -215,43 +221,202 @@ func (s *Store) AppendAudit(ctx context.Context, e AuditEvent, at time.Time) err
 	})
 }
 
-// VerifyAudit recomputes the chain from the first row: positions are 1..n
-// without a gap, every prev_hash is the previous row's hash, every hash is
-// recomputed. Any break is ErrAuditChain, naming the first broken row.
-func (s *Store) VerifyAudit(ctx context.Context) (err error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, at, kind, preview_id, repo, pr_number, commit_sha, actor_login, actor_id, detail, prev_hash, hash
-		FROM audit_events ORDER BY id`)
+// querier is a *sql.DB or a *sql.Tx.
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// AuditHead is where a verified chain ends: its row count and the hash of
+// its last row (64 zeros for an empty trail). Recording it outside the host
+// anchors the trail: a later chain that no longer holds that hash was
+// truncated or rewritten.
+type AuditHead struct {
+	Rows int64
+	Hash string
+}
+
+// AuditRecord is one exported row (previewd audit export, JSON Lines).
+// prev_hash and hash let a third party recompute the chain: hash =
+// SHA-256(prev_hash || "previewd-audit-v1\n" || each column from id to
+// detail as <decimal byte length>:<bytes>,).
+type AuditRecord struct {
+	ID         int64  `json:"id"`
+	At         string `json:"at"`    // RFC 3339, UTC, milliseconds
+	AtMillis   int64  `json:"at_ms"` // the value the hash covers
+	Kind       string `json:"kind"`
+	EnvID      string `json:"environment_id"`
+	Repo       string `json:"repository"`
+	PRNumber   int64  `json:"pr_number"`
+	CommitSHA  string `json:"commit_sha"`
+	ActorLogin string `json:"actor_login"`
+	ActorID    int64  `json:"actor_id"`
+	Detail     string `json:"detail"`
+	PrevHash   string `json:"prev_hash"`
+	Hash       string `json:"hash"`
+}
+
+const queryAuditRows = `
+	SELECT id, at, kind, preview_id, repo, pr_number, commit_sha, actor_login, actor_id, detail, prev_hash, hash
+	FROM audit_events ORDER BY id`
+
+// walkAudit recomputes the chain from the first row and hands every row
+// that verifies to fn, in order: positions are 1..n without a gap, every
+// prev_hash is the previous row's hash, every hash is recomputed. The first
+// break stops the walk with ErrAuditChain, naming the row; fn never sees a
+// row that does not verify.
+func walkAudit(ctx context.Context, db querier, fn func(auditRow) error) (head AuditHead, err error) {
+	rows, err := db.QueryContext(ctx, queryAuditRows)
 	if err != nil {
-		return fmt.Errorf("verify audit: %w", err)
+		return AuditHead{}, fmt.Errorf("verify audit: %w", err)
 	}
 	defer func() {
 		if closeErr := rows.Close(); closeErr != nil {
 			err = errors.Join(err, fmt.Errorf("verify audit: close: %w", closeErr))
 		}
 	}()
-	prev, want := zeroHash, int64(1)
+	head.Hash = zeroHash
 	for rows.Next() {
 		var r auditRow
 		var kind string
 		e := &r.Event
 		if err := rows.Scan(&r.ID, &r.At, &kind, &e.EnvID, &e.Repo, &e.PRNumber, &e.CommitSHA, &e.ActorLogin, &e.ActorID,
 			&e.Detail, &r.PrevHash, &r.Hash); err != nil {
-			return fmt.Errorf("verify audit: scan: %w", err)
+			return AuditHead{}, fmt.Errorf("verify audit: scan: %w", err)
 		}
 		e.Kind = AuditKind(kind)
 		switch {
-		case r.ID != want:
-			return fmt.Errorf("%w: row %d where %d was expected", ErrAuditChain, r.ID, want)
-		case r.PrevHash != prev:
-			return fmt.Errorf("%w: row %d does not follow row %d", ErrAuditChain, r.ID, r.ID-1)
+		case r.ID != head.Rows+1:
+			return AuditHead{}, fmt.Errorf("%w: row %d where %d was expected", ErrAuditChain, r.ID, head.Rows+1)
+		case r.PrevHash != head.Hash:
+			return AuditHead{}, fmt.Errorf("%w: row %d does not follow row %d", ErrAuditChain, r.ID, r.ID-1)
 		case r.Hash != chainHash(r.PrevHash, r):
-			return fmt.Errorf("%w: row %d does not match its hash", ErrAuditChain, r.ID)
+			return AuditHead{}, fmt.Errorf("%w: row %d does not match its hash", ErrAuditChain, r.ID)
 		}
-		prev, want = r.Hash, want+1
+		if fn != nil {
+			if err := fn(r); err != nil {
+				return AuditHead{}, err
+			}
+		}
+		head.Rows, head.Hash = r.ID, r.Hash
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("verify audit: %w", err)
+		return AuditHead{}, fmt.Errorf("verify audit: %w", err)
 	}
-	return nil
+	return head, nil
+}
+
+// VerifyAudit recomputes the chain from the first row. Any break is
+// ErrAuditChain, naming the first broken row.
+func (s *Store) VerifyAudit(ctx context.Context) error {
+	_, err := walkAudit(ctx, s.db, nil)
+	return err
+}
+
+// AuditReader reads the audit trail of a database file without writing to
+// it (previewd audit verify|export): opened read-only and query-only,
+// never migrated, at this binary's schema version only. It can run beside
+// the daemon (WAL readers do not block the writer) or on a copy.
+type AuditReader struct {
+	db *sql.DB
+}
+
+// OpenAuditReader opens path read-only. A database at another schema
+// version is refused: an older one must first be migrated by the daemon,
+// a newer one belongs to a newer binary.
+func OpenAuditReader(ctx context.Context, path string) (*AuditReader, error) {
+	if path == "" || strings.ContainsAny(path, "?#") {
+		return nil, fmt.Errorf("audit: database path %s is empty or contains '?' or '#'", quoted(path))
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("audit: database path: %w", err)
+	}
+	if _, err := os.Stat(abs); err != nil {
+		return nil, fmt.Errorf("audit: %w", err)
+	}
+	q := url.Values{}
+	q.Set("mode", "ro")
+	q.Add("_pragma", "query_only(1)")
+	q.Add("_pragma", "busy_timeout(5000)")
+	db, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: abs, RawQuery: q.Encode()}).String())
+	if err != nil {
+		return nil, fmt.Errorf("audit: open %s: %w", abs, err)
+	}
+	var version int
+	if err := db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+		return nil, errors.Join(fmt.Errorf("audit: read schema version of %s: %w", abs, err), db.Close())
+	}
+	if version != len(migrations) {
+		return nil, errors.Join(fmt.Errorf("audit: %s is at schema version %d, this binary reads %d: start the matching daemon once to migrate it",
+			abs, version, len(migrations)), db.Close())
+	}
+	if err := verifySchema(ctx, db); err != nil {
+		return nil, errors.Join(err, db.Close())
+	}
+	return &AuditReader{db: db}, nil
+}
+
+// Verify recomputes the whole chain and returns its head.
+func (r *AuditReader) Verify(ctx context.Context) (AuditHead, error) {
+	return walkAudit(ctx, r.db, nil)
+}
+
+// Export writes every row to w as JSON Lines, oldest first, and returns
+// the head. In one read snapshot it first verifies the whole chain, then
+// writes it: a chain with any break (ErrAuditChain) writes nothing. A row
+// rewritten with its own hash recomputed verifies against its predecessor
+// and breaks only at the next row, so streaming would have written it.
+func (r *AuditReader) Export(ctx context.Context, w io.Writer) (head AuditHead, err error) {
+	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return AuditHead{}, fmt.Errorf("export audit: begin: %w", err)
+	}
+	defer func() {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			err = errors.Join(err, fmt.Errorf("export audit: end snapshot: %w", rbErr))
+		}
+	}()
+	verified, err := walkAudit(ctx, tx, nil)
+	if err != nil {
+		return AuditHead{}, err
+	}
+	bw := bufio.NewWriter(w)
+	enc := json.NewEncoder(bw)
+	enc.SetEscapeHTML(false)
+	head, err = walkAudit(ctx, tx, func(row auditRow) error {
+		e := row.Event
+		if err := enc.Encode(AuditRecord{
+			ID: row.ID, At: time.UnixMilli(row.At).UTC().Format("2006-01-02T15:04:05.000Z07:00"), AtMillis: row.At,
+			Kind: string(e.Kind), EnvID: e.EnvID, Repo: e.Repo, PRNumber: e.PRNumber, CommitSHA: e.CommitSHA,
+			ActorLogin: e.ActorLogin, ActorID: e.ActorID, Detail: e.Detail, PrevHash: row.PrevHash, Hash: row.Hash,
+		}); err != nil {
+			return fmt.Errorf("export audit row %d: %w", row.ID, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return AuditHead{}, err
+	}
+	if head != verified {
+		return AuditHead{}, fmt.Errorf("%w: the chain changed within one snapshot", ErrAuditChain)
+	}
+	if err := bw.Flush(); err != nil {
+		return AuditHead{}, fmt.Errorf("export audit: %w", err)
+	}
+	return head, nil
+}
+
+// Contains reports whether a row of the trail carries hash. Run after
+// Verify: the head of an intact chain names every row before it.
+func (r *AuditReader) Contains(ctx context.Context, hash string) (bool, error) {
+	var n int
+	if err := r.db.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE hash = ?`, hash).Scan(&n); err != nil {
+		return false, fmt.Errorf("audit: look up head: %w", err)
+	}
+	return n > 0, nil
+}
+
+// Close closes the database.
+func (r *AuditReader) Close() error {
+	return r.db.Close()
 }

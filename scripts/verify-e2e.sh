@@ -136,6 +136,22 @@ git push -q origin e2e/broken
 BROKEN_SHA=$(git rev-parse HEAD)
 git checkout -q -
 
+# A fork's two commits (D8). GHES serves a fork's head from the base
+# repository (refs/pull/N/head): here each is a branch tip of the base
+# repository, so the daemon fetches it by SHA from the base clone URL.
+git checkout -q -b e2e/fork-v1 "$MOCK_SHA"
+echo one > fork.txt
+git add fork.txt
+git commit -q -m "fork: first push"
+git push -q origin e2e/fork-v1
+FORK_SHA1=$(git rev-parse HEAD)
+git checkout -q -b e2e/fork-v2
+echo two > fork.txt
+git commit -q -am "fork: second push"
+git push -q origin e2e/fork-v2
+FORK_SHA2=$(git rev-parse HEAD)
+git checkout -q "$MOCK_SHA"
+
 cd "$PROJECT_ROOT"
 
 echo "==> Bootstrapping Traefik (file provider, no socket)..."
@@ -211,6 +227,8 @@ start_agent() {
     PREVIEWD_TLS_KEY_CREDENTIAL=listener-key \
     PREVIEWD_WEBHOOK_ALLOWED_CIDRS=127.0.0.0/8,::1/128 \
     PREVIEWD_APPROVERS=e2e/mock:e2e-approver#7 \
+    PREVIEWD_APPROVAL_REVALIDATE_INTERVAL=1m \
+    PREVIEWD_APPROVAL_REVALIDATE_GRACE=1m \
     CREDENTIALS_DIRECTORY="$CREDS_DIR" \
     ./bin/previewd >>"$MOCK_DIR/agent.log" 2>&1 &
   AGENT_PID=$!
@@ -428,3 +446,115 @@ for _ in $(seq 10); do
 done
 [ "$code" = "404" ] || fail "route still served after teardown (HTTP $code)"
 echo "    ok: container, network, route and staged secrets removed"
+
+echo "==> 4. Approval gating end to end (D8): fork PR, approvals, push, dismissal, GHES outage..."
+fake_put permissions/e2e/mock/e2e-approver '{"id":7,"permission":"write"}'
+# FORK_BODY ACTION SHA: fork PR #1002 (head in outside/mock, opened by
+# outsider#555), signed now.
+FORK_BODY() {
+  printf '{"action":"%s","number":1002,"pull_request":{"number":1002,"head":{"ref":"feature","sha":"%s","repo":{"full_name":"outside/mock"}},"user":{"login":"outsider","id":555},"updated_at":"%s"},"repository":{"full_name":"e2e/mock","clone_url":"file://%s/mock.git"},"sender":{"login":"outsider","id":555}}' \
+    "$1" "$2" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$MOCK_DIR"
+}
+# fork_pull SHA: GHES truth for PR #1002, head SHA in the fork.
+fork_pull() { fake_put pulls/e2e/mock/1002 "{\"state\":\"open\",\"head_sha\":\"$1\",\"head_repo\":\"outside/mock\",\"opener\":{\"login\":\"outsider\",\"id\":555}}"; }
+# review_json ID STATE SHA: one review by e2e-approver#7 as GHES lists it.
+review_json() { printf '{"id":%d,"user":{"login":"e2e-approver","id":7},"state":"%s","commit_id":"%s"}' "$1" "$2" "$3"; }
+# fork_review ACTION STATE SHA: e2e-approver's review webhook on PR #1002, signed now.
+fork_review() {
+  NOW_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  send_webhook pull_request_review "$(REVIEW_BODY "$1" "$2" 1002 feature "$3" outside/mock outsider 555)"
+}
+# fork_log MSG: the agent's log lines with message MSG for the fork environment.
+fork_log() { grep "\"msg\":\"$1" "$MOCK_DIR/agent.log" | grep "\"environment_id\":\"$FORK_ENV\"" || true; }
+parked_times() { [ "$(fork_log 'Deploy refused: parked' | wc -l)" -ge "$1" ]; }
+fork_absent() { ! docker inspect "$FORK_ENV" >/dev/null 2>&1 && [ ! -e "$ROUTES_DIR/$FORK_ENV.yml" ] && [ ! -e "$STAGING_DIR/$FORK_ENV" ]; }
+# fork_runs_untrusted: the approved fork runs, with the :untrusted section only.
+fork_runs_untrusted() {
+  wait_for 90 "the approved fork deploy" test -f "$ROUTES_DIR/$FORK_ENV.yml"
+  [ "$(docker logs "$FORK_ENV" 2>&1 | tail -n 1)" = "untrusted-$E2E_SECRET" ] \
+    || fail "the fork did not receive exactly the :untrusted section (got: $(docker logs "$FORK_ENV" 2>&1 | head -c 120))"
+  [ "$(cat "$STAGING_DIR/$FORK_ENV/E2E_TOKEN")" = "untrusted-$E2E_SECRET" ] || fail "staged secret of the fork is not the :untrusted value"
+  case "$(docker inspect "$FORK_ENV")" in *"$E2E_SECRET"*) fail "a secret value is visible in docker inspect of the fork" ;; esac
+}
+
+echo "==> 4a. A fork PR is parked: nothing fetched, built or run..."
+fork_pull "$FORK_SHA1"
+fake_put reviews/e2e/mock/1002 '[]'
+reply=$(send_webhook pull_request "$(FORK_BODY opened "$FORK_SHA1")")
+FORK_ENV=$(printf '%s' "$reply" | sed -n 's/.*"environment_id":"\([a-z0-9-]*\)".*/\1/p')
+[ -n "$FORK_ENV" ] || fail "no environment_id for the fork PR: $reply"
+case "$reply" in *'"status":"queued"'*) ;; *) fail "fork PR not queued: $reply" ;; esac
+wait_for 30 "the fork deploy to be parked" parked_times 1
+[ -z "$(fork_log 'Deploying environment')" ] || fail "the unapproved fork reached ExecuteDeploy"
+fork_absent || fail "something of the unapproved fork exists on the host"
+if docker image inspect "$FORK_ENV:latest" >/dev/null 2>&1; then fail "an image was built for the unapproved fork"; fi
+echo "    ok: parked in PENDING_APPROVAL, no fetch, build, container, route or staging"
+
+echo "==> 4b. An approval of another commit leaves it parked..."
+fake_put reviews/e2e/mock/1002 "[$(review_json 501 APPROVED "$MOCK_SHA")]"
+case "$(fork_review submitted approved "$MOCK_SHA")" in
+  *'"status":"recorded"'*) ;; *) fail "approval of another commit was not recorded without a job" ;; esac
+sleep 5
+[ -z "$(fork_log 'Deploying environment')" ] || fail "an approval of another commit deployed the fork"
+fork_absent || fail "an approval of another commit created something on the host"
+echo "    ok: recorded, still parked"
+
+echo "==> 4c. An approval of the exact head deploys it with the :untrusted section only..."
+fake_put reviews/e2e/mock/1002 "[$(review_json 501 APPROVED "$MOCK_SHA"),$(review_json 502 APPROVED "$FORK_SHA1")]"
+case "$(fork_review submitted approved "$FORK_SHA1")" in
+  *'"status":"queued"'*) ;; *) fail "approval of the parked head did not re-queue it" ;; esac
+fork_runs_untrusted
+fork_log 'Deploy authorized' | grep '"trust":"untrusted"' | grep -q '"approver_id":7' \
+  || fail "the fork deploy was not authorized as untrusted on approver 7"
+echo "    ok: deployed untrusted on e2e-approver#7, container reads only untrusted-<secret>"
+
+echo "==> 4d. A push revokes the approval and tears the old version down..."
+fork_pull "$FORK_SHA2"
+case "$(send_webhook pull_request "$(FORK_BODY synchronize "$FORK_SHA2")")" in
+  *'"status":"queued"'*) ;; *) fail "the push was not queued" ;; esac
+wait_for 60 "the pushed fork to be parked" parked_times 2
+wait_for 30 "removal of the old fork version" fork_absent
+echo "    ok: the new head is parked, the approved old version removed"
+
+echo "==> 4e. A dismissal tears the approved environment down..."
+fake_put reviews/e2e/mock/1002 "[$(review_json 502 APPROVED "$FORK_SHA1"),$(review_json 503 APPROVED "$FORK_SHA2")]"
+case "$(fork_review submitted approved "$FORK_SHA2")" in
+  *'"status":"queued"'*) ;; *) fail "approval of the new head did not re-queue it" ;; esac
+fork_runs_untrusted
+case "$(fork_review dismissed dismissed "$FORK_SHA2")" in
+  *'"status":"queued"'*) ;; *) fail "the dismissal queued no teardown" ;; esac
+fake_put reviews/e2e/mock/1002 "[$(review_json 502 APPROVED "$FORK_SHA1"),$(review_json 503 DISMISSED "$FORK_SHA2")]"
+wait_for 60 "teardown after the dismissal" fork_absent
+echo "    ok: the dismissal queued a teardown; container, route and staging removed"
+
+echo "==> 4f. GHES unavailable past the grace period tears it down (fail closed)..."
+fake_put reviews/e2e/mock/1002 "[$(review_json 503 DISMISSED "$FORK_SHA2"),$(review_json 504 APPROVED "$FORK_SHA2")]"
+case "$(fork_review submitted approved "$FORK_SHA2")" in
+  *'"status":"queued"'*) ;; *) fail "a fresh approval of the open head queued no deploy" ;; esac
+fork_runs_untrusted
+ledger_clean() {
+  local l
+  l=$(fake_ledger)
+  case "$l" in *'"live":0'*) ;; *) return 1 ;; esac
+  case "$l" in *'"misuse":null'*) ;; *) fail "a token was misused: $l" ;; esac
+  [ "$(printf '%s' "$l" | sed -n 's/.*"minted":\([0-9]*\).*/\1/p')" = "$(printf '%s' "$l" | sed -n 's/.*"revoked":\([0-9]*\).*/\1/p')" ]
+}
+wait_for 15 "every GHES token revoked" ledger_clean
+kill -SIGTERM "$FAKE_PID"
+wait "$FAKE_PID" 2>/dev/null || true
+FAKE_PID=""
+down_at=$(date +%s)
+wait_for 200 "teardown of the fork after the grace period" fork_absent
+[ -n "$(fork_log 'Environment unverifiable past the grace period')" ] || fail "the teardown was not the fail-closed re-validation"
+echo "    ok: GHES down, torn down after $(( $(date +%s) - down_at ))s (interval 1m, grace 1m)"
+
+echo "==> 5. The audit trail verifies and exports while the daemon runs (D7)..."
+./bin/previewd audit verify -db "$MOCK_DIR/previewd.sqlite" || fail "audit verify failed on the live trail"
+./bin/previewd audit export -db "$MOCK_DIR/previewd.sqlite" > "$MOCK_DIR/audit.jsonl" || fail "audit export failed"
+for want in '"kind":"deploy_refused"' '"kind":"untrusted_deploy".*"actor_login":"e2e-approver","actor_id":7' \
+  '"kind":"approval_revoked".*"detail":"new_head"' '"kind":"approval_revoked".*"detail":"dismissed"' \
+  '"kind":"approval_granted".*"actor_id":7' '"kind":"teardown".*"detail":"revalidation_unavailable"' '"kind":"trusted_deploy"'; do
+  grep -q "$want" "$MOCK_DIR/audit.jsonl" || fail "audit export has no row matching $want"
+done
+if grep -q "$E2E_SECRET" "$MOCK_DIR/audit.jsonl"; then fail "a secret value reached the audit trail"; fi
+echo "    ok: chain intact, $(wc -l < "$MOCK_DIR/audit.jsonl") rows exported, every gating decision attributed"

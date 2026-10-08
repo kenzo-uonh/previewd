@@ -34,6 +34,9 @@ const (
 )
 
 func main() {
+	if code, ran := subcommand(); ran {
+		os.Exit(code)
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 

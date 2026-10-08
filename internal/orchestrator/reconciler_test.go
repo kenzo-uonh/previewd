@@ -829,7 +829,7 @@ func TestRevalidatorRevokesALostApproval(t *testing.T) {
 	r.auth.set(nil, func(store.Job) error {
 		return refuse(store.RevokedDismissed, "review 100 is DISMISSED")
 	})
-	rec.revalidateOnce(context.Background(), map[string]time.Time{})
+	rec.revalidateOnce(context.Background(), map[string]*streak{})
 	jobs := r.jobs()
 	if j := jobs[len(jobs)-1]; j.Type != store.JobTeardown || j.Origin != store.OriginRevalidation || j.Status != store.StatusQueued {
 		t.Fatalf("latest job %+v, want a queued re-validation teardown", j)
@@ -859,7 +859,7 @@ func TestRevalidatorGracePeriod(t *testing.T) {
 		}
 		return nil
 	})
-	failing := map[string]time.Time{}
+	failing := map[string]*streak{}
 	teardowns := func() int {
 		n := 0
 		for _, j := range r.jobs() {
@@ -931,5 +931,49 @@ func TestRebootRebuildsAnUntrustedEnvironmentOnlyWithAnApproval(t *testing.T) {
 				t.Fatalf("not approved: %+v running %v calls %v", last, r.running(), r.engine.calls)
 			}
 		})
+	}
+}
+
+// The grace is counted in checks as well as in time: with grace equal to
+// the interval, the second consecutive failure tears down even when it
+// returns a little less than one interval after the first (E2E finding:
+// otherwise jitter costs a whole extra interval).
+func TestRevalidatorGraceIgnoresJitter(t *testing.T) {
+	r := newRig(t)
+	r.interval, r.grace = time.Minute, time.Minute
+	rec := r.started()
+	r.enqueue(store.JobDeploy)
+	r.drain(rec)
+	r.auth.set(nil, func(store.Job) error { return fmt.Errorf("%w: connection refused", ErrUnavailable) })
+	failing := map[string]*streak{}
+	rec.revalidateOnce(context.Background(), failing)
+	r.now = r.now.Add(time.Minute - 100*time.Millisecond) // the first check returned late
+	rec.revalidateOnce(context.Background(), failing)
+	jobs := r.jobs()
+	if j := jobs[len(jobs)-1]; j.Type != store.JobTeardown || j.Origin != store.OriginRevalidation {
+		t.Fatalf("second consecutive failure kept the environment: %+v", j)
+	}
+}
+
+func TestStreakExhausted(t *testing.T) {
+	t0 := time.Unix(1_800_000_000, 0)
+	for _, tc := range []struct {
+		interval, grace time.Duration
+		failures        int64
+		elapsed         time.Duration
+		want            bool
+	}{
+		{time.Minute, time.Minute, 1, 0, false},
+		{time.Minute, time.Minute, 2, 59 * time.Second, true},
+		{10 * time.Minute, 30 * time.Minute, 3, 20 * time.Minute, false},
+		{10 * time.Minute, 30 * time.Minute, 4, 29 * time.Minute, true},
+		{10 * time.Minute, 25 * time.Minute, 4, 25 * time.Minute, true}, // ceil(25/10) = 3 intervals
+		{10 * time.Minute, 25 * time.Minute, 3, 24 * time.Minute, false},
+		{10 * time.Minute, 30 * time.Minute, 2, 30 * time.Minute, true}, // passes ran late: wall time decides
+	} {
+		s := &streak{since: t0, failures: tc.failures}
+		if got := s.exhausted(t0.Add(tc.elapsed), tc.interval, tc.grace); got != tc.want {
+			t.Errorf("%+v: exhausted = %v", tc, got)
+		}
 	}
 }

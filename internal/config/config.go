@@ -95,10 +95,7 @@ func Load() (*Config, error) {
 		apiPort = p
 	}
 
-	dbPath := os.Getenv("PREVIEWD_DB_PATH")
-	if dbPath == "" {
-		dbPath = "previewd.sqlite"
-	}
+	dbPath := DBPath()
 
 	dockerHost := os.Getenv("DOCKER_HOST")
 	if dockerHost == "" {
@@ -266,6 +263,15 @@ func Load() (*Config, error) {
 		AllowPlaintextWebhooks:  plaintext,
 		WebhookAllowedCIDRs:     cidrs,
 	}, nil
+}
+
+// DBPath is PREVIEWD_DB_PATH, previewd.sqlite when unset. The audit
+// subcommands read it without the daemon's other keys.
+func DBPath() string {
+	if p := os.Getenv("PREVIEWD_DB_PATH"); p != "" {
+		return p
+	}
+	return "previewd.sqlite"
 }
 
 // repoSet reads a comma-separated owner/repo list. Unset or empty is the

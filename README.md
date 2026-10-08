@@ -16,7 +16,8 @@
 .
 ├── cmd/
 │   └── previewd/
-│       └── main.go                # Single binary entry point initializing config, store, and HTTP server.
+│       ├── main.go                # Single binary entry point initializing config, store, and HTTP server.
+│       └── audit.go               # `previewd audit verify|export`: read-only check and JSON Lines export of the audit trail.
 ├── deployments/
 │   ├── docker-compose.yml         # Traefik: digest-pinned, read-only, no socket, routes dir mounted read-only.
 │   └── traefik.yml                # Traefik static configuration: file provider only, no API, no telemetry.
@@ -92,7 +93,7 @@ make run
 ```
 
 
-* **Execute End-to-End Tests:** Run the air-gapped validation suite using a locally generated bare Git repository to verify the complete environment lifecycle against a fake GHES (`test/e2e/fakegithub`, build tag `e2e`, its own test PKI, never part of the daemon): the TLS listener, approvals judged from GHES with every token scoped and revoked, signature check, secrets only through the read-only mount, routing through the route document (no label, no socket), the internal network shared only with Traefik, Traefik unreachable from the PR container, and teardown of container, network, route and staged secrets. It mounts a ramfs with sudo; `E2E_STAGING=tmpfs make e2e` uses `/dev/shm` with `PREVIEWD_ALLOW_TMPFS_SECRETS=1` instead. Needs `busybox:latest` loaded locally.
+* **Execute End-to-End Tests:** Run the air-gapped validation suite using a locally generated bare Git repository to verify the complete environment lifecycle against a fake GHES (`test/e2e/fakegithub`, build tag `e2e`, its own test PKI, never part of the daemon): the TLS listener, approvals judged from GHES with every token scoped and revoked, signature check, secrets only through the read-only mount, routing through the route document (no label, no socket), the internal network shared only with Traefik, Traefik unreachable from the PR container, teardown of container, network, route and staged secrets, the approval gating flow on a fork PR (parked without a build, still parked on an approval of another commit, deployed with the `:untrusted` secret section only on an approval of its head, torn down by a push, by a dismissal, and by GHES down past the re-validation grace), and `previewd audit verify|export` on the live database. Re-validation runs at its minimum interval and grace (1m each), so the suite takes a few minutes. It mounts a ramfs with sudo; `E2E_STAGING=tmpfs make e2e` uses `/dev/shm` with `PREVIEWD_ALLOW_TMPFS_SECRETS=1` instead. Needs `busybox:latest` loaded locally.
 
 
 ```bash
@@ -266,6 +267,17 @@ ramfs is never swapped. A reboot discards it, together with every staged secret.
 7. **Queue:** one SQLite transaction records the delivery (`internal/store/jobs.go`). A delivery whose GUID or whose body (SHA-256) was already recorded is a duplicate (200). The body check matters because the header is unsigned, so a captured body resent under a new GUID is still refused. A delivery not newer than every job of its environment, whatever that job's status, and than its watermark (the highest seq of pruned jobs), is stale (202, nothing queued). Otherwise a job is queued (202) and a worker woken. `opened`, `reopened` and `synchronize` queue a deploy, `closed` a teardown. An accepted deploy also revokes, in the same transaction, the approvals of every other commit of the pull request (V1 approval gating, `docs/specs/V1-previewd.md`).
 
 The database is at schema version 3. The first start of this version migrates a version-2 file in one transaction, then converts it once to incremental `auto_vacuum` with a `VACUUM` (temporary disk space up to the database size); the daemon refuses to start if either fails.
+
+## Audit Trail
+
+Every authorization decision (approval granted or revoked, trusted or untrusted deploy and its approver, refusal, re-validation teardown, full-secrets opt-in) is an `audit_events` row, written in the transaction of the job transition it causes. Rows are append-only (SQLite triggers) and hash-chained: `hash = SHA-256(prev_hash || "previewd-audit-v1\n" || <len>:<column>, … from id to detail)`, 64 zeros before the first row. The table is never pruned.
+
+```bash
+previewd audit verify [-db PATH] [-head HASH]   # exit 0: "audit chain intact: N rows, head H"; exit 1: BROKEN
+previewd audit export [-db PATH] > audit.jsonl   # verified first; a broken chain writes nothing and exits 1
+```
+
+Both open the database read-only (never migrated, this binary's schema version only) and need none of the daemon's keys or credentials; `PATH` defaults to `PREVIEWD_DB_PATH`. They run beside the daemon or on a copy. A chain truncated from the end is still a valid chain: record the head hash outside the host (with each export, in a ticket) and pass it to `-head`, which fails when the chain no longer contains it. Exit 2 is a usage or read error.
 
 ## Reconciliation
 
