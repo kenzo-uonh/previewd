@@ -46,9 +46,19 @@ func TestBoundedDuration(t *testing.T) {
 	}
 }
 
+// minimalEnv sets the keys Load requires.
+func minimalEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("PREVIEWD_WEBHOOK_SECRET", "s3cret")
+	t.Setenv("PREVIEWD_GHES_URL", "https://ghes.corp")
+	t.Setenv("PREVIEWD_GITHUB_APP_ID", "31337")
+	t.Setenv("PREVIEWD_TLS_CERT_FILE", "/etc/previewd/tls.pem")
+	t.Setenv("PREVIEWD_TLS_KEY_CREDENTIAL", "tls-key")
+}
+
 // The approval keys fail closed: a malformed value refuses to start.
 func TestLoadApprovalKeys(t *testing.T) {
-	t.Setenv("PREVIEWD_WEBHOOK_SECRET", "s3cret")
+	minimalEnv(t)
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -79,5 +89,57 @@ func TestLoadApprovalKeys(t *testing.T) {
 				t.Fatalf("%s=%q accepted", key, bad)
 			}
 		})
+	}
+}
+
+// The GHES and listener keys fail closed: missing, malformed or
+// contradictory values refuse to start.
+func TestLoadGHESAndListenerKeys(t *testing.T) {
+	minimalEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GHESURL != "https://ghes.corp" || cfg.GitHubAppID != 31337 || cfg.GitHubAppKeyCredential != "github-app-key" ||
+		cfg.TLSCertFile != "/etc/previewd/tls.pem" || cfg.TLSKeyCredential != "tls-key" || cfg.AllowPlaintextWebhooks ||
+		cfg.WebhookAllowedCIDRs != nil {
+		t.Fatalf("cfg = %+v", cfg)
+	}
+	t.Setenv("PREVIEWD_WEBHOOK_ALLOWED_CIDRS", "10.0.0.0/8")
+	if cfg, err = Load(); err != nil || len(cfg.WebhookAllowedCIDRs) != 1 {
+		t.Fatalf("CIDRs = %v, %v", cfg, err)
+	}
+
+	for name, env := range map[string]map[string]string{
+		"no GHES URL":            {"PREVIEWD_GHES_URL": ""},
+		"plaintext GHES URL":     {"PREVIEWD_GHES_URL": "http://ghes.corp"},
+		"GHES URL with path":     {"PREVIEWD_GHES_URL": "https://ghes.corp/api/v3"},
+		"no App ID":              {"PREVIEWD_GITHUB_APP_ID": ""},
+		"zero App ID":            {"PREVIEWD_GITHUB_APP_ID": "0"},
+		"App key as a path":      {"PREVIEWD_GITHUB_APP_KEY_CREDENTIAL": "/etc/previewd/app.pem"},
+		"empty App key name":     {"PREVIEWD_GITHUB_APP_KEY_CREDENTIAL": ""},
+		"no TLS certificate":     {"PREVIEWD_TLS_CERT_FILE": ""},
+		"no TLS key":             {"PREVIEWD_TLS_KEY_CREDENTIAL": ""},
+		"TLS key as a path":      {"PREVIEWD_TLS_KEY_CREDENTIAL": "../tls.key"},
+		"plaintext and TLS":      {"PREVIEWD_ALLOW_PLAINTEXT_WEBHOOKS": "1"},
+		"plaintext opt-in typo":  {"PREVIEWD_ALLOW_PLAINTEXT_WEBHOOKS": "yes", "PREVIEWD_TLS_CERT_FILE": "", "PREVIEWD_TLS_KEY_CREDENTIAL": ""},
+		"CIDR with an empty one": {"PREVIEWD_WEBHOOK_ALLOWED_CIDRS": "10.0.0.0/8,"},
+		"CIDR host bits":         {"PREVIEWD_WEBHOOK_ALLOWED_CIDRS": "10.1.2.3/8"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for k, v := range env {
+				t.Setenv(k, v)
+			}
+			if _, err := Load(); err == nil {
+				t.Fatalf("%v accepted", env)
+			}
+		})
+	}
+
+	t.Setenv("PREVIEWD_ALLOW_PLAINTEXT_WEBHOOKS", "1")
+	t.Setenv("PREVIEWD_TLS_CERT_FILE", "")
+	t.Setenv("PREVIEWD_TLS_KEY_CREDENTIAL", "")
+	if cfg, err = Load(); err != nil || !cfg.AllowPlaintextWebhooks {
+		t.Fatalf("plaintext opt-in = %+v, %v", cfg, err)
 	}
 }

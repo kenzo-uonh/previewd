@@ -35,14 +35,10 @@ func (s *Server) approver(log *slog.Logger, repo string, id int64, login string)
 
 // truth reads GHES in the step that records an approval or a revocation:
 // whether the environment is trusted, and whether commit is the open head.
-// Without the client, or on any failed read, both are false: no approval
-// queues a deploy, and a revocation is judged as for an untrusted
-// environment. AuthorizeDeploy reads GHES again before anything runs.
+// On any failed read both are false: no approval queues a deploy, and a
+// revocation is judged as for an untrusted environment. AuthorizeDeploy
+// reads GHES again before anything runs.
 func (s *Server) truth(r *http.Request, log *slog.Logger, repo string, number uint32, commit string) (trusted, openHead bool) {
-	if s.github == nil {
-		log.Warn("No GHES client: approval judged without GitHub truth (fail closed)")
-		return false, false
-	}
 	ctx, cancel := context.WithTimeout(r.Context(), ghesTimeout)
 	defer cancel()
 	pr, err := s.github.PullRequest(ctx, repo, number)
@@ -50,16 +46,7 @@ func (s *Server) truth(r *http.Request, log *slog.Logger, repo string, number ui
 		log.Warn("GHES unavailable: approval judged without GitHub truth (fail closed)", "error", err)
 		return false, false
 	}
-	openHead = pr.Open && pr.HeadSHA == commit
-	if pr.HeadRepo != repo || pr.OpenerLogin == "" {
-		return false, openHead
-	}
-	permission, err := s.github.Permission(ctx, repo, pr.OpenerLogin)
-	if err != nil {
-		log.Warn("GHES unavailable: opener permission unknown, judged untrusted (fail closed)", "error", err)
-		return false, openHead
-	}
-	return vcs.Trusted(pr, repo, permission), openHead
+	return vcs.Trusted(pr, repo), pr.Open && pr.HeadSHA == commit
 }
 
 func (s *Server) handleReview(w http.ResponseWriter, r *http.Request, in inbound, body []byte) {

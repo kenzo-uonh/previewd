@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"strconv"
 	"time"
@@ -32,13 +33,27 @@ type Config struct {
 	LabelApproval  bool   // PREVIEWD_LABEL_APPROVAL opt-in
 	ApprovalLabel  string // the label that approves when LabelApproval is set
 	DeliveryMaxAge time.Duration
+
+	// GHES (V1 F4, C3): read as a GitHub App. The key is a systemd
+	// credential name, never a path.
+	GHESURL                string // https://host[:port]
+	GHESCAFile             string // site CA bundle; "" for the system roots
+	GitHubAppID            int64
+	GitHubAppKeyCredential string
+
+	// Webhook listener (V1 F4, C2). TLS unless AllowPlaintextWebhooks.
+	TLSCertFile            string
+	TLSKeyCredential       string
+	AllowPlaintextWebhooks bool
+	WebhookAllowedCIDRs    []netip.Prefix
 }
 
 const (
-	defaultApprovalLabel  = "previewd-approved"
-	defaultDeliveryMaxAge = 15 * time.Minute
-	minDeliveryMaxAge     = time.Minute
-	maxDeliveryMaxAge     = 2 * time.Hour
+	defaultAppKeyCredential = "github-app-key" // #nosec G101 -- the name of a systemd credential, not a credential
+	defaultApprovalLabel    = "previewd-approved"
+	defaultDeliveryMaxAge   = 15 * time.Minute
+	minDeliveryMaxAge       = time.Minute
+	maxDeliveryMaxAge       = 2 * time.Hour
 )
 
 // defaultStagingDir mirrors secrets.DefaultStagingDir; config imports
@@ -148,6 +163,38 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	ghesURL, err := validate.GHESURL(os.Getenv("PREVIEWD_GHES_URL"))
+	if err != nil {
+		return nil, fmt.Errorf("PREVIEWD_GHES_URL is required: %w", err)
+	}
+	appID, err := strconv.ParseInt(os.Getenv("PREVIEWD_GITHUB_APP_ID"), 10, 64)
+	if err != nil || appID < 1 {
+		return nil, fmt.Errorf("PREVIEWD_GITHUB_APP_ID is required: a positive integer")
+	}
+	appKey, err := credentialName("PREVIEWD_GITHUB_APP_KEY_CREDENTIAL", defaultAppKeyCredential)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := optIn("PREVIEWD_ALLOW_PLAINTEXT_WEBHOOKS")
+	if err != nil {
+		return nil, err
+	}
+	certFile, keyCred := os.Getenv("PREVIEWD_TLS_CERT_FILE"), os.Getenv("PREVIEWD_TLS_KEY_CREDENTIAL")
+	switch {
+	case plaintext && (certFile != "" || keyCred != ""):
+		return nil, fmt.Errorf("PREVIEWD_ALLOW_PLAINTEXT_WEBHOOKS=1 contradicts PREVIEWD_TLS_CERT_FILE and PREVIEWD_TLS_KEY_CREDENTIAL: set one or the other")
+	case !plaintext && (certFile == "" || keyCred == ""):
+		return nil, fmt.Errorf("PREVIEWD_TLS_CERT_FILE and PREVIEWD_TLS_KEY_CREDENTIAL are required: webhooks arrive over TLS (or set PREVIEWD_ALLOW_PLAINTEXT_WEBHOOKS=1)")
+	case keyCred != "":
+		if err := validate.CredentialName(keyCred); err != nil {
+			return nil, fmt.Errorf("invalid PREVIEWD_TLS_KEY_CREDENTIAL: %w", err)
+		}
+	}
+	cidrs, err := validate.CIDRs(os.Getenv("PREVIEWD_WEBHOOK_ALLOWED_CIDRS"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid PREVIEWD_WEBHOOK_ALLOWED_CIDRS: %w", err)
+	}
+
 	return &Config{
 		APIPort:             apiPort,
 		DBPath:              dbPath,
@@ -167,7 +214,28 @@ func Load() (*Config, error) {
 		LabelApproval:       labelApproval,
 		ApprovalLabel:       approvalLabel,
 		DeliveryMaxAge:      maxAge,
+
+		GHESURL:                ghesURL,
+		GHESCAFile:             os.Getenv("PREVIEWD_GHES_CA_FILE"),
+		GitHubAppID:            appID,
+		GitHubAppKeyCredential: appKey,
+		TLSCertFile:            certFile,
+		TLSKeyCredential:       keyCred,
+		AllowPlaintextWebhooks: plaintext,
+		WebhookAllowedCIDRs:    cidrs,
 	}, nil
+}
+
+// credentialName reads a systemd credential name, def when unset.
+func credentialName(name, def string) (string, error) {
+	v, set := os.LookupEnv(name)
+	if !set {
+		return def, nil
+	}
+	if err := validate.CredentialName(v); err != nil {
+		return "", fmt.Errorf("invalid %s: %w", name, err)
+	}
+	return v, nil
 }
 
 // boundedDuration reads a Go duration. Unset means def; anything outside

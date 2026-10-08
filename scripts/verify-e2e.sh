@@ -11,6 +11,14 @@ E2E_STAGING="${E2E_STAGING:-ramfs}"
 DOMAIN="local.previewd"
 AGENT_PID=""
 GIT_SERVER_PID=""
+FAKE_PID=""
+PKI_DIR=""
+# The daemon's webhook listener is TLS (C2); the fake GHES (C3) serves the
+# GitHub App API on loopback with the same test CA.
+AGENT_URL="https://localhost:8080"
+GHES_ADDR="127.0.0.1:18443"
+GHES_URL="https://$GHES_ADDR"
+E2E_APP_ID=31337
 E2E_SECRET="e2e-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 WEBHOOK_SECRET="hook-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 
@@ -37,10 +45,13 @@ uuid1() {
 # send_webhook EVENT BODY [DELIVERY]: POST a webhook signed exactly as GitHub
 # does (the signature covers the body only), with a fresh delivery GUID unless
 # one is given.
+# agent_curl: curl to the daemon's listener, trusting only the test CA.
+agent_curl() { curl --cacert "$PKI_DIR/ca.pem" "$@"; }
+
 send_webhook() {
   local sig delivery="${3:-$(uuid1)}"
   sig=$(printf '%s' "$2" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | sed 's/^.*= //')
-  curl -s -X POST http://localhost:8080/webhooks/github \
+  agent_curl -s -X POST "$AGENT_URL/webhooks/github" \
     -H "X-GitHub-Event: $1" \
     -H "X-GitHub-Delivery: $delivery" \
     -H "X-Hub-Signature-256: sha256=$sig" \
@@ -53,7 +64,7 @@ send_webhook() {
 send_webhook_code() {
   local sig delivery="${3:-$(uuid1)}"
   sig=$(printf '%s' "$2" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | sed 's/^.*= //')
-  curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8080/webhooks/github \
+  agent_curl -s -o /dev/null -w '%{http_code}' -X POST "$AGENT_URL/webhooks/github" \
     -H "X-GitHub-Event: $1" \
     -H "X-GitHub-Delivery: $delivery" \
     -H "X-Hub-Signature-256: sha256=$sig" \
@@ -76,6 +87,7 @@ cleanup() {
   echo -e "\n\n==> Shutting down and cleaning up..."
   if [ -n "$AGENT_PID" ]; then kill -SIGTERM "$AGENT_PID" 2>/dev/null || true; fi
   if [ -n "$GIT_SERVER_PID" ]; then kill -SIGTERM "$GIT_SERVER_PID" 2>/dev/null || true; fi
+  if [ -n "$FAKE_PID" ]; then kill -SIGTERM "$FAKE_PID" 2>/dev/null || true; fi
 
   cd "$PROJECT_ROOT"
   PREVIEWD_ROUTES_DIR="$ROUTES_DIR" make docker-down >/dev/null 2>&1 || true
@@ -135,6 +147,29 @@ case "$mounts" in *.sock*) fail "Traefik mounts a socket: $mounts" ;; esac
 case "$(docker inspect traefik-proxy --format '{{json .Args}}')" in *providers.docker*) fail "Traefik Docker provider enabled" ;; esac
 echo "    ok: no socket mounted, no Docker provider"
 
+echo "==> Starting the fake GHES (GitHub App API over TLS, e2e build tag)..."
+PKI_DIR="$MOCK_DIR/pki"
+mkdir -p "$PKI_DIR"
+go build -tags e2e -o "$MOCK_DIR/fakegithub" ./test/e2e/fakegithub
+"$MOCK_DIR/fakegithub" init -dir "$PKI_DIR"
+"$MOCK_DIR/fakegithub" serve -dir "$PKI_DIR" -listen "$GHES_ADDR" -app-id "$E2E_APP_ID" -installation 77 \
+  >>"$MOCK_DIR/fakegithub.log" 2>&1 &
+FAKE_PID=$!
+# fake_put PATH JSON: set the fake's GitHub truth.
+fake_put() { curl -sf --cacert "$PKI_DIR/ca.pem" -X PUT -H 'Content-Type: application/json' -d "$2" "$GHES_URL/_fake/$1"; }
+fake_ledger() { curl -sf --cacert "$PKI_DIR/ca.pem" "$GHES_URL/_fake/ledger"; }
+wait_for 15 "the fake GHES" fake_ledger
+fake_put pulls/e2e/mock/999 "{\"state\":\"open\",\"head_sha\":\"$MOCK_SHA\",\"head_repo\":\"e2e/mock\",\"opener\":{\"login\":\"e2e-opener\",\"id\":4242}}"
+fake_put permissions/e2e/mock/e2e-opener '{"id":4242,"permission":"write"}'
+# The App key and the listener key reach the daemon as systemd credentials:
+# by name under CREDENTIALS_DIRECTORY, never as a configured path.
+CREDS_DIR="$MOCK_DIR/creds"
+mkdir -m 0700 "$CREDS_DIR"
+cp "$PKI_DIR/app-key.pem" "$CREDS_DIR/github-app-key"
+cp "$PKI_DIR/listener-key.pem" "$CREDS_DIR/listener-key"
+chmod 0400 "$CREDS_DIR"/*
+echo "    ok: fake GHES on $GHES_URL, test CA, App key and listener key as credentials"
+
 echo "==> Compiling CGO-free static binary..."
 make build
 
@@ -166,9 +201,17 @@ start_agent() {
     PREVIEWD_ROUTES_DIR="$ROUTES_DIR" \
     PREVIEWD_TRAEFIK_DOMAIN="$DOMAIN" \
     PREVIEWD_DB_PATH="$MOCK_DIR/previewd.sqlite" \
+    PREVIEWD_GHES_URL="$GHES_URL" \
+    PREVIEWD_GHES_CA_FILE="$PKI_DIR/ca.pem" \
+    PREVIEWD_GITHUB_APP_ID="$E2E_APP_ID" \
+    PREVIEWD_TLS_CERT_FILE="$PKI_DIR/listener.pem" \
+    PREVIEWD_TLS_KEY_CREDENTIAL=listener-key \
+    PREVIEWD_WEBHOOK_ALLOWED_CIDRS=127.0.0.0/8,::1/128 \
+    PREVIEWD_APPROVERS=e2e/mock:e2e-approver#7 \
+    CREDENTIALS_DIRECTORY="$CREDS_DIR" \
     ./bin/previewd >>"$MOCK_DIR/agent.log" 2>&1 &
   AGENT_PID=$!
-  wait_for 30 "the agent to serve" curl -sf http://localhost:8080/healthz
+  wait_for 30 "the agent to serve" agent_curl -sf "$AGENT_URL/healthz"
 }
 
 echo "==> Starting previewd agent in background..."
@@ -178,10 +221,19 @@ echo "==> 1. Testing Ping Handshake..."
 send_webhook ping '{}'
 
 echo -e "\n\n==> 1b. Unsigned webhook must be rejected..."
-code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8080/webhooks/github \
+code=$(agent_curl -s -o /dev/null -w '%{http_code}' -X POST "$AGENT_URL/webhooks/github" \
   -H "X-GitHub-Event: ping" -H "Content-Type: application/json" -d '{}')
 [ "$code" = "401" ] || fail "unsigned webhook answered $code, want 401"
 echo "    ok: unsigned webhook rejected (401)"
+
+echo -e "\n==> 1a. The listener speaks TLS 1.2+ only (C2, V1-I8)..."
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8080/webhooks/github -d '{}' || true)
+[ "$code" = "400" ] || fail "plaintext request answered $code, want the TLS stack's 400"
+if curl -s -o /dev/null --cacert "$PKI_DIR/ca.pem" --tlsv1.0 --tls-max 1.1 "$AGENT_URL/healthz"; then
+  fail "a TLS 1.1 handshake was accepted"
+fi
+if curl -s -o /dev/null "$AGENT_URL/healthz"; then fail "the listener certificate verified without the test CA"; fi
+echo "    ok: plaintext refused, TLS 1.1 refused, certificate chains to the site CA only"
 
 # PR_BODY_AT ACTION UPDATED_AT: a pull_request body whose signed time is
 # UPDATED_AT. The delivery GUID must fall within [UPDATED_AT - 5 min,
@@ -197,9 +249,9 @@ PR_BODY() { PR_BODY_AT "$1" "$PR_UPDATED_AT"; }
 echo -e "\n==> 1c. Delivery GUIDs that cannot be ordered are rejected..."
 for bad in "" "3f1c6b2e-9a7d-4c1b-8e2f-0a1b2c3d4e5f" "not-a-uuid"; do
   sig=$(printf '%s' "$(PR_BODY opened)" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | sed 's/^.*= //')
-  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8080/webhooks/github \
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$AGENT_URL/webhooks/github" \
     -H "X-GitHub-Event: pull_request" -H "X-GitHub-Delivery: $bad" \
-    -H "X-Hub-Signature-256: sha256=$sig" --data-binary "$(PR_BODY opened)")
+    -H "X-Hub-Signature-256: sha256=$sig" --data-binary "$(PR_BODY opened)" --cacert "$PKI_DIR/ca.pem")
   [ "$code" = "400" ] || fail "delivery GUID '$bad' answered $code, want 400"
 done
 echo "    ok: missing, version 4 and malformed delivery GUIDs rejected (400)"
@@ -317,6 +369,40 @@ if docker inspect "$BROKEN_ENV" >/dev/null 2>&1; then fail "a container exists f
 [ ! -e "$ROUTES_DIR/$BROKEN_ENV.yml" ] || fail "a route exists for the failed build"
 [ ! -e "$STAGING_DIR/$BROKEN_ENV" ] || fail "staged secrets exist for the failed build"
 echo "    ok: failed RUN reported as a build failure; no container, route or staging"
+
+echo "==> 2g. Approvals judged against GHES truth, read with scoped tokens revoked after use (C3)..."
+NOW_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+# REVIEW_BODY ACTION STATE NUMBER REF COMMIT HEAD_REPO OPENER_LOGIN OPENER_ID
+REVIEW_BODY() {
+  printf '{"action":"%s","review":{"id":%d,"user":{"login":"e2e-approver","id":7},"commit_id":"%s","state":"%s","submitted_at":"%s"},"pull_request":{"number":%d,"head":{"ref":"%s","sha":"%s","repo":{"full_name":"%s"}},"user":{"login":"%s","id":%d},"updated_at":"%s"},"repository":{"full_name":"e2e/mock","clone_url":"file://%s/mock.git"},"sender":{"login":"e2e-approver","id":7}}' \
+    "$1" "$(( RANDOM + 1 ))" "$5" "$2" "$NOW_TS" "$3" "$4" "$5" "$6" "$7" "$8" "$NOW_TS" "$MOCK_DIR"
+}
+# Same-repository PR, opener with write (GHES): trusted. Its approval and
+# a change request are recorded; nothing is queued, nothing torn down.
+case "$(send_webhook pull_request_review "$(REVIEW_BODY submitted approved 999 e2e/branch "$MOCK_SHA" e2e/mock e2e-opener 4242)")" in
+  *'"status":"recorded"'*) ;; *) fail "approval of the trusted PR not recorded without a job" ;; esac
+case "$(send_webhook pull_request_review "$(REVIEW_BODY submitted changes_requested 999 e2e/branch "$MOCK_SHA" e2e/mock e2e-opener 4242)")" in
+  *'"status":"recorded"'*) ;; *) fail "change request on the trusted PR not recorded without a teardown" ;; esac
+sleep 2
+docker inspect "$ENV_ID" >/dev/null 2>&1 || fail "the trusted environment was torn down by a change request"
+# A fork whose head GHES reports elsewhere: the approval is recorded, and
+# queues no deploy, since the approved commit is not the open head.
+fake_put pulls/e2e/mock/1001 "{\"state\":\"open\",\"head_sha\":\"$BROKEN_SHA\",\"head_repo\":\"outside/mock\",\"opener\":{\"login\":\"outsider\",\"id\":555}}"
+case "$(send_webhook pull_request_review "$(REVIEW_BODY submitted approved 1001 e2e/fork "$MOCK_SHA" outside/mock outsider 555)")" in
+  *'"status":"recorded"'*) ;; *) fail "approval of a commit GHES no longer heads was not recorded without a job" ;; esac
+# A review by an account outside PREVIEWD_APPROVERS reads nothing.
+before=$(fake_ledger | sed -n 's/.*"minted":\([0-9]*\).*/\1/p')
+case "$(send_webhook pull_request_review "$(REVIEW_BODY submitted approved 999 e2e/branch "$MOCK_SHA" e2e/mock e2e-opener 4242 | sed 's/"login":"e2e-approver","id":7},"commit_id"/"login":"stranger","id":99},"commit_id"/')")" in
+  *'"status":"ignored"'*) ;; *) fail "a stranger's approval was not ignored" ;; esac
+[ "$(fake_ledger | sed -n 's/.*"minted":\([0-9]*\).*/\1/p')" = "$before" ] || fail "a stranger's review minted a token"
+ledger=$(fake_ledger)
+minted=$(printf '%s' "$ledger" | sed -n 's/.*"minted":\([0-9]*\).*/\1/p')
+revoked=$(printf '%s' "$ledger" | sed -n 's/.*"revoked":\([0-9]*\).*/\1/p')
+[ "$minted" -ge 3 ] && [ "$minted" = "$revoked" ] || fail "tokens minted $minted, revoked $revoked: $ledger"
+case "$ledger" in *'"live":0'*) ;; *) fail "a token is still live: $ledger" ;; esac
+case "$ledger" in *'"misuse":null'*) ;; *) fail "a token was misused: $ledger" ;; esac
+case "$ledger" in *'contents'*|*':write'*) fail "a token carried more than read on pull requests: $ledger" ;; esac
+echo "    ok: trusted and untrusted judged from GHES; $minted tokens, each scoped to e2e/mock, read-only, revoked"
 
 echo "==> 3. Testing Exhaustive Teardown (Action: closed)..."
 case "$(send_webhook pull_request "$(PR_BODY closed)")" in

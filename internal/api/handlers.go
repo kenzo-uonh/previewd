@@ -34,8 +34,9 @@ const (
 	// disconnects: a delivery is either recorded or answered with an error.
 	enqueueTimeout = 10 * time.Second
 
-	// ghesTimeout bounds the GHES reads one approval or revocation needs.
-	ghesTimeout = 5 * time.Second
+	// ghesTimeout bounds the GHES read one approval or revocation needs:
+	// installation, token, pull request, permission, revocation.
+	ghesTimeout = 8 * time.Second
 )
 
 // Queue records deliveries (store.Store).
@@ -48,13 +49,12 @@ type Queue interface {
 // GitHub is the GHES truth read in the step that records an approval or a
 // revocation (V1 spec 3.4): whether the environment is trusted (the head
 // lives in the base repository and its opener can write there, D-V1-5) and
-// whether the approved commit is the open head. The client is phase C3.
-// Without it, or when a read fails, the handler fails closed: an approval is
-// recorded but queues no deploy, and a revocation is judged as for an
-// untrusted environment.
+// whether the approved commit is the open head. vcs.Client implements it
+// (C3). When a read fails, the handler fails closed: an approval is recorded
+// but queues no deploy, and a revocation is judged as for an untrusted
+// environment.
 type GitHub interface {
 	PullRequest(ctx context.Context, repo string, number uint32) (vcs.PRState, error)
-	Permission(ctx context.Context, repo, login string) (string, error)
 }
 
 // Waker is told when a job was queued (orchestrator.Reconciler).
@@ -68,12 +68,11 @@ type Server struct {
 	cfg    *config.Config
 	queue  Queue
 	waker  Waker
-	github GitHub // nil until the GHES client (C3) is configured
+	github GitHub
 	now    func() time.Time
 }
 
-// NewServer initializes the HTTP API controller. github may be nil: see
-// GitHub.
+// NewServer initializes the HTTP API controller.
 func NewServer(logger *slog.Logger, cfg *config.Config, queue Queue, waker Waker, github GitHub) *Server {
 	return &Server{logger: logger, cfg: cfg, queue: queue, waker: waker, github: github, now: time.Now}
 }
@@ -84,8 +83,11 @@ func (s *Server) Routes() http.Handler {
 
 	mux.HandleFunc("GET /healthz", s.handleHealthCheck())
 
+	// The source filter runs first: a peer outside the allowed CIDRs is
+	// refused before the signature check reads the body.
 	webhookHandler := http.HandlerFunc(s.handleGitHubWebhook())
-	mux.Handle("POST /webhooks/github", ValidateGitHubSignature([]byte(s.cfg.WebhookSecret))(webhookHandler))
+	mux.Handle("POST /webhooks/github", SourceFilter(s.cfg.WebhookAllowedCIDRs, s.logger)(
+		ValidateGitHubSignature([]byte(s.cfg.WebhookSecret))(webhookHandler)))
 
 	return mux
 }

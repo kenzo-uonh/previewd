@@ -90,7 +90,7 @@ make run
 ```
 
 
-* **Execute End-to-End Tests:** Run the air-gapped validation suite using a locally generated bare Git repository to verify the complete environment lifecycle: signature check, secrets only through the read-only mount, routing through the route document (no label, no socket), the internal network shared only with Traefik, Traefik unreachable from the PR container, and teardown of container, network, route and staged secrets. It mounts a ramfs with sudo; `E2E_STAGING=tmpfs make e2e` uses `/dev/shm` with `PREVIEWD_ALLOW_TMPFS_SECRETS=1` instead. Needs `busybox:latest` loaded locally.
+* **Execute End-to-End Tests:** Run the air-gapped validation suite using a locally generated bare Git repository to verify the complete environment lifecycle against a fake GHES (`test/e2e/fakegithub`, build tag `e2e`, its own test PKI, never part of the daemon): the TLS listener, approvals judged from GHES with every token scoped and revoked, signature check, secrets only through the read-only mount, routing through the route document (no label, no socket), the internal network shared only with Traefik, Traefik unreachable from the PR container, and teardown of container, network, route and staged secrets. It mounts a ramfs with sudo; `E2E_STAGING=tmpfs make e2e` uses `/dev/shm` with `PREVIEWD_ALLOW_TMPFS_SECRETS=1` instead. Needs `busybox:latest` loaded locally.
 
 
 ```bash
@@ -194,6 +194,26 @@ Operational parameters enforce hardware boundaries and are managed exclusively v
 * `PREVIEWD_DELIVERY_MAX_AGE`: How long after its signed time a delivery is still accepted (default: `15m`, a Go duration in 1m..2h; see V1-I7 below).
 
 
+* `PREVIEWD_GHES_URL` (required): The GitHub Enterprise Server, `https://host[:port]`, no path (the API is under `/api/v3`). previewd reads it as a GitHub App, through no proxy, following no redirect.
+
+
+* `PREVIEWD_GHES_CA_FILE`: PEM bundle of the site CA that signs the GHES certificate. When set, it is the only trust (never added to the system roots); every block must be a certificate.
+
+
+* `PREVIEWD_GITHUB_APP_ID` (required) and `PREVIEWD_GITHUB_APP_KEY_CREDENTIAL` (default `github-app-key`): The GitHub App and the name of the systemd credential holding its private key (RSA, 2048 bits or more). The App needs **Pull requests: read** (and the default **Metadata: read**), installed on the repositories previewd serves. Each read mints a token scoped to one repository, read only, and revokes it before returning.
+
+
+* `PREVIEWD_TLS_CERT_FILE` and `PREVIEWD_TLS_KEY_CREDENTIAL` (required unless the plaintext opt-in): The webhook listener's certificate chain (a file) and the systemd credential holding its key. TLS 1.2 or later, AEAD suites only. `systemctl reload`/SIGHUP re-reads both; a pair that fails to load keeps the one in use. An expired, not yet valid or mismatched pair refuses to start.
+
+
+* `PREVIEWD_ALLOW_PLAINTEXT_WEBHOOKS`: Set exactly `1` to receive webhooks in plaintext (delivery IDs and bodies readable on the network). Logged as an error at every start; contradicts the TLS keys.
+
+
+* `PREVIEWD_WEBHOOK_ALLOWED_CIDRS`: Comma-separated prefixes (`10.0.0.0/8,fd00::/8`, no host bits) of the GHES addresses that may deliver webhooks. A peer outside them gets 403 before its body is read. Unset: any source (logged as a warning).
+
+Credentials are read by name from `$CREDENTIALS_DIRECTORY`, never from a configured path: pass them with `LoadCredentialEncrypted=github-app-key:/etc/credstore.encrypted/github-app-key` (or `LoadCredential=`) in the unit. In GHES, enable SSL verification on the webhook and make the listener certificate chain to a CA GHES trusts.
+
+
 * `PREVIEWD_ROUTES_DIR`: Directory of the route documents, watched by Traefik's file provider (default: `/var/lib/previewd/routes`). Must exist (absolute path, not a symlink); the daemon refuses to start otherwise. Mounted read-only into Traefik.
 
 
@@ -219,12 +239,13 @@ ramfs is never swapped. A reboot discards it, together with every staged secret.
 
 ## Webhook Ingestion
 
+0. **Transport:** TLS 1.2+ from an allowed source (`PREVIEWD_WEBHOOK_ALLOWED_CIDRS`, checked before the body is read).
 1. **Signature:** the body is read up to 1 MiB (larger bodies get 413, never truncated). It must carry `X-Hub-Signature-256: sha256=<64 lowercase hex>`, equal to HMAC-SHA256 of the raw body under `PREVIEWD_WEBHOOK_SECRET`. Anything else gets 401.
 2. **Schema:** `pull_request` bodies need `action`, `number` (1 to 2^32-1), `pull_request.head.ref` (git ref rules), `pull_request.head.sha` (40 or 64 lowercase hex), `pull_request.head.repo` (`null` for a deleted fork, otherwise with `full_name`), `pull_request.user` and `sender` (login and numeric ID), `pull_request.updated_at` (RFC 3339), `repository.full_name` (`owner/repo`) and `repository.clone_url` (absolute, no credentials), for every action, `closed` included; `labeled` and `unlabeled` also need `label.name`. `pull_request_review` bodies need the same pull request fields (`pull_request.number`) and the review's `id`, `user`, `commit_id`, `state`, and `submitted_at` when submitted. The head repository and the opener are recorded with the job; trust is never decided from them. Acted on: `opened`, `reopened`, `synchronize`, `closed`, the approval label (below), and an approver's review that approves, requests changes or is dismissed. Other well-formed events and actions get 202 and are ignored.
 3. **Environment ID:** `pr-<number>-<10 hex of SHA-256(repo, head branch)>`. The same PR number in two repositories, or on two branches, never shares an environment.
 4. **Ordering:** `X-GitHub-Delivery` must be a canonical UUID version 1 (RFC 4122 variant). Its embedded timestamp, in 100-nanosecond intervals, orders the intents of one environment. Anything else gets 400, and so does a timestamp more than 5 minutes ahead of the host's clock. GitHub does not sign that header, and one forged far-future ID would otherwise make every later event of the environment stale. Ordering relies on the clock of the GitHub Enterprise Server that minted the IDs; keep it and the previewd host on NTP.
 5. **Signed time (V1-I7):** the GUID's time must lie within 5 minutes before and `PREVIEWD_DELIVERY_MAX_AGE` after the time the signed body carries (`pull_request.updated_at`; `review.submitted_at` for a submitted review). A body captured and resent later under a fresh GUID falls outside it. A delivery that would deploy or approve is refused there (400); one that only restricts (`closed`, a change request, a dismissal, a label removal) is processed and logged, since it can only remove.
-6. **Approvals:** an approver (`PREVIEWD_APPROVERS`, matched on the account ID) approves the exact head commit with a review, or, with `PREVIEWD_LABEL_APPROVAL=1`, by adding `PREVIEWD_APPROVAL_LABEL`. A change request by an approver, the dismissal of an approver's review, or the removal of the label (by anyone) revokes the approvals of that commit. Approvals and revocations are recorded with their delivery (replay-checked like any other) and an audit row, in any arrival order. Until the GHES client is configured (V1 phase C), an approval never queues a deploy and every revocation is judged as for an untrusted environment; the daemon logs this as an error at every start.
+6. **Approvals:** an approver (`PREVIEWD_APPROVERS`, matched on the account ID) approves the exact head commit with a review, or, with `PREVIEWD_LABEL_APPROVAL=1`, by adding `PREVIEWD_APPROVAL_LABEL`. A change request by an approver, the dismissal of an approver's review, or the removal of the label (by anyone) revokes the approvals of that commit. Approvals and revocations are recorded with their delivery (replay-checked like any other) and an audit row, in any arrival order. Each is judged against GHES read in the same request: the environment is trusted when its head lives in the repository and its opener has write access (a trusted environment is not torn down by a revocation: it needed no approval), and an approval queues a deploy only when its commit is the open head now. When GHES cannot be read, an approval queues no deploy and a revocation is judged as for an untrusted environment.
 7. **Queue:** one SQLite transaction records the delivery (`internal/store/jobs.go`). A delivery whose GUID or whose body (SHA-256) was already recorded is a duplicate (200). The body check matters because the header is unsigned, so a captured body resent under a new GUID is still refused. A delivery not newer than every job of its environment, whatever that job's status, and than its watermark (the highest seq of pruned jobs), is stale (202, nothing queued). Otherwise a job is queued (202) and a worker woken. `opened`, `reopened` and `synchronize` queue a deploy, `closed` a teardown. An accepted deploy also revokes, in the same transaction, the approvals of every other commit of the pull request (V1 approval gating, `docs/specs/V1-previewd.md`).
 
 The database is at schema version 3. The first start of this version migrates a version-2 file in one transaction, then converts it once to incremental `auto_vacuum` with a `VACUUM` (temporary disk space up to the database size); the daemon refuses to start if either fails.

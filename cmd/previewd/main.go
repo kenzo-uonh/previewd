@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -157,29 +158,54 @@ func main() {
 		close(workersDone)
 	}()
 
-	// Approval gating (V1 F1). The GHES client is phase C3: until then the
-	// handler judges approvals and revocations without GitHub truth, fail
-	// closed (no approval queues a deploy; a revocation counts as for an
-	// untrusted environment).
-	logger.Error("No GHES client configured: approvals queue no deploy and revocations are judged untrusted (phase C3)",
-		"approver_repositories", len(cfg.Approvers))
+	// Approval gating (V1 F1): GHES truth through the GitHub App (C3).
+	ghes, err := newGHESClient(cfg, logger)
+	if err != nil {
+		logger.Error("GHES client refused", "ghes_url", cfg.GHESURL, "error", err)
+		os.Exit(1)
+	}
 	if cfg.LabelApproval {
 		logger.Error("Opt-in active: an approver's label approves untrusted code",
 			"opt_in", "PREVIEWD_LABEL_APPROVAL", "label", cfg.ApprovalLabel)
 	}
-	apiServer := api.NewServer(logger, cfg, db, reconciler, nil)
+	apiServer := api.NewServer(logger, cfg, db, reconciler, ghes)
 	httpServer := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.APIPort),
 		Handler:           apiServer.Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      15 * time.Second,
+		WriteTimeout:      30 * time.Second, // an approval reads GHES before it answers
 		IdleTimeout:       60 * time.Second,
 	}
 
+	// The webhook listener (C2, V1-I8): TLS, the certificate re-read on
+	// SIGHUP, unless the plaintext opt-in is set.
+	var certs *api.CertReloader
+	if cfg.AllowPlaintextWebhooks {
+		logger.Error("Opt-in active: webhooks are received in plaintext, delivery IDs and bodies readable on the network",
+			"opt_in", "PREVIEWD_ALLOW_PLAINTEXT_WEBHOOKS")
+	} else {
+		certs, err = api.NewCertReloader(cfg.TLSCertFile, func() ([]byte, error) { return secrets.Credential(cfg.TLSKeyCredential) })
+		if err != nil {
+			logger.Error("Listener certificate refused", "cert_file", cfg.TLSCertFile, "error", err)
+			os.Exit(1)
+		}
+		httpServer.TLSConfig = api.TLSConfig(certs)
+	}
+	if len(cfg.WebhookAllowedCIDRs) == 0 {
+		logger.Warn("PREVIEWD_WEBHOOK_ALLOWED_CIDRS is unset: webhooks are accepted from any source address")
+	}
+	go reloadOnHangup(ctx, certs, logger)
+
 	go func() {
-		logger.Info("Ingress HTTP server running", "addr", httpServer.Addr)
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		logger.Info("Ingress server running", "addr", httpServer.Addr, "tls", certs != nil)
+		var err error
+		if certs != nil {
+			err = httpServer.ListenAndServeTLS("", "")
+		} else {
+			err = httpServer.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("HTTP server crash", "error", err)
 			os.Exit(1)
 		}
@@ -200,4 +226,68 @@ func main() {
 	<-workersDone
 
 	logger.Info("Agent exited cleanly.")
+}
+
+// maxCABundleBytes bounds PREVIEWD_GHES_CA_FILE.
+const maxCABundleBytes = 1 << 20
+
+// newGHESClient builds the GitHub App client: the key from its systemd
+// credential, held in memory only, the site CA when one is configured.
+func newGHESClient(cfg *config.Config, logger *slog.Logger) (*vcs.Client, error) {
+	key, err := secrets.Credential(cfg.GitHubAppKeyCredential)
+	if err != nil {
+		return nil, fmt.Errorf("GitHub App key: %w", err)
+	}
+	defer clear(key)
+	var ca []byte
+	if cfg.GHESCAFile != "" {
+		if ca, err = readBounded(cfg.GHESCAFile, maxCABundleBytes); err != nil {
+			return nil, fmt.Errorf("PREVIEWD_GHES_CA_FILE: %w", err)
+		}
+	}
+	return vcs.NewClient(vcs.ClientConfig{BaseURL: cfg.GHESURL, AppID: cfg.GitHubAppID, KeyPEM: key, CAPEM: ca, Logger: logger})
+}
+
+func readBounded(path string, limit int64) (data []byte, err error) {
+	f, err := os.Open(path) // #nosec G304 -- the operator's PREVIEWD_GHES_CA_FILE
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+	}()
+	if data, err = io.ReadAll(io.LimitReader(f, limit+1)); err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("%s exceeds %d bytes", path, limit)
+	}
+	return data, nil
+}
+
+// reloadOnHangup re-reads the listener certificate on SIGHUP; a failed
+// reload keeps the certificate in use. SIGHUP never terminates the daemon.
+func reloadOnHangup(ctx context.Context, certs *api.CertReloader, logger *slog.Logger) {
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-hup:
+			if certs == nil {
+				logger.Info("SIGHUP: plaintext listener, no certificate to reload")
+				continue
+			}
+			if err := certs.Reload(); err != nil {
+				logger.Error("SIGHUP: listener certificate reload failed, the previous one stays in use", "error", err)
+				continue
+			}
+			leaf := certs.Leaf()
+			logger.Info("SIGHUP: listener certificate reloaded", "serial", leaf.SerialNumber.String(), "not_after", leaf.NotAfter)
+		}
+	}
 }

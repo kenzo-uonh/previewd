@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -79,19 +80,16 @@ func (f *fakeQueue) recorded() int { return len(f.got) + len(f.grants) + len(f.r
 
 // fakeGitHub is GHES truth.
 type fakeGitHub struct {
-	pr         vcs.PRState
-	permission string
-	prErr      error
-	permErr    error
+	pr    vcs.PRState
+	prErr error
 }
 
 func (f *fakeGitHub) PullRequest(context.Context, string, uint32) (vcs.PRState, error) {
 	return f.pr, f.prErr
 }
 
-func (f *fakeGitHub) Permission(context.Context, string, string) (string, error) {
-	return f.permission, f.permErr
-}
+// ghesDown fails every read.
+var ghesDown = &fakeGitHub{prErr: errors.New("connection refused")}
 
 type countingWaker struct{ n int }
 
@@ -108,7 +106,7 @@ type harness struct {
 
 func newHarness() *harness {
 	return &harness{
-		q: &fakeQueue{verdict: store.VerdictAccepted, job: true}, w: &countingWaker{}, now: v1Time,
+		q: &fakeQueue{verdict: store.VerdictAccepted, job: true}, w: &countingWaker{}, gh: ghesDown, now: v1Time,
 		cfg: &config.Config{
 			WebhookSecret: testSecret, DeliveryMaxAge: 15 * time.Minute, ApprovalLabel: "previewd-approved",
 			Approvers: map[string][]validate.Approver{"acme/app": {{Login: "lead-dev", ID: 7}}},
@@ -279,5 +277,20 @@ func TestWebhookSignedTimeWindow(t *testing.T) {
 				t.Fatalf("reply %d, want 400", rec.Code)
 			}
 		})
+	}
+}
+
+// The source filter guards the webhook route: a signed delivery from outside
+// PREVIEWD_WEBHOOK_ALLOWED_CIDRS is refused (403) and nothing is recorded.
+func TestWebhookSourceFilterOnRoute(t *testing.T) {
+	h := newHarness()
+	h.cfg.WebhookAllowedCIDRs = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
+	rec := h.send(t, "pull_request", v1Delivery, prBody("opened")) // httptest peer: 192.0.2.1
+	if rec.Code != http.StatusForbidden || h.q.recorded() != 0 {
+		t.Fatalf("outside source: reply %d, recorded %d", rec.Code, h.q.recorded())
+	}
+	h.cfg.WebhookAllowedCIDRs = []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}
+	if rec := h.send(t, "pull_request", v1Delivery, prBody("opened")); rec.Code != http.StatusAccepted || len(h.q.got) != 1 {
+		t.Fatalf("allowed source: reply %d, recorded %d", rec.Code, h.q.recorded())
 	}
 }

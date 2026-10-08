@@ -41,9 +41,17 @@ func reviewBody(action, state string, reviewerID int64, commit, updatedAt string
 
 // trustedPR and forkPR are GHES truth for acme/app#7 open at its head.
 var (
-	trustedPR = &fakeGitHub{pr: vcs.PRState{Open: true, HeadSHA: headSHA, HeadRepo: "acme/app", OpenerLogin: "opener"}, permission: "write"}
-	forkPR    = &fakeGitHub{pr: vcs.PRState{Open: true, HeadSHA: headSHA, HeadRepo: "outside/app", OpenerLogin: "opener"}, permission: "write"}
+	opener    = vcs.Account{Login: "opener", ID: 4242}
+	trustedPR = &fakeGitHub{pr: vcs.PRState{Open: true, HeadSHA: headSHA, HeadRepo: "acme/app", Opener: opener, OpenerPermission: "write"}}
+	forkPR    = &fakeGitHub{pr: vcs.PRState{Open: true, HeadSHA: headSHA, HeadRepo: "outside/app", Opener: opener}}
 )
+
+// prWith is trustedPR's state with one change.
+func prWith(change func(*vcs.PRState)) *fakeGitHub {
+	st := trustedPR.pr
+	change(&st)
+	return &fakeGitHub{pr: st}
+}
 
 func wantSource(commit string) store.Source {
 	return store.Source{Repo: "acme/app", HeadRepo: "acme/app", PRNumber: 7, OpenerLogin: "opener", OpenerID: 4242,
@@ -194,27 +202,24 @@ func TestLabelApproval(t *testing.T) {
 	}
 }
 
-// GitHub truth fails closed: without the client, on any failed read, for a
-// fork, a deleted head repository or an opener without write access, the
-// environment is untrusted; the commit is the open head only if GHES says
-// so now.
+// GitHub truth fails closed: on any failed read, for a fork, a deleted head
+// repository or an opener without write access, the environment is
+// untrusted; the commit is the open head only if GHES says so now.
 func TestApprovalGitHubTruth(t *testing.T) {
-	down := errors.New("connection refused")
 	for name, tc := range map[string]struct {
 		gh                GitHub
 		trusted, openHead bool
 	}{
-		"no client":              {nil, false, false},
-		"pull request read fail": {&fakeGitHub{prErr: down}, false, false},
-		"permission read fail":   {&fakeGitHub{pr: trustedPR.pr, permErr: down}, false, true},
-		"fork":                   {forkPR, false, true},
-		"deleted head repo":      {&fakeGitHub{pr: vcs.PRState{Open: true, HeadSHA: headSHA, OpenerLogin: "opener"}, permission: "admin"}, false, true},
-		"opener reads only":      {&fakeGitHub{pr: trustedPR.pr, permission: "read"}, false, true},
-		"opener triages":         {&fakeGitHub{pr: trustedPR.pr, permission: "triage"}, false, true},
-		"opener writes":          {trustedPR, true, true},
-		"opener maintains":       {&fakeGitHub{pr: trustedPR.pr, permission: "maintain"}, true, true},
-		"closed":                 {&fakeGitHub{pr: vcs.PRState{HeadSHA: headSHA, HeadRepo: "acme/app", OpenerLogin: "opener"}, permission: "write"}, true, false},
-		"head moved":             {&fakeGitHub{pr: vcs.PRState{Open: true, HeadSHA: oldSHA, HeadRepo: "acme/app", OpenerLogin: "opener"}, permission: "write"}, true, false},
+		"GHES unavailable":  {ghesDown, false, false},
+		"fork":              {forkPR, false, true},
+		"deleted head repo": {prWith(func(s *vcs.PRState) { s.HeadRepo = ""; s.OpenerPermission = "admin" }), false, true},
+		"opener reads only": {prWith(func(s *vcs.PRState) { s.OpenerPermission = "read" }), false, true},
+		"opener triages":    {prWith(func(s *vcs.PRState) { s.OpenerPermission = "triage" }), false, true},
+		"permission unread": {prWith(func(s *vcs.PRState) { s.OpenerPermission = "" }), false, true},
+		"opener writes":     {trustedPR, true, true},
+		"opener maintains":  {prWith(func(s *vcs.PRState) { s.OpenerPermission = "maintain" }), true, true},
+		"closed":            {prWith(func(s *vcs.PRState) { s.Open = false }), true, false},
+		"head moved":        {prWith(func(s *vcs.PRState) { s.HeadSHA = oldSHA }), true, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := newHarness()

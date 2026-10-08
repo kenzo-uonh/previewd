@@ -26,11 +26,14 @@ var allowedImports = map[string][]string{
 	// config parses the approver list and the approval label with the
 	// validators the webhook path uses (V1 F1): one definition of a valid
 	// login, repository and label, refused at start.
-	"config":  {"validate"},
-	"secrets": {},
+	"config": {"validate"},
+	// The credential reader shares the credential-name rule with config.
+	"secrets": {"validate"},
 	"store":   {},
-	"vcs":     {},
-	"proxy":   {"envid", "validate"},
+	// The GHES client (C3) validates every reply with the webhook path's
+	// validators and quotes replies in errors only through textutil.
+	"vcs":   {"textutil", "validate"},
+	"proxy": {"envid", "validate"},
 	// The reconciler consumes the queue (store) and publishes routes (proxy);
 	// envid validates ownership labels at startup. Fetching and secrets come
 	// in through injected functions and interfaces.
