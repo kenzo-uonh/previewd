@@ -15,13 +15,13 @@ The MVP model identifies a delivery only by its order `ts`. It cannot say "the a
 | `Commits` | commit identifiers (model values) | `{"c1", "c2"}` |
 | `UntrustedEnvs` | environments whose PR comes from a fork or an external author, a subset of `EnvIDs` | `{"e1"}` |
 | `MaxWebhooks` | GitHub actions that emit a delivery (PR, review and label events), redeliveries included | 3..4 |
-| `MaxPermissionLoss` | silent GitHub-side changes: an approver loses write access, no webhook | 0..1 |
+| `MaxPermissionLoss` | silent GitHub-side changes, no webhook: an approver loses write access (untrusted environment), or the opener does (trusted environment, D-V1-5) | 0..1 |
 | `MaxGhesFaults` | GHES unavailable during `AuthorizeDeploy` or `Revalidate` | 0..1 |
 | `Grace` | consecutive unavailable re-validations before the fail-closed teardown | 1 |
 | `MaxPrunes` | `Prune` steps | 0..2 |
 | `TTL`, `MaxClock` | environment lifetime and clock bound, in clock ticks; `TTL = 0` disables expiry | 0 or 1, ≤ `MaxWebhooks + 3` |
 
-Trust is a property of the PR, not of a job. A PR's head repository and opener do not change during its life, so `UntrustedEnvs` is a constant. The re-validation of a trusted opener's write permission is decision D-V1-5 of the spec, outside this model until decided.
+A PR's head repository and opener do not change during its life, so `UntrustedEnvs` (forks and external authors) is a constant. The opener's write access can change (D-V1-5, decided), so trust is evaluated against GitHub truth, never cached: `Trusted(e) == e ∉ UntrustedEnvs ∧ openerOK[e]`. A same-repo PR whose opener lost write access is treated like a fork from then on.
 
 ### 1.2 GitHub-side truth
 
@@ -32,6 +32,7 @@ GitHub becomes an explicit process with its own state. The MVP model's "any ts, 
 | `head[e]` | `Commits ∪ {None}` | current head commit of the PR |
 | `open[e]` | `BOOLEAN` | PR open |
 | `approvedGH[e]` | `SUBSET Commits` | commits with a currently valid approval by an approver who still has write access |
+| `openerOK[e]` | `BOOLEAN` | the PR's opener still has write access (D-V1-5) |
 | `clock` | `0..MaxClock` | one global clock. GitHub stamps deliveries with it, and previewd stamps internal jobs and revocations with it. This abstracts UUIDv1 ticks and `now` with clocks synchronized within the skew bound (V1-I7 stays outside the model). |
 | `inflight` | set of deliveries | emitted, not yet received; the network reorders freely |
 
@@ -66,7 +67,7 @@ Rule: a human or external actor is never fair, and a previewd loop that enforces
 
 | Process | Fairness | Actions |
 |---|---|---|
-| `GitHub` | none; bounded by `MaxWebhooks`, `MaxPermissionLoss` | `Open(e, c)`, `Push(e, c)` (needs `c ≠ head[e]`), `Close(e)`, `Reopen(e)`, `Approve(e)` (approves `head[e]`), `Revoke(e, c)` (`c ∈ approvedGH[e]`), `PermissionLoss(e)` (empties `approvedGH[e]`, emits nothing), `Redeliver(d)` |
+| `GitHub` | none; bounded by `MaxWebhooks`, `MaxPermissionLoss` | `Open(e, c)`, `Push(e, c)` (needs `c ≠ head[e]`), `Close(e)`, `Reopen(e)`, `Approve(e)` (approves `head[e]`), `Revoke(e, c)` (`c ∈ approvedGH[e]`), `PermissionLoss(e)` (untrusted: empties `approvedGH[e]`; trusted: `openerOK[e] := FALSE`; emits nothing), `Redeliver(d)` |
 | `Clock` | none; bounded by `MaxClock` | `Tick` |
 | `Api` | WF | `ReceiveWebhook` (any `d ∈ inflight`) |
 | `Worker` (each) | WF | `AcquireJob`, `AuthorizeDeploy`, `ExecuteDeploy`, `StartContainer`, `PublishRoute`, `CommitDeploy`, `ExecuteTeardown`, `CommitTeardown` |
@@ -77,7 +78,7 @@ Rule: a human or external actor is never fair, and a previewd loop that enforces
 | `Chaos` | none; bounded | `SimulateCrash` (daemon crash or host reboot) |
 
 Guards keep the fair loops from stuttering forever:
-- `Revalidate(e)` is enabled only for an untrusted environment that exists, has a successful builder, and either is no longer approved in GitHub truth or has `revalFails[e] > 0`, or while a GHES fault remains in the budget.
+- `Revalidate(e)` is enabled only for an environment, trusted or not (D-V1-5), that exists, has a successful builder, and either is no longer allowed in GitHub truth or has `revalFails[e] > 0`, or while a GHES fault remains in the budget. Allowed: `Trusted(e)`, or a live approval of its commit in the DB and in GitHub truth.
 - `Expire(e)` is enabled only when `clock − deployedAt[e] ≥ TTL > 0` and no newer job exists.
 
 A fair action that is always enabled but changes nothing would satisfy weak fairness vacuously.
@@ -95,7 +96,7 @@ Transition rules beyond the MVP:
   - untrusted without both: park. The previous version is destroyed and the job becomes `PENDING_APPROVAL`, in one step;
   - GHES fault: `QUEUED`, attempt counted, nothing changed on the host.
 - **`Revalidate(e)`:**
-  - if approved in GitHub truth and live in DB: reset `revalFails[e]`;
+  - if allowed (trusted, or approved in GitHub truth and live in the DB): reset `revalFails[e]`;
   - if not: record an internal `revoke` and queue a teardown (`origin = "revalidation"`, `seq = ++clock`);
   - GHES fault: `revalFails[e] + 1`, and at `Grace` the same teardown.
 - **`Expire(e)`:** a teardown with `origin = "ttl"`, `seq = ++clock`.
@@ -115,7 +116,7 @@ Together they imply that every future `deploy`/`teardown` verdict is the same as
 ## 4. Desired state (`Converged`) and liveness under gating
 
 ```tla
-Allowed(e, c) == e ∉ UntrustedEnvs ∨ (LiveApproval(e, c) ∧ c ∈ approvedGH[e])
+Allowed(e, c) == Trusted(e) ∨ (LiveApproval(e, c) ∧ c ∈ approvedGH[e])
 Converged(e) ==
   IF JobsOf(e) ≠ {} ∧ db_jobs[Latest(e)].type = "deploy"
        ∧ db_jobs[Latest(e)].status = "SUCCESS" ∧ Allowed(e, db_jobs[Latest(e)].commit)
@@ -146,7 +147,7 @@ The statement "an untrusted environment runs only with a live approval" cannot b
 
 | Name | Statement |
 |---|---|
-| `LivenessRevokedTornDown` | `∀ e ∈ UntrustedEnvs: (Exists(e) ∧ environments[e].commit ∉ approvedGH[e]) ~> (¬Exists(e) ∨ environments[e].commit ∈ approvedGH[e])`. Relies on WF of `Revalidator`, `Worker` and `Api`. |
+| `LivenessRevokedTornDown` | `∀ e ∈ EnvIDs: (Exists(e) ∧ ¬AllowedTruth(e, environments[e].commit)) ~> (¬Exists(e) ∨ AllowedTruth(e, environments[e].commit))`, with `AllowedTruth(e, c) == Trusted(e) ∨ c ∈ approvedGH[e]`. It covers a revoked fork approval and an offboarded opener alike (D-V1-5). Relies on WF of `Revalidator`, `Worker` and `Api`. |
 | `LivenessExpired` | `∀ e: (TTL > 0 ∧ Exists(e) ∧ clock − deployedAt[e] ≥ TTL) ~> (¬Exists(e) ∨ a newer deploy SUCCESS)` |
 | `LivenessEventualCompletion` (amended) | every `QUEUED` job reaches a terminal state or `PENDING_APPROVAL`; every `PENDING_APPROVAL` job whose grant is live leaves that status |
 | `LivenessEventualConsistency` (amended) | `<>[] ∀ e: Converged(e)` with the section 4 definition |
@@ -163,7 +164,7 @@ Each configuration enables only the features it targets. Budget per configuratio
 | `previewd-workers.cfg` | MVP regression, lock | e1, e2 (none) | c1 | 2 | 3 | 1 | 0 | 0 | 0 | 0 |
 | `previewd-approval.cfg` | gate, revocation, new head | e1 (e1) | c1, c2 | 1 | 4 | 0 | 1 | 1 | 0 | 0 |
 | `previewd-approval-reboot.cfg` | revalidated rebuild after reboot | e1 (e1) | c1 | 1 | 3 | 1 | 0 | 0 | 0 | 0 |
-| `previewd-mixed.cfg` | trusted and untrusted together, lock across trust | e1, e2 (e2) | c1 | 2 | 3 | 0 | 0 | 0 | 0 | 0 |
+| `previewd-mixed.cfg` | trusted and untrusted together, lock across trust, opener offboarded (D-V1-5) | e1, e2 (e2) | c1 | 2 | 3 | 0 | 0 | 1 | 0 | 0 |
 | `previewd-prune.cfg` | watermark, pruned deliveries | e1 (none) | c1 | 1 | 4 | 1 | 0 | 0 | 2 | 0 |
 | `previewd-ttl.cfg` | expiry through the queue | e1 (none) | c1 | 1 | 2 | 0 | 0 | 0 | 0 | 1 |
 
@@ -180,7 +181,7 @@ Small-scope argument, stated so a reviewer can challenge it:
 
 ## 7. Acceptance criteria
 
-A1 is accepted when every configuration of 6.1 passes within budget, coverage shows every new action producing states with no unevaluated sub-expression, and every mutant below is killed by the named property in the named configuration. The mutants are applied to the translated model, as in Phase 2. The MVP mutants (12, plus the route mutants) are re-run on the regression configurations.
+A1 is accepted when every configuration of 6.1 passes within budget, coverage shows every new action producing states with no unevaluated sub-expression, and every mutant below (V1-M1 to V1-M19) is killed by the named property in the named configuration. The mutants are applied to the translated model, as in Phase 2. The MVP mutants (12, plus the route mutants) are re-run on the regression configurations.
 
 | # | Mutant | Must be killed by | Config |
 |---|---|---|---|
@@ -202,6 +203,7 @@ A1 is accepted when every configuration of 6.1 passes within budget, coverage sh
 | V1-M16 | `Prune` deletes a delivery newer than `MaxSeq` | `SafetyPrunedDeliveriesStale` | prune |
 | V1-M17 | `Expirer` not fair | `LivenessExpired` | ttl |
 | V1-M18 | Trusted and untrusted jobs of different environments share the lock | `SafetyOneJobPerEnv` / `LivenessEventualCompletion` | mixed |
+| V1-M19 | `Revalidator` checks untrusted environments only (the pre-D-V1-5 design) | `LivenessRevokedTornDown` (offboarded opener) | mixed |
 
 Out of model, and checked by Go tests instead:
 - an untrusted deploy receiving trusted secrets (`Injector.Section`);
@@ -230,4 +232,4 @@ The SPBT reference model implements sections 1 to 4 independently of the store, 
 
 - **S-1 (applied with this note):** `approvals` stores `granted_seq` and `revoked_seq` (delivery order) instead of relying on timestamps. Liveness of an approval is "a grant newer than every revocation of the same `(repo, pr, commit, approver)`".
 - **S-2 (applied):** A0 inserted before A1 in the task list. A1 means "implement this note".
-- **D-V1-5 (to decide, recorded in the spec):** the re-validation loop re-checks untrusted environments only. A same-repo PR whose opener loses write access keeps its trusted environment, with the full secret set, until the next event. Proposal: re-validate the opener's permission for trusted environments too (same loop, same grace), and model it as `PermissionLoss` on trusted environments (it then joins `previewd-mixed.cfg`).
+- **D-V1-5 (decided 2026-10-08):** every running environment is re-validated. For a trusted one that means its opener's write access, in the same loop with the same grace. Modeled by `openerOK`, `PermissionLoss` on trusted environments, `LivenessRevokedTornDown` over all environments, `previewd-mixed.cfg` with `MaxPermissionLoss = 1`, and mutant V1-M19.
