@@ -225,10 +225,14 @@ type v1Model struct {
 	// previewd: SQLite.
 	jobs       map[int64]v1Job
 	nextID     int64
-	deliveries map[string]v1DeliveryRecord
-	approvals  []v1ApprovalRecord
-	watermark  map[string]int64
-	epoch      int64
+	deliveries map[string]v1DeliveryRecord // webhook deploy and teardown deliveries
+	// Approval and revocation deliveries, replay-checked like the others
+	// (D2) but kept apart: RegressionA22 and prunedDeliveries are about
+	// webhook job deliveries only.
+	approvalDeliveries map[string]v1DeliveryRecord
+	approvals          []v1ApprovalRecord
+	watermark          map[string]int64
+	epoch              int64
 
 	// previewd: host and memory.
 	host       map[string]v1HostEnv
@@ -253,6 +257,7 @@ func (m *v1Model) clone() v1Model {
 	c.openerOK = maps.Clone(m.openerOK)
 	c.jobs = maps.Clone(m.jobs)
 	c.deliveries = maps.Clone(m.deliveries)
+	c.approvalDeliveries = maps.Clone(m.approvalDeliveries)
 	c.approvals = slices.Clone(m.approvals)
 	c.watermark = maps.Clone(m.watermark)
 	c.host = maps.Clone(m.host)
@@ -419,8 +424,10 @@ const (
 )
 
 // v1Grant is a grant delivery as the API hands it to the store, with the
-// GitHub truth it read in the same step.
+// GitHub truth it read in the same step and its replay keys.
 type v1Grant struct {
+	ID       string
+	Payload  string
 	EnvID    string
 	Commit   string
 	Seq      int64
@@ -430,6 +437,8 @@ type v1Grant struct {
 
 // v1Revocation is a revoke delivery as the API hands it to the store.
 type v1Revocation struct {
+	ID      string
+	Payload string
 	EnvID   string
 	Commit  string
 	Seq     int64
@@ -465,8 +474,8 @@ type v1Backend interface {
 	crash(t *rapid.T)
 	boot(t *rapid.T, now time.Time, observed []Observation) SweepResult
 	enqueue(t *rapid.T, d v1Emission, now time.Time) (Verdict, int64)
-	approve(t *rapid.T, g v1Grant, now time.Time) int64
-	revoke(t *rapid.T, r v1Revocation, now time.Time) int64
+	approve(t *rapid.T, g v1Grant, now time.Time) (Verdict, int64)
+	revoke(t *rapid.T, r v1Revocation, now time.Time) (Verdict, int64)
 	acquire(t *rapid.T, now time.Time) (v1Lease, bool)
 	// classify returns true when the store refused the classification
 	// because no live approval of the commit exists.
@@ -516,11 +525,13 @@ func newV1Machine(t *rapid.T, mutant v1Mutant, st v1Backend) *v1Machine {
 		nextID:     1,
 		deliveries: map[string]v1DeliveryRecord{},
 		watermark:  map[string]int64{},
-		host:       map[string]v1HostEnv{},
-		deployedAt: map[string]int64{},
-		revalFails: map[string]int{},
-		authzEpoch: map[int64]int64{},
-		maxTs:      map[string]int64{},
+
+		approvalDeliveries: map[string]v1DeliveryRecord{},
+		host:               map[string]v1HostEnv{},
+		deployedAt:         map[string]int64{},
+		revalFails:         map[string]int{},
+		authzEpoch:         map[int64]int64{},
+		maxTs:              map[string]int64{},
 	}
 	for _, e := range envs {
 		m.approvedGH[e] = map[string]bool{}
@@ -733,19 +744,18 @@ func (x *v1Machine) Redeliver(t *rapid.T) {
 	x.inflight = append(x.inflight, rapid.SampledFrom(idle).Draw(t, "redelivery"))
 }
 
-// ForgedRedelivery: a captured deploy or teardown body resent under a new
+// ForgedRedelivery: a captured body, of any kind, resent under a new
 // delivery ID (the header is unsigned). The signed body binds the time
 // (V1-I7), so the seq is the original's: a replay while the delivery is
-// recorded, stale once it is pruned.
+// recorded; once pruned, a deploy or teardown is stale, a grant older than
+// what revoked it, a revocation harmless.
 func (x *v1Machine) ForgedRedelivery(t *rapid.T) {
-	var webhooks []int
-	for i, d := range x.emitted {
-		if d.Kind == v1KindDeploy || d.Kind == v1KindTeardown {
-			webhooks = append(webhooks, i)
-		}
+	webhooks := make([]int, len(x.emitted))
+	for i := range x.emitted {
+		webhooks[i] = i
 	}
 	if len(webhooks) == 0 {
-		t.Skip("no webhook delivery yet")
+		t.Skip("no delivery yet")
 	}
 	d := x.emitted[rapid.SampledFrom(webhooks).Draw(t, "captured")]
 	x.forged++
@@ -797,16 +807,31 @@ func (x *v1Machine) receive(t *rapid.T, d v1Emission) {
 	}
 }
 
+// replayed is the replay rule over every recorded delivery, of any kind:
+// the same ID, or the same signed body.
 func (x *v1Machine) replayed(d v1Emission) bool {
-	if _, ok := x.m.deliveries[d.ID]; ok {
-		return true
-	}
-	for _, r := range x.m.deliveries {
-		if r.Payload == d.Payload {
+	for _, recorded := range []map[string]v1DeliveryRecord{x.m.deliveries, x.m.approvalDeliveries} {
+		if _, ok := recorded[d.ID]; ok {
 			return true
+		}
+		for _, r := range recorded {
+			if r.Payload == d.Payload {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// recordApprovalDelivery replay-checks a grant or revoke delivery and
+// records it; false for a replay, which changes nothing.
+func (x *v1Machine) recordApprovalDelivery(d v1Emission, now time.Time) bool {
+	if x.replayed(d) {
+		x.log("  replay")
+		return false
+	}
+	x.m.approvalDeliveries[d.ID] = v1DeliveryRecord{EnvID: d.EnvID, Seq: d.Seq, Verdict: VerdictAccepted, Payload: d.Payload, ReceivedAt: now.UnixMilli()}
+	return true
 }
 
 func (x *v1Machine) receiveWebhookJob(t *rapid.T, d v1Emission) {
@@ -862,10 +887,13 @@ func (x *v1Machine) receiveGrant(t *rapid.T, d v1Emission) {
 	m := &x.m
 	now := x.now()
 	e, c := d.EnvID, d.Commit
-	g := v1Grant{EnvID: e, Commit: c, Seq: d.Seq, Trusted: x.trusted(e), OpenHead: m.open[e] && m.head[e] == c}
-	m.approvals = append(m.approvals, v1ApprovalRecord{Grant: true, EnvID: e, Commit: c, Seq: d.Seq})
-	var wantID int64
-	if !g.Trusted && x.liveIn(m.approvals, e, c) {
+	g := v1Grant{ID: d.ID, Payload: d.Payload, EnvID: e, Commit: c, Seq: d.Seq, Trusted: x.trusted(e), OpenHead: m.open[e] && m.head[e] == c}
+	want, wantID := VerdictReplay, int64(0)
+	if x.recordApprovalDelivery(d, now) {
+		want = VerdictAccepted
+		m.approvals = append(m.approvals, v1ApprovalRecord{Grant: true, EnvID: e, Commit: c, Seq: d.Seq})
+	}
+	if want == VerdictAccepted && !g.Trusted && x.liveIn(m.approvals, e, c) {
 		// The latest intent is the parked deploy of this commit: unpark
 		// it. Otherwise, if the commit is still the open head and no
 		// deploy of it is the latest intent, queue one (A1-3).
@@ -882,8 +910,8 @@ func (x *v1Machine) receiveGrant(t *rapid.T, d v1Emission) {
 		}
 	}
 	if x.st != nil {
-		if jobID := x.st.approve(t, g, now); jobID != wantID {
-			t.Fatalf("approve %+v = job %d, model %d", g, jobID, wantID)
+		if verdict, jobID := x.st.approve(t, g, now); verdict != want || jobID != wantID {
+			t.Fatalf("approve %+v = %s/%d, model %s/%d", g, verdict, jobID, want, wantID)
 		}
 	}
 }
@@ -892,8 +920,12 @@ func (x *v1Machine) receiveRevoke(t *rapid.T, d v1Emission) {
 	m := &x.m
 	now := x.now()
 	e, c := d.EnvID, d.Commit
-	r := v1Revocation{EnvID: e, Commit: c, Seq: d.Seq, Trusted: x.trusted(e)}
-	m.approvals = append(m.approvals, v1ApprovalRecord{EnvID: e, Commit: c, Seq: d.Seq})
+	r := v1Revocation{ID: d.ID, Payload: d.Payload, EnvID: e, Commit: c, Seq: d.Seq, Trusted: x.trusted(e)}
+	want := VerdictReplay
+	if x.recordApprovalDelivery(d, now) {
+		want = VerdictAccepted
+		m.approvals = append(m.approvals, v1ApprovalRecord{EnvID: e, Commit: c, Seq: d.Seq})
+	}
 	// The teardown judges the latest intent (A2-1): when it deploys another
 	// commit, that intent already removes c (ExecuteDeploy replaces it, Park
 	// destroys it), and a teardown above it would skip the new head.
@@ -902,12 +934,12 @@ func (x *v1Machine) receiveRevoke(t *rapid.T, d v1Emission) {
 		affected = m.runningCommit(e, c) || m.activeDeployOf(e, c)
 	}
 	var wantID int64
-	if !r.Trusted && !x.liveIn(m.approvals, e, c) && affected && x.cfg.mutant != v1M05 {
+	if want == VerdictAccepted && !r.Trusted && !x.liveIn(m.approvals, e, c) && affected && x.cfg.mutant != v1M05 {
 		wantID = x.internal(e, JobTeardown, c, v1OriginRevocation).ID
 	}
 	if x.st != nil {
-		if jobID := x.st.revoke(t, r, now); jobID != wantID {
-			t.Fatalf("revoke %+v = job %d, model %d", r, jobID, wantID)
+		if verdict, jobID := x.st.revoke(t, r, now); verdict != want || jobID != wantID {
+			t.Fatalf("revoke %+v = %s/%d, model %s/%d", r, verdict, jobID, want, wantID)
 		}
 	}
 }
@@ -1301,6 +1333,17 @@ func (x *v1Machine) Prune(t *rapid.T) {
 		}
 		delete(m.deliveries, id)
 		m.prunedDeliveries = append(m.prunedDeliveries, r)
+		deliveries++
+	}
+	// The same rule for approval deliveries (one table in the store). A
+	// pruned grant comes back stale (V1-I7 binds its seq): never newer than
+	// the revocation that killed it.
+	for _, id := range slices.Sorted(maps.Keys(m.approvalDeliveries)) {
+		r := m.approvalDeliveries[id]
+		if r.ReceivedAt >= deliveryCutoff || r.Seq > m.maxSeq(r.EnvID) {
+			continue
+		}
+		delete(m.approvalDeliveries, id)
 		deliveries++
 	}
 	if x.st != nil {

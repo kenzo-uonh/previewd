@@ -25,30 +25,47 @@ func testAuditEvent(kind AuditKind, detail string) AuditEvent {
 	return AuditEvent{Kind: kind, EnvID: envA, Repo: testSource.Repo, PRNumber: testSource.PRNumber, Detail: detail}
 }
 
+// grantOf is an approval of commit delivered at seq; its delivery ID and
+// body are distinct per (commit, seq).
 func grantOf(commit string, seq int64) Grant {
-	return Grant{EnvID: envA, Source: sourceAt(commit), Seq: seq, ApproverLogin: "approver", ApproverID: 7,
-		Via: ApprovalViaReview, ReviewID: 99, OpenHead: true}
+	id := fmt.Sprintf("grant-%s-%d", commit[:4], seq)
+	return Grant{DeliveryID: id, PayloadSHA256: payloadHash("body of " + id), EnvID: envA, Source: sourceAt(commit), Seq: seq,
+		ApproverLogin: "approver", ApproverID: 7, Via: ApprovalViaReview, ReviewID: 99, OpenHead: true}
+}
+
+func grantAudit(g Grant) AuditEvent {
+	ev := testAuditEvent(AuditApprovalGranted, string(g.Via))
+	ev.EnvID, ev.CommitSHA, ev.ActorLogin, ev.ActorID = g.EnvID, g.Source.CommitSHA, g.ApproverLogin, g.ApproverID
+	return ev
 }
 
 func approve(t *testing.T, s *Store, g Grant) int64 {
 	t.Helper()
-	ev := testAuditEvent(AuditApprovalGranted, string(g.Via))
-	ev.EnvID, ev.CommitSHA, ev.ActorLogin, ev.ActorID = g.EnvID, g.Source.CommitSHA, g.ApproverLogin, g.ApproverID
-	id, err := s.Approve(context.Background(), g, t0, ev)
-	if err != nil {
-		t.Fatalf("Approve %+v: %v", g, err)
+	v, id, err := s.Approve(context.Background(), g, t0, grantAudit(g))
+	if err != nil || v != VerdictAccepted {
+		t.Fatalf("Approve %+v = %s, %v", g, v, err)
 	}
 	return id
 }
 
+func revocationOf(commit string, seq int64) Revoke {
+	id := fmt.Sprintf("revoke-%s-%d", commit[:4], seq)
+	return Revoke{DeliveryID: id, PayloadSHA256: payloadHash("body of " + id), EnvID: envA, Repo: testSource.Repo,
+		PRNumber: testSource.PRNumber, CommitSHA: commit, Seq: seq, Reason: RevokedDismissed}
+}
+
+func revocationAudit(r Revoke) AuditEvent {
+	ev := testAuditEvent(AuditApprovalRevoked, string(r.Reason))
+	ev.CommitSHA = r.CommitSHA
+	return ev
+}
+
 func revoke(t *testing.T, s *Store, commit string, seq int64) int64 {
 	t.Helper()
-	ev := testAuditEvent(AuditApprovalRevoked, string(RevokedDismissed))
-	ev.CommitSHA = commit
-	id, err := s.Revoke(context.Background(), Revoke{EnvID: envA, Repo: testSource.Repo, PRNumber: testSource.PRNumber,
-		CommitSHA: commit, Seq: seq, Reason: RevokedDismissed}, t0, ev)
-	if err != nil {
-		t.Fatalf("Revoke %s at %d: %v", commit, seq, err)
+	r := revocationOf(commit, seq)
+	v, id, err := s.Revoke(context.Background(), r, t0, revocationAudit(r))
+	if err != nil || v != VerdictAccepted {
+		t.Fatalf("Revoke %s at %d = %s, %v", commit, seq, v, err)
 	}
 	return id
 }
@@ -246,7 +263,7 @@ func TestOperationsRefuseMismatchedAudit(t *testing.T) {
 		"other actor":  {Kind: AuditApprovalGranted, EnvID: envA, Repo: testSource.Repo, PRNumber: testSource.PRNumber, CommitSHA: commitA, ActorLogin: "mallory", ActorID: 8, Detail: "review"},
 		"other via":    {Kind: AuditApprovalGranted, EnvID: envA, Repo: testSource.Repo, PRNumber: testSource.PRNumber, CommitSHA: commitA, ActorLogin: "approver", ActorID: 7, Detail: "label"},
 	} {
-		if _, err := s.Approve(ctx, g, t0, ev); !errors.Is(err, ErrInvalidAudit) {
+		if _, _, err := s.Approve(ctx, g, t0, ev); !errors.Is(err, ErrInvalidAudit) {
 			t.Errorf("%s: %v, want ErrInvalidAudit", name, err)
 		}
 	}
@@ -303,6 +320,53 @@ func TestEnqueueInternalRevokesAtNow(t *testing.T) {
 	}
 	if _, err := s.EnqueueInternal(ctx, envB, OriginTTL, "", t0, testAuditEvent(AuditTTLExpired, "ttl")); !errors.Is(err, ErrNoJob) {
 		t.Errorf("internal teardown of an environment without jobs: %v, want ErrNoJob", err)
+	}
+}
+
+// D2: an approval or a revocation delivery is a replay when its ID or its
+// signed body was already recorded. A captured approval resent under a
+// fresh, later delivery ID after a dismissal does not revive the approval,
+// writes no audit row and queues nothing.
+func TestApproveAndRevokeReplay(t *testing.T) {
+	s, _ := sweptStore(t)
+	ctx := context.Background()
+	enqueueAt(t, s, "d1", JobDeploy, 10, commitA)
+	g := grantOf(commitA, 11)
+	approve(t, s, g)
+	revoke(t, s, commitA, 12) // queues the revocation teardown
+	before := auditKinds(t, s)
+	jobsBefore, err := s.Jobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	forged := g
+	forged.DeliveryID, forged.Seq = "forged-grant", 13 // same body, fresh ID and time
+	for name, replay := range map[string]Grant{"same delivery": g, "same body, fresh ID": forged} {
+		v, id, err := s.Approve(ctx, replay, t0, grantAudit(replay))
+		if err != nil || v != VerdictReplay || id != 0 {
+			t.Fatalf("%s = %s/%d, %v; want replay", name, v, id, err)
+		}
+	}
+	if live(t, s, commitA) {
+		t.Fatal("a replayed approval revived a dismissed one")
+	}
+	r := revocationOf(commitA, 12)
+	r.DeliveryID = "forged-revocation"
+	if v, _, err := s.Revoke(ctx, r, t0, revocationAudit(r)); err != nil || v != VerdictReplay {
+		t.Fatalf("replayed revocation = %s, %v; want replay", v, err)
+	}
+	if got := auditKinds(t, s); !slices.Equal(got, before) {
+		t.Fatalf("replays wrote audit rows %v", got[len(before):])
+	}
+	if jobs, err := s.Jobs(ctx); err != nil || !slices.Equal(jobs, jobsBefore) {
+		t.Fatalf("replays changed the jobs: %+v, %v", jobs, err)
+	}
+	// A grant body replayed as a deploy delivery is a replay too: one key space.
+	d := testDelivery("forged-deploy", envA, JobDeploy, 14)
+	d.PayloadSHA256 = g.PayloadSHA256
+	if v, _, err := s.Enqueue(ctx, d); err != nil || v != VerdictReplay {
+		t.Fatalf("approval body as a deploy = %s, %v; want replay", v, err)
 	}
 }
 

@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 var (
@@ -20,9 +23,11 @@ var (
 )
 
 const (
-	maxGitRefLen  = 255
-	maxDNSNameLen = 253
-	maxQuotedLen  = 64
+	maxLabelLen     = 50
+	maxTimestampLen = 35
+	maxGitRefLen    = 255
+	maxDNSNameLen   = 253
+	maxQuotedLen    = 64
 )
 
 // quote renders untrusted input for an error message: escaped, and cut to
@@ -52,6 +57,33 @@ func Login(s string) error {
 		return fmt.Errorf("invalid login %s", quote(s))
 	}
 	return nil
+}
+
+// LabelName validates a GitHub label name: 1 to 50 bytes of valid UTF-8,
+// no control character.
+func LabelName(s string) error {
+	if s == "" || len(s) > maxLabelLen || !utf8.ValidString(s) {
+		return fmt.Errorf("invalid label %s", quote(s))
+	}
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("invalid label %s", quote(s))
+		}
+	}
+	return nil
+}
+
+// Timestamp parses a GitHub timestamp (RFC 3339, as in updated_at and
+// submitted_at) after the Unix epoch, in UTC.
+func Timestamp(s string) (time.Time, error) {
+	if len(s) > maxTimestampLen {
+		return time.Time{}, fmt.Errorf("invalid timestamp %s", quote(s))
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil || t.Unix() <= 0 {
+		return time.Time{}, fmt.Errorf("invalid timestamp %s", quote(s))
+	}
+	return t.UTC(), nil
 }
 
 // CommitSHA validates a full lowercase SHA-1 or SHA-256 object name.

@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"time"
+
+	"github.com/kenzo-uonh/previewd/internal/validate"
 )
 
 // Config models all operational runtime flags for the sovereign daemon.
@@ -22,10 +25,24 @@ type Config struct {
 	MaxConcurrentBuilds int
 	ContainerMemoryMiB  int64
 	ContainerPids       int64
+
+	// Approval gating (V1 F1). Approvers maps owner/repo, as GitHub spells
+	// it, to the accounts whose review or label approves untrusted code.
+	Approvers      map[string][]validate.Approver
+	LabelApproval  bool   // PREVIEWD_LABEL_APPROVAL opt-in
+	ApprovalLabel  string // the label that approves when LabelApproval is set
+	DeliveryMaxAge time.Duration
 }
 
+const (
+	defaultApprovalLabel  = "previewd-approved"
+	defaultDeliveryMaxAge = 15 * time.Minute
+	minDeliveryMaxAge     = time.Minute
+	maxDeliveryMaxAge     = 2 * time.Hour
+)
+
 // defaultStagingDir mirrors secrets.DefaultStagingDir; config imports
-// no internal package.
+// no internal package but the validate leaf.
 const defaultStagingDir = "/run/previewd/secrets"
 
 // defaultRoutesDir is the directory Traefik's file provider watches
@@ -111,6 +128,26 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	approvers, err := validate.ParseApprovers(os.Getenv("PREVIEWD_APPROVERS"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid PREVIEWD_APPROVERS: %w", err)
+	}
+	labelApproval, err := optIn("PREVIEWD_LABEL_APPROVAL")
+	if err != nil {
+		return nil, err
+	}
+	approvalLabel := defaultApprovalLabel
+	if v, set := os.LookupEnv("PREVIEWD_APPROVAL_LABEL"); set {
+		if err := validate.LabelName(v); err != nil {
+			return nil, fmt.Errorf("invalid PREVIEWD_APPROVAL_LABEL: %w", err)
+		}
+		approvalLabel = v
+	}
+	maxAge, err := boundedDuration("PREVIEWD_DELIVERY_MAX_AGE", defaultDeliveryMaxAge, minDeliveryMaxAge, maxDeliveryMaxAge)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Config{
 		APIPort:             apiPort,
 		DBPath:              dbPath,
@@ -126,7 +163,25 @@ func Load() (*Config, error) {
 		MaxConcurrentBuilds: maxBuilds,
 		ContainerMemoryMiB:  memoryMiB,
 		ContainerPids:       pids,
+		Approvers:           approvers,
+		LabelApproval:       labelApproval,
+		ApprovalLabel:       approvalLabel,
+		DeliveryMaxAge:      maxAge,
 	}, nil
+}
+
+// boundedDuration reads a Go duration. Unset means def; anything outside
+// [lo, hi], or not a duration, is a configuration error.
+func boundedDuration(name string, def, lo, hi time.Duration) (time.Duration, error) {
+	v := os.Getenv(name)
+	if v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < lo || d > hi {
+		return 0, fmt.Errorf("invalid %s %q: want a duration in %s..%s", name, v, lo, hi)
+	}
+	return d, nil
 }
 
 // maxPositiveInt keeps a MiB value convertible to bytes in an int64.

@@ -428,31 +428,36 @@ var v1MutantCases = []struct {
 	name     string
 	mutant   v1Mutant
 	killedBy []string // empty: equivalent, must survive
+	checks   int      // runs, when the path is rarer than v1MutantChecks covers
 }{
-	{"V1-M01", v1M01, []string{"SafetyAuthorizeChecksBoth", "SafetyNoUnapprovedUntrusted"}},
-	{"V1-M02", v1M02, []string{"SafetyAuthorizeChecksBoth", "LivenessRevokedTornDown"}},
-	{"V1-M03", v1M03, []string{"SafetyApprovalBindsCommit"}},
-	{"V1-M04", v1M04, []string{"SafetyParkRemovesPrevious"}},
-	{"V1-M05", v1M05, []string{"SafetyRevocationPending"}},
-	{"V1-M06", v1M06, []string{"LivenessHeadDeployed", "LivenessEventualConsistency"}},
-	{"V1-M06b", v1M06b, []string{"SafetyAuthorizeChecksBoth", "SafetyApprovalBindsCommit", "LivenessHeadDeployed"}},
-	{"V1-M07", v1M07, []string{"LivenessRevokedTornDown", "LivenessEventualConsistency"}},
-	{"V1-M08", v1M08, []string{"SafetyFailClosedOnUnavailable"}},
-	{"V1-M09", v1M09, []string{"SafetyAuthorizeChecksBoth", "SafetyNoUnapprovedUntrusted"}},
-	{"V1-M10", v1M10, []string{"LivenessHeadDeployed", "RegressionA21"}},
-	{"V1-M11", v1M11, []string{"LivenessHeadDeployed", "RegressionA21"}},
-	{"V1-M12", v1M12, []string{"SafetyAuthorizedThisBoot"}},
-	{"V1-M13", v1M13, []string{"SafetyInternalJobsAreNewest", "SafetyUniqueDelivery"}},
-	{"V1-M14", v1M14, []string{"SafetyPruneKeepsLatest"}},
-	{"V1-M15", v1M15, nil},
-	{"V1-M15b", v1M15b, []string{"SafetyPruneKeepsVerdicts"}},
-	{"V1-M16", v1M16, nil},
-	{"V1-M17", v1M17, []string{"LivenessExpired"}},
-	{"V1-M18", v1M18, []string{"SafetyMonotonicity", "SafetyOneJobPerEnv", "SafetyMonotonicStep"}},
-	{"V1-M19", v1M19, []string{"LivenessRevokedTornDown", "LivenessEventualConsistency"}},
-	{"V1-M20", v1M20, []string{"RegressionA21", "LivenessHeadDeployed"}},
-	{"V1-M21", v1M21, []string{"RegressionA22", "LivenessHeadDeployed"}},
-	{"V1-M22", v1M22, []string{"SafetyUnavailableRemovesRevoked"}},
+	{"V1-M01", v1M01, []string{"SafetyAuthorizeChecksBoth", "SafetyNoUnapprovedUntrusted"}, 0},
+	{"V1-M02", v1M02, []string{"SafetyAuthorizeChecksBoth", "LivenessRevokedTornDown"}, 0},
+	{"V1-M03", v1M03, []string{"SafetyApprovalBindsCommit"}, 0},
+	{"V1-M04", v1M04, []string{"SafetyParkRemovesPrevious"}, 0},
+	{"V1-M05", v1M05, []string{"SafetyRevocationPending"}, 0},
+	{"V1-M06", v1M06, []string{"LivenessHeadDeployed", "LivenessEventualConsistency"}, 0},
+	{"V1-M06b", v1M06b, []string{"SafetyAuthorizeChecksBoth", "SafetyApprovalBindsCommit", "LivenessHeadDeployed"}, 0},
+	{"V1-M07", v1M07, []string{"LivenessRevokedTornDown", "LivenessEventualConsistency"}, 0},
+	{"V1-M08", v1M08, []string{"SafetyFailClosedOnUnavailable"}, 0},
+	{"V1-M09", v1M09, []string{"SafetyAuthorizeChecksBoth", "SafetyNoUnapprovedUntrusted"}, 0},
+	{"V1-M10", v1M10, []string{"LivenessHeadDeployed", "RegressionA21"}, 0},
+	{"V1-M11", v1M11, []string{"LivenessHeadDeployed", "RegressionA21"}, 0},
+	{"V1-M12", v1M12, []string{"SafetyAuthorizedThisBoot"}, 0},
+	{"V1-M13", v1M13, []string{"SafetyInternalJobsAreNewest", "SafetyUniqueDelivery"}, 0},
+	{"V1-M14", v1M14, []string{"SafetyPruneKeepsLatest"}, 0},
+	{"V1-M15", v1M15, nil, 0},
+	{"V1-M15b", v1M15b, []string{"SafetyPruneKeepsVerdicts"}, 0},
+	{"V1-M16", v1M16, nil, 0},
+	{"V1-M17", v1M17, []string{"LivenessExpired"}, 0},
+	{"V1-M18", v1M18, []string{"SafetyMonotonicity", "SafetyOneJobPerEnv", "SafetyMonotonicStep"}, 0},
+	// A trusted opener losing write access under a running environment,
+	// then a quiet ending: about 4 seeds in 12 missed it at 1,000 runs.
+	{"V1-M19", v1M19, []string{"LivenessRevokedTornDown", "LivenessEventualConsistency"}, 10 * v1MutantChecks},
+	{"V1-M20", v1M20, []string{"RegressionA21", "LivenessHeadDeployed"}, 0},
+	{"V1-M21", v1M21, []string{"RegressionA22", "LivenessHeadDeployed"}, 0},
+	// An approved version superseded, then a GHES fault at the next
+	// authorization: rare at 1,000 runs.
+	{"V1-M22", v1M22, []string{"SafetyUnavailableRemovesRevoked"}, 5 * v1MutantChecks},
 }
 
 // v1MutantChecks is the least number of runs a mutant gets.
@@ -530,6 +535,9 @@ func TestV1Model_Mutants(t *testing.T) {
 	}
 	for _, tc := range v1MutantCases {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.checks > max(n, v1MutantChecks) {
+				setTestFlag(t, "rapid.checks", strconv.Itoa(tc.checks))
+			}
 			rec := &rapidRecorder{name: t.Name()}
 			rapid.Check(rec, func(rt *rapid.T) {
 				runV1(rt, tc.mutant, nil)

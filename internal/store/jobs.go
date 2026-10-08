@@ -429,13 +429,9 @@ func (s *Store) Enqueue(ctx context.Context, d Delivery) (Verdict, int64, error)
 	var verdict Verdict
 	var jobID int64
 	err := s.inTx(ctx, "enqueue", func(tx *sql.Tx) error {
-		var seen int
-		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM deliveries WHERE delivery_id = ? OR payload_sha256 = ?`, d.ID, d.PayloadSHA256).Scan(&seen); err != nil {
-			return fmt.Errorf("enqueue: replay check: %w", err)
-		}
-		if seen > 0 {
+		if replay, err := seenDelivery(ctx, tx, d.ID, d.PayloadSHA256); err != nil || replay {
 			verdict = VerdictReplay
-			return nil
+			return err
 		}
 		top, err := maxSeq(ctx, tx, d.EnvID)
 		if err != nil {
@@ -445,9 +441,8 @@ func (s *Store) Enqueue(ctx context.Context, d Delivery) (Verdict, int64, error)
 		if d.Seq <= top {
 			verdict = VerdictStale
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO deliveries (delivery_id, payload_sha256, preview_id, seq, verdict, received_at) VALUES (?, ?, ?, ?, ?, ?)`,
-			d.ID, d.PayloadSHA256, d.EnvID, d.Seq, string(verdict), d.ReceivedAt.UnixMilli()); err != nil {
-			return fmt.Errorf("enqueue: record delivery: %w", err)
+		if err := recordDelivery(ctx, tx, d.ID, d.PayloadSHA256, d.EnvID, d.Seq, verdict, d.ReceivedAt); err != nil {
+			return fmt.Errorf("enqueue: %w", err)
 		}
 		if verdict == VerdictStale {
 			return nil
@@ -464,6 +459,29 @@ func (s *Store) Enqueue(ctx context.Context, d Delivery) (Verdict, int64, error)
 		return "", 0, err
 	}
 	return verdict, jobID, nil
+}
+
+// seenDelivery is the replay rule: a delivery whose ID or signed body was
+// already recorded. The body counts because GitHub does not sign the
+// delivery header: a captured body resent under a fresh ID is a replay.
+func seenDelivery(ctx context.Context, tx *sql.Tx, id, payloadSHA256 string) (bool, error) {
+	var seen int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM deliveries WHERE delivery_id = ? OR payload_sha256 = ?`, id, payloadSHA256).Scan(&seen); err != nil {
+		return false, fmt.Errorf("replay check: %w", err)
+	}
+	return seen > 0, nil
+}
+
+func recordDelivery(ctx context.Context, tx *sql.Tx, id, payloadSHA256, envID string, seq int64, verdict Verdict, at time.Time) error {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO deliveries (delivery_id, payload_sha256, preview_id, seq, verdict, received_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		id, payloadSHA256, envID, seq, string(verdict), at.UnixMilli()); err != nil {
+		return fmt.Errorf("record delivery %s: %w", id, err)
+	}
+	return nil
+}
+
+func validDeliveryKeys(id, payloadSHA256 string) bool {
+	return id != "" && len(id) <= maxDeliveryIDLen && len(payloadSHA256) == 64 && isLowerHex(payloadSHA256)
 }
 
 // Acquire leases the next job. An environment is ready when it has no

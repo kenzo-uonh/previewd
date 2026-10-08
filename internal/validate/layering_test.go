@@ -23,7 +23,10 @@ var allowedImports = map[string][]string{
 	"textutil":  {},
 	"validate":  {},
 
-	"config":  {},
+	// config parses the approver list and the approval label with the
+	// validators the webhook path uses (V1 F1): one definition of a valid
+	// login, repository and label, refused at start.
+	"config":  {"validate"},
 	"secrets": {},
 	"store":   {},
 	"vcs":     {},

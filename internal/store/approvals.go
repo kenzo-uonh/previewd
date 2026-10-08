@@ -79,8 +79,11 @@ var (
 // Grant is an approval delivery as the API hands it over, with the GitHub
 // truth it read in the same step: Trusted (the environment needs no
 // approval, D-V1-5), OpenHead (the PR is open and Source.CommitSHA is its
-// head) and the PR's Source.
+// head) and the PR's Source. DeliveryID and PayloadSHA256 are its replay
+// keys, as for Enqueue.
 type Grant struct {
+	DeliveryID    string
+	PayloadSHA256 string
 	EnvID         string
 	Source        Source // CommitSHA is the approved commit
 	Seq           int64  // delivery order of the approval
@@ -93,26 +96,28 @@ type Grant struct {
 }
 
 func (g Grant) valid() bool {
-	return validPreviewID(g.EnvID) && g.Source.valid() && g.Seq > 0 &&
+	return validDeliveryKeys(g.DeliveryID, g.PayloadSHA256) && validPreviewID(g.EnvID) && g.Source.valid() && g.Seq > 0 &&
 		validLogin(g.ApproverLogin) && g.ApproverID > 0 &&
 		((g.Via == ApprovalViaReview && g.ReviewID > 0) || (g.Via == ApprovalViaLabel && g.ReviewID == 0))
 }
 
 // Revoke is a revocation delivery (dismissal, change request, label
 // removal) as the API hands it over. Trusted is GitHub truth read in the
-// same step.
+// same step. DeliveryID and PayloadSHA256 are its replay keys.
 type Revoke struct {
-	EnvID     string
-	Repo      string
-	PRNumber  int64
-	CommitSHA string
-	Seq       int64 // delivery order of the revocation
-	Reason    RevocationReason
-	Trusted   bool
+	DeliveryID    string
+	PayloadSHA256 string
+	EnvID         string
+	Repo          string
+	PRNumber      int64
+	CommitSHA     string
+	Seq           int64 // delivery order of the revocation
+	Reason        RevocationReason
+	Trusted       bool
 }
 
 func (r Revoke) valid() bool {
-	return validPreviewID(r.EnvID) && len(r.Repo) >= 3 && len(r.Repo) <= maxRepoLen && r.PRNumber > 0 &&
+	return validDeliveryKeys(r.DeliveryID, r.PayloadSHA256) && validPreviewID(r.EnvID) && len(r.Repo) >= 3 && len(r.Repo) <= maxRepoLen && r.PRNumber > 0 &&
 		validCommit(r.CommitSHA) && r.Seq > 0 && r.Reason.valid() && r.Reason != RevokedNewHead
 }
 
@@ -251,31 +256,43 @@ func recordRevocation(ctx context.Context, tx *sql.Tx, envID, commit string, seq
 	return nil
 }
 
-// Approve records a grant and its audit row (kind approval_granted, the
-// approver as actor) in one transaction. When the environment is not trusted
+// Approve records a grant, its delivery and its audit row (kind
+// approval_granted, the approver as actor) in one transaction. A delivery
+// whose ID or signed body was already recorded is a replay and changes
+// nothing: a captured approval resent under a fresh delivery ID cannot
+// revive it after a dismissal. When the environment is not trusted
 // and the approval is live, it judges the latest job (V1-model.md A1-3):
 //   - the parked deploy of the commit becomes QUEUED (same seq);
 //   - otherwise, when the commit is the open head and the latest job does not
 //     already deploy it, a deploy is queued (origin approval, seq MaxSeq + 1).
 //
-// It returns the unparked or queued job, or 0.
-func (s *Store) Approve(ctx context.Context, g Grant, now time.Time, audit AuditEvent) (jobID int64, err error) {
+// It returns the verdict (accepted or replay) and the unparked or queued
+// job, or 0. now is the receipt time.
+func (s *Store) Approve(ctx context.Context, g Grant, now time.Time, audit AuditEvent) (verdict Verdict, jobID int64, err error) {
 	if _, err := s.requireSwept(); err != nil {
-		return 0, err
+		return "", 0, err
 	}
 	if !g.valid() || !validTime(now) {
-		return 0, ErrInvalidGrant
+		return "", 0, ErrInvalidGrant
 	}
 	c := g.Source.CommitSHA
 	if err := audit.matches(AuditApprovalGranted, g.EnvID, g.Source.Repo, g.Source.PRNumber, c); err != nil {
-		return 0, err
+		return "", 0, err
 	}
 	if audit.ActorID != g.ApproverID || audit.ActorLogin != g.ApproverLogin || audit.Detail != string(g.Via) {
-		return 0, fmt.Errorf("%w: approval_granted names %s#%d (%s), the grant %s#%d (%s)", ErrInvalidAudit,
+		return "", 0, fmt.Errorf("%w: approval_granted names %s#%d (%s), the grant %s#%d (%s)", ErrInvalidAudit,
 			quoted(audit.ActorLogin), audit.ActorID, quoted(audit.Detail), quoted(g.ApproverLogin), g.ApproverID, g.Via)
 	}
 
 	err = s.inTx(ctx, "approve", func(tx *sql.Tx) error {
+		if replay, err := seenDelivery(ctx, tx, g.DeliveryID, g.PayloadSHA256); err != nil || replay {
+			verdict = VerdictReplay
+			return err
+		}
+		verdict = VerdictAccepted
+		if err := recordDelivery(ctx, tx, g.DeliveryID, g.PayloadSHA256, g.EnvID, g.Seq, VerdictAccepted, now); err != nil {
+			return fmt.Errorf("approve: %w", err)
+		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO approvals (preview_id, repo, pr_number, commit_sha, approver_login, approver_id, via, review_id, granted_seq, granted_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -314,35 +331,45 @@ func (s *Store) Approve(ctx context.Context, g Grant, now time.Time, audit Audit
 		return nil
 	})
 	if err != nil {
-		return 0, err
+		return "", 0, err
 	}
-	return jobID, nil
+	return verdict, jobID, nil
 }
 
-// Revoke records a revocation and its audit row (kind approval_revoked,
-// detail the reason) in one transaction. When the environment is not
+// Revoke records a revocation, its delivery and its audit row (kind
+// approval_revoked, detail the reason) in one transaction; a replayed
+// delivery changes nothing. When the environment is not
 // trusted, no grant of the commit stays live, and the latest job deploys the
 // commit (QUEUED, IN_PROGRESS, PENDING_APPROVAL or SUCCESS), a teardown of
 // it is queued (origin revocation, seq MaxSeq + 1). When the latest job
 // deploys another commit, that intent removes the revoked version itself,
 // and a teardown above it would skip the new head (V1-model.md A2-1).
 //
-// It returns the teardown job, or 0.
-func (s *Store) Revoke(ctx context.Context, r Revoke, now time.Time, audit AuditEvent) (teardownJobID int64, err error) {
+// It returns the verdict (accepted or replay) and the teardown job, or 0.
+// now is the receipt time.
+func (s *Store) Revoke(ctx context.Context, r Revoke, now time.Time, audit AuditEvent) (verdict Verdict, teardownJobID int64, err error) {
 	if _, err := s.requireSwept(); err != nil {
-		return 0, err
+		return "", 0, err
 	}
 	if !r.valid() || !validTime(now) {
-		return 0, ErrInvalidRevocation
+		return "", 0, ErrInvalidRevocation
 	}
 	if err := audit.matches(AuditApprovalRevoked, r.EnvID, r.Repo, r.PRNumber, r.CommitSHA); err != nil {
-		return 0, err
+		return "", 0, err
 	}
 	if audit.Detail != string(r.Reason) {
-		return 0, fmt.Errorf("%w: approval_revoked detail %s, reason %s", ErrInvalidAudit, quoted(audit.Detail), r.Reason)
+		return "", 0, fmt.Errorf("%w: approval_revoked detail %s, reason %s", ErrInvalidAudit, quoted(audit.Detail), r.Reason)
 	}
 
 	err = s.inTx(ctx, "revoke", func(tx *sql.Tx) error {
+		if replay, err := seenDelivery(ctx, tx, r.DeliveryID, r.PayloadSHA256); err != nil || replay {
+			verdict = VerdictReplay
+			return err
+		}
+		verdict = VerdictAccepted
+		if err := recordDelivery(ctx, tx, r.DeliveryID, r.PayloadSHA256, r.EnvID, r.Seq, VerdictAccepted, now); err != nil {
+			return fmt.Errorf("revoke: %w", err)
+		}
 		if err := recordRevocation(ctx, tx, r.EnvID, r.CommitSHA, r.Seq, r.Reason, now); err != nil {
 			return fmt.Errorf("revoke: %w", err)
 		}
@@ -365,9 +392,9 @@ func (s *Store) Revoke(ctx context.Context, r Revoke, now time.Time, audit Audit
 		return nil
 	})
 	if err != nil {
-		return 0, err
+		return "", 0, err
 	}
-	return teardownJobID, nil
+	return verdict, teardownJobID, nil
 }
 
 // EnqueueInternal queues a teardown of the latest job's commit: origin

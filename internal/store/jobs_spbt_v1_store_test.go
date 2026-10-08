@@ -190,24 +190,25 @@ func (b *v1StoreBackend) enqueue(t *rapid.T, d v1Emission, now time.Time) (Verdi
 	return verdict, id
 }
 
-func (b *v1StoreBackend) approve(t *rapid.T, g v1Grant, now time.Time) int64 {
-	id, err := b.store.Approve(b.ctx, Grant{
+func (b *v1StoreBackend) approve(t *rapid.T, g v1Grant, now time.Time) (Verdict, int64) {
+	verdict, id, err := b.store.Approve(b.ctx, Grant{
+		DeliveryID: g.ID, PayloadSHA256: g.Payload,
 		EnvID: g.EnvID, Source: b.source(g.EnvID, g.Commit), Seq: g.Seq,
 		ApproverLogin: "approver", ApproverID: 7, Via: ApprovalViaReview, ReviewID: 99,
 		Trusted: g.Trusted, OpenHead: g.OpenHead,
 	}, now, b.audit(AuditApprovalGranted, g.EnvID, g.Commit, "review"))
 	b.must(t, err, "approve")
-	return id
+	return verdict, id
 }
 
-func (b *v1StoreBackend) revoke(t *rapid.T, r v1Revocation, now time.Time) int64 {
+func (b *v1StoreBackend) revoke(t *rapid.T, r v1Revocation, now time.Time) (Verdict, int64) {
 	src := b.source(r.EnvID, r.Commit)
-	id, err := b.store.Revoke(b.ctx, Revoke{
-		EnvID: r.EnvID, Repo: src.Repo, PRNumber: src.PRNumber, CommitSHA: r.Commit, Seq: r.Seq,
+	verdict, id, err := b.store.Revoke(b.ctx, Revoke{
+		DeliveryID: r.ID, PayloadSHA256: r.Payload, EnvID: r.EnvID, Repo: src.Repo, PRNumber: src.PRNumber, CommitSHA: r.Commit, Seq: r.Seq,
 		Reason: RevokedDismissed, Trusted: r.Trusted,
 	}, now, b.audit(AuditApprovalRevoked, r.EnvID, r.Commit, string(RevokedDismissed)))
 	b.must(t, err, "revoke")
-	return id
+	return verdict, id
 }
 
 func (b *v1StoreBackend) acquire(t *rapid.T, now time.Time) (v1Lease, bool) {
@@ -328,8 +329,10 @@ func (b *v1StoreBackend) verify(t *rapid.T, x *v1Machine) {
 	}
 	b.must(t, rows.Err(), "list deliveries")
 	b.must(t, rows.Close(), "close deliveries")
-	if !maps.Equal(deliveries, m.deliveries) {
-		t.Fatalf("deliveries diverged from the model\n db:    %+v\n model: %+v", deliveries, m.deliveries)
+	want := maps.Clone(m.deliveries)
+	maps.Copy(want, m.approvalDeliveries)
+	if !maps.Equal(deliveries, want) {
+		t.Fatalf("deliveries diverged from the model\n db:    %+v\n model: %+v", deliveries, want)
 	}
 
 	for _, e := range x.envs {

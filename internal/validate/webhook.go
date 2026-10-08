@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
 )
 
 const (
@@ -28,6 +29,8 @@ const (
 	ActionReopened    = "reopened"
 	ActionSynchronize = "synchronize"
 	ActionClosed      = "closed"
+	ActionLabeled     = "labeled"
+	ActionUnlabeled   = "unlabeled"
 )
 
 var (
@@ -70,6 +73,7 @@ func VerifySignature(secret, body []byte, header string) error {
 // PullRequest is a validated pull_request event: every field has passed its
 // validator. HeadRepo and the opener are recorded with the job; trust is
 // never decided from them, but from GHES at AuthorizeDeploy (D-V1-5).
+// UpdatedAt is the signed time the delivery GUID is bound to (V1-I7).
 type PullRequest struct {
 	Action      string
 	Number      uint32
@@ -80,35 +84,112 @@ type PullRequest struct {
 	HeadRepo    string // "" when the head repository (a fork) was deleted
 	OpenerLogin string
 	OpenerID    int64
+	UpdatedAt   time.Time
+	SenderLogin string
+	SenderID    int64
+	Label       string // labeled and unlabeled only
+}
+
+// accountWire is a GitHub account object.
+type accountWire struct {
+	Login *string `json:"login"`
+	ID    *int64  `json:"id"`
+}
+
+// pullRequestObjectWire is the pull_request object of pull_request and
+// pull_request_review events.
+type pullRequestObjectWire struct {
+	Number *uint32 `json:"number"`
+	Head   *struct {
+		Ref  *string `json:"ref"`
+		SHA  *string `json:"sha"`
+		Repo *struct {
+			FullName *string `json:"full_name"`
+		} `json:"repo"`
+	} `json:"head"`
+	User      *accountWire `json:"user"`
+	UpdatedAt *string      `json:"updated_at"`
+}
+
+type repositoryWire struct {
+	FullName *string `json:"full_name"`
+	CloneURL *string `json:"clone_url"`
 }
 
 type pullRequestWire struct {
-	Action      *string `json:"action"`
-	Number      *uint32 `json:"number"`
-	PullRequest *struct {
-		Head *struct {
-			Ref  *string `json:"ref"`
-			SHA  *string `json:"sha"`
-			Repo *struct {
-				FullName *string `json:"full_name"`
-			} `json:"repo"`
-		} `json:"head"`
-		User *struct {
-			Login *string `json:"login"`
-			ID    *int64  `json:"id"`
-		} `json:"user"`
-	} `json:"pull_request"`
-	Repository *struct {
-		FullName *string `json:"full_name"`
-		CloneURL *string `json:"clone_url"`
-	} `json:"repository"`
+	Action      *string                `json:"action"`
+	Number      *uint32                `json:"number"`
+	PullRequest *pullRequestObjectWire `json:"pull_request"`
+	Repository  *repositoryWire        `json:"repository"`
+	Sender      *accountWire           `json:"sender"`
+	Label       *struct {
+		Name *string `json:"name"`
+	} `json:"label"`
+}
+
+// pullRequestFields decodes what both event kinds carry about the pull
+// request into pr, validated. number is the event's PR number.
+func pullRequestFields(number *uint32, o *pullRequestObjectWire, repo *repositoryWire, sender *accountWire, pr *PullRequest) error {
+	if number == nil || o == nil || o.Head == nil || o.Head.Ref == nil || o.Head.SHA == nil ||
+		o.User == nil || o.User.Login == nil || o.User.ID == nil || o.UpdatedAt == nil ||
+		(o.Head.Repo != nil && o.Head.Repo.FullName == nil) ||
+		repo == nil || repo.FullName == nil || repo.CloneURL == nil ||
+		sender == nil || sender.Login == nil || sender.ID == nil {
+		return errors.New("missing required field")
+	}
+	pr.Number, pr.Repo, pr.CloneURL = *number, *repo.FullName, *repo.CloneURL
+	pr.HeadRef, pr.HeadSHA = *o.Head.Ref, *o.Head.SHA
+	pr.OpenerLogin, pr.OpenerID = *o.User.Login, *o.User.ID
+	pr.SenderLogin, pr.SenderID = *sender.Login, *sender.ID
+	if o.Head.Repo != nil {
+		pr.HeadRepo = *o.Head.Repo.FullName
+		if err := RepoFullName(pr.HeadRepo); err != nil {
+			return fmt.Errorf("head %w", err)
+		}
+	}
+	if pr.Number == 0 {
+		return errors.New("pull request number must be positive")
+	}
+	if err := account("opener", pr.OpenerLogin, pr.OpenerID); err != nil {
+		return err
+	}
+	if err := account("sender", pr.SenderLogin, pr.SenderID); err != nil {
+		return err
+	}
+	updated, err := Timestamp(*o.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("pull request updated_at: %w", err)
+	}
+	pr.UpdatedAt = updated
+	if err := RepoFullName(pr.Repo); err != nil {
+		return err
+	}
+	if err := GitRef(pr.HeadRef); err != nil {
+		return err
+	}
+	if err := CommitSHA(pr.HeadSHA); err != nil {
+		return err
+	}
+	return cloneURL(pr.CloneURL)
+}
+
+// account validates a login and its numeric account ID.
+func account(role, login string, id int64) error {
+	if err := Login(login); err != nil {
+		return fmt.Errorf("%s %w", role, err)
+	}
+	if id <= 0 {
+		return fmt.Errorf("%s id must be positive", role)
+	}
+	return nil
 }
 
 // ParsePullRequest decodes and validates a pull_request webhook body. The
 // fields previewd uses are required for every action, so a `closed` event
 // derives the same environment ID as the `opened` one. head.repo may be
-// null (a deleted fork) and is then "". A well-formed event with another
-// action returns ErrIgnoredAction.
+// null (a deleted fork) and is then "". labeled and unlabeled carry the
+// label's name. A well-formed event with another action returns
+// ErrIgnoredAction.
 func ParsePullRequest(body []byte) (PullRequest, error) {
 	reject := func(format string, args ...any) (PullRequest, error) {
 		return PullRequest{}, fmt.Errorf("%w: %s", ErrPayload, fmt.Sprintf(format, args...))
@@ -121,55 +202,25 @@ func ParsePullRequest(body []byte) (PullRequest, error) {
 	if err := json.Unmarshal(body, &w); err != nil {
 		return reject("invalid JSON: %v", err)
 	}
-	if w.Action == nil || w.Number == nil || w.PullRequest == nil || w.PullRequest.Head == nil ||
-		w.PullRequest.Head.Ref == nil || w.PullRequest.Head.SHA == nil ||
-		w.PullRequest.User == nil || w.PullRequest.User.Login == nil || w.PullRequest.User.ID == nil ||
-		(w.PullRequest.Head.Repo != nil && w.PullRequest.Head.Repo.FullName == nil) ||
-		w.Repository == nil || w.Repository.FullName == nil || w.Repository.CloneURL == nil {
+	if w.Action == nil {
 		return reject("missing required field")
 	}
-
-	pr := PullRequest{
-		Action:   *w.Action,
-		Number:   *w.Number,
-		Repo:     *w.Repository.FullName,
-		HeadRef:  *w.PullRequest.Head.Ref,
-		HeadSHA:  *w.PullRequest.Head.SHA,
-		CloneURL: *w.Repository.CloneURL,
-
-		OpenerLogin: *w.PullRequest.User.Login,
-		OpenerID:    *w.PullRequest.User.ID,
-	}
-	if w.PullRequest.Head.Repo != nil {
-		pr.HeadRepo = *w.PullRequest.Head.Repo.FullName
-		if err := RepoFullName(pr.HeadRepo); err != nil {
-			return reject("head %v", err)
-		}
-	}
-	if pr.Number == 0 {
-		return reject("pull request number must be positive")
-	}
-	if err := Login(pr.OpenerLogin); err != nil {
-		return reject("opener %v", err)
-	}
-	if pr.OpenerID <= 0 {
-		return reject("opener id must be positive")
-	}
-	if err := RepoFullName(pr.Repo); err != nil {
-		return reject("%v", err)
-	}
-	if err := GitRef(pr.HeadRef); err != nil {
-		return reject("%v", err)
-	}
-	if err := CommitSHA(pr.HeadSHA); err != nil {
-		return reject("%v", err)
-	}
-	if err := cloneURL(pr.CloneURL); err != nil {
+	pr := PullRequest{Action: *w.Action}
+	if err := pullRequestFields(w.Number, w.PullRequest, w.Repository, w.Sender, &pr); err != nil {
 		return reject("%v", err)
 	}
 
 	switch pr.Action {
 	case ActionOpened, ActionReopened, ActionSynchronize, ActionClosed:
+		return pr, nil
+	case ActionLabeled, ActionUnlabeled:
+		if w.Label == nil || w.Label.Name == nil {
+			return reject("missing required field")
+		}
+		if err := LabelName(*w.Label.Name); err != nil {
+			return reject("%v", err)
+		}
+		pr.Label = *w.Label.Name
 		return pr, nil
 	default:
 		return pr, ErrIgnoredAction

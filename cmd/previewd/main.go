@@ -157,7 +157,17 @@ func main() {
 		close(workersDone)
 	}()
 
-	apiServer := api.NewServer(logger, cfg, db, reconciler)
+	// Approval gating (V1 F1). The GHES client is phase C3: until then the
+	// handler judges approvals and revocations without GitHub truth, fail
+	// closed (no approval queues a deploy; a revocation counts as for an
+	// untrusted environment).
+	logger.Error("No GHES client configured: approvals queue no deploy and revocations are judged untrusted (phase C3)",
+		"approver_repositories", len(cfg.Approvers))
+	if cfg.LabelApproval {
+		logger.Error("Opt-in active: an approver's label approves untrusted code",
+			"opt_in", "PREVIEWD_LABEL_APPROVAL", "label", cfg.ApprovalLabel)
+	}
+	apiServer := api.NewServer(logger, cfg, db, reconciler, nil)
 	httpServer := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.APIPort),
 		Handler:           apiServer.Routes(),

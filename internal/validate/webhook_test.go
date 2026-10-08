@@ -8,6 +8,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func sign(secret, body []byte) string {
@@ -20,10 +21,13 @@ const validPayload = `{
   "action": "opened",
   "number": 42,
   "pull_request": {
+    "number": 42,
     "head": {"ref": "feature/login", "sha": "0123456789abcdef0123456789abcdef01234567", "repo": {"full_name": "fork/shop"}},
-    "user": {"login": "octo-cat", "id": 4242}
+    "user": {"login": "octo-cat", "id": 4242},
+    "updated_at": "2026-10-08T12:00:00Z"
   },
-  "repository": {"full_name": "acme/shop", "clone_url": "https://ghes.example/acme/shop.git"}
+  "repository": {"full_name": "acme/shop", "clone_url": "https://ghes.example/acme/shop.git"},
+  "sender": {"login": "octo-cat", "id": 4242}
 }`
 
 // Total function + rejection: VerifySignature never panics, and it accepts
@@ -68,6 +72,8 @@ func FuzzParsePullRequest(f *testing.F) {
 	f.Add([]byte(strings.Replace(validPayload, `{"full_name": "fork/shop"}`, `null`, 1)))
 	f.Add([]byte(strings.Replace(validPayload, `octo-cat`, `-octo`, 1)))
 	f.Add([]byte(strings.Replace(validPayload, `4242`, `0`, 1)))
+	f.Add([]byte(strings.Replace(validPayload, `"opened"`, `"labeled"`, 1)[:len(validPayload)-1] + `,"label":{"name":"previewd-approved"}}`))
+	f.Add([]byte(strings.Replace(validPayload, `2026-10-08T12:00:00Z`, `2026-10-08 12:00`, 1)))
 	f.Add([]byte(`{"action":"opened"}`))
 	f.Add([]byte(`null`))
 	f.Add([]byte(`[]`))
@@ -93,8 +99,20 @@ func FuzzParsePullRequest(f *testing.F) {
 		if pr.Number == 0 {
 			t.Fatal("accepted PR number 0")
 		}
-		if pr.OpenerID <= 0 {
-			t.Fatalf("accepted opener id %d", pr.OpenerID)
+		if pr.OpenerID <= 0 || pr.SenderID <= 0 {
+			t.Fatalf("accepted opener id %d, sender id %d", pr.OpenerID, pr.SenderID)
+		}
+		if pr.UpdatedAt.Unix() <= 0 || pr.UpdatedAt.Location() != time.UTC {
+			t.Fatalf("accepted updated_at %v", pr.UpdatedAt)
+		}
+		labeled := pr.Action == ActionLabeled || pr.Action == ActionUnlabeled
+		if err == nil && labeled != (pr.Label != "") {
+			t.Fatalf("action %q with label %q", pr.Action, pr.Label)
+		}
+		if pr.Label != "" {
+			if err := LabelName(pr.Label); err != nil {
+				t.Fatalf("accepted invalid label: %v", err)
+			}
 		}
 		if pr.HeadRepo != "" {
 			if err := RepoFullName(pr.HeadRepo); err != nil {
@@ -103,13 +121,14 @@ func FuzzParsePullRequest(f *testing.F) {
 		}
 		for name, check := range map[string]error{
 			"repo": RepoFullName(pr.Repo), "ref": GitRef(pr.HeadRef), "sha": CommitSHA(pr.HeadSHA), "clone": cloneURL(pr.CloneURL),
-			"opener": Login(pr.OpenerLogin),
+			"opener": Login(pr.OpenerLogin), "sender": Login(pr.SenderLogin),
 		} {
 			if check != nil {
 				t.Fatalf("accepted invalid %s: %v", name, check)
 			}
 		}
-		acted := pr.Action == ActionOpened || pr.Action == ActionReopened || pr.Action == ActionSynchronize || pr.Action == ActionClosed
+		acted := pr.Action == ActionOpened || pr.Action == ActionReopened || pr.Action == ActionSynchronize ||
+			pr.Action == ActionClosed || labeled
 		if acted != (err == nil) {
 			t.Fatalf("action %q returned err=%v", pr.Action, err)
 		}
@@ -125,9 +144,38 @@ func TestParsePullRequestAcceptsValidPayload(t *testing.T) {
 		Action: ActionOpened, Number: 42, Repo: "acme/shop", HeadRef: "feature/login",
 		HeadSHA: "0123456789abcdef0123456789abcdef01234567", CloneURL: "https://ghes.example/acme/shop.git",
 		HeadRepo: "fork/shop", OpenerLogin: "octo-cat", OpenerID: 4242,
+		UpdatedAt: time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC), SenderLogin: "octo-cat", SenderID: 4242,
 	}
 	if pr != want {
 		t.Fatalf("got %+v, want %+v", pr, want)
+	}
+}
+
+// labeled and unlabeled carry a validated label name; without one they are
+// refused, never treated as another label.
+func TestParsePullRequestLabel(t *testing.T) {
+	labeled := func(action, label string) []byte {
+		body := strings.Replace(validPayload, `"opened"`, `"`+action+`"`, 1)
+		return []byte(strings.TrimSuffix(body, "}") + label + "}")
+	}
+	for _, action := range []string{ActionLabeled, ActionUnlabeled} {
+		pr, err := ParsePullRequest(labeled(action, `,"label":{"name":"previewd-approved"}`))
+		if err != nil || pr.Label != "previewd-approved" {
+			t.Fatalf("%s = %+v, %v", action, pr, err)
+		}
+		for name, label := range map[string]string{
+			"no label":      ``,
+			"no name":       `,"label":{}`,
+			"empty name":    `,"label":{"name":""}`,
+			"long name":     `,"label":{"name":"` + strings.Repeat("l", 51) + `"}`,
+			"control char":  `,"label":{"name":"approved\u0007"}`,
+			"numeric name":  `,"label":{"name":7}`,
+			"label is null": `,"label":null`,
+		} {
+			if _, err := ParsePullRequest(labeled(action, label)); !errors.Is(err, ErrPayload) {
+				t.Errorf("%s with %s: %v, want ErrPayload", action, name, err)
+			}
+		}
 	}
 }
 
@@ -145,7 +193,8 @@ func TestParsePullRequestRejectsMissingFields(t *testing.T) {
 	paths := [][]string{
 		{"action"}, {"number"}, {"pull_request"}, {"pull_request", "head"}, {"pull_request", "head", "ref"},
 		{"pull_request", "head", "sha"}, {"pull_request", "head", "repo", "full_name"}, {"pull_request", "user"},
-		{"pull_request", "user", "login"}, {"pull_request", "user", "id"},
+		{"pull_request", "user", "login"}, {"pull_request", "user", "id"}, {"pull_request", "updated_at"},
+		{"sender"}, {"sender", "login"}, {"sender", "id"},
 		{"repository"}, {"repository", "full_name"}, {"repository", "clone_url"},
 	}
 	for _, path := range paths {
@@ -189,6 +238,10 @@ func TestParsePullRequestRejectsInvalidFields(t *testing.T) {
 		"zero opener id":   {`4242`, `0`},
 		"negative id":      {`4242`, `-4242`},
 		"string id":        {`4242`, `"4242"`},
+		"local timestamp":  {`2026-10-08T12:00:00Z`, `2026-10-08T12:00:00`},
+		"epoch timestamp":  {`2026-10-08T12:00:00Z`, `1970-01-01T00:00:00Z`},
+		"numeric time":     {`"2026-10-08T12:00:00Z"`, `1791460800`},
+		"bad sender":       {`"sender": {"login": "octo-cat"`, `"sender": {"login": "octo cat"`},
 	} {
 		body := strings.Replace(validPayload, edit[0], edit[1], 1)
 		if body == validPayload {

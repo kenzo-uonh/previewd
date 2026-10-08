@@ -48,6 +48,19 @@ send_webhook() {
     --data-binary "$2"
 }
 
+# send_webhook_code EVENT BODY [DELIVERY]: as send_webhook, printing only the
+# HTTP status.
+send_webhook_code() {
+  local sig delivery="${3:-$(uuid1)}"
+  sig=$(printf '%s' "$2" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | sed 's/^.*= //')
+  curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8080/webhooks/github \
+    -H "X-GitHub-Event: $1" \
+    -H "X-GitHub-Delivery: $delivery" \
+    -H "X-Hub-Signature-256: sha256=$sig" \
+    -H "Content-Type: application/json" \
+    --data-binary "$2"
+}
+
 # wait_for SECONDS DESCRIPTION COMMAND...: poll until COMMAND succeeds.
 wait_for() {
   local secs="$1" what="$2"
@@ -170,10 +183,16 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8080/webh
 [ "$code" = "401" ] || fail "unsigned webhook answered $code, want 401"
 echo "    ok: unsigned webhook rejected (401)"
 
-PR_BODY() {
-  printf '{"action":"%s","number":999,"pull_request":{"head":{"ref":"e2e/branch","sha":"%s","repo":{"full_name":"e2e/mock"}},"user":{"login":"e2e-opener","id":4242}},"repository":{"full_name":"e2e/mock","clone_url":"file://%s/mock.git"}}' \
-    "$1" "$MOCK_SHA" "$MOCK_DIR"
+# PR_BODY_AT ACTION UPDATED_AT: a pull_request body whose signed time is
+# UPDATED_AT. The delivery GUID must fall within [UPDATED_AT - 5 min,
+# UPDATED_AT + PREVIEWD_DELIVERY_MAX_AGE] (V1-I7).
+PR_BODY_AT() {
+  printf '{"action":"%s","number":999,"pull_request":{"number":999,"head":{"ref":"e2e/branch","sha":"%s","repo":{"full_name":"e2e/mock"}},"user":{"login":"e2e-opener","id":4242},"updated_at":"%s"},"repository":{"full_name":"e2e/mock","clone_url":"file://%s/mock.git"},"sender":{"login":"e2e-opener","id":4242}}' \
+    "$1" "$MOCK_SHA" "$2" "$MOCK_DIR"
 }
+# One signed time for the bodies below: a body sent twice is byte-identical.
+PR_UPDATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PR_BODY() { PR_BODY_AT "$1" "$PR_UPDATED_AT"; }
 
 echo -e "\n==> 1c. Delivery GUIDs that cannot be ordered are rejected..."
 for bad in "" "3f1c6b2e-9a7d-4c1b-8e2f-0a1b2c3d4e5f" "not-a-uuid"; do
@@ -205,6 +224,11 @@ case "$(send_webhook pull_request "$(PR_BODY opened)")" in
 case "$(send_webhook pull_request "$(PR_BODY synchronize)" "$OLD_DELIVERY")" in
   *'"status":"stale"'*) ;; *) fail "older delivery not stale" ;; esac
 echo "    ok: same GUID and same body under a new GUID are duplicates; an older GUID is stale"
+
+echo -e "\n==> 2d (cont.). A body whose signed time is an hour old, under a fresh GUID, is refused (V1-I7)..."
+code=$(send_webhook_code pull_request "$(PR_BODY_AT synchronize "$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%SZ)")")
+[ "$code" = "400" ] || fail "a body signed an hour ago answered $code under a fresh GUID, want 400"
+echo "    ok: the delivery time is bound to the signed payload time"
 
 echo -e "\n\n[*] Agent is processing job in background. Waiting up to 60 seconds for the route..."
 wait_for 60 "route document $ENV_ID.yml" test -f "$ROUTES_DIR/$ENV_ID.yml"
@@ -280,7 +304,7 @@ done
 echo "    ok: orphan, foreign and partial route files removed; the kept environment and its route survive the crash"
 
 echo "==> 2f. A build that fails in a RUN step is recorded as a build failure..."
-BROKEN_BODY=$(printf '{"action":"opened","number":1000,"pull_request":{"head":{"ref":"e2e/broken","sha":"%s","repo":{"full_name":"e2e/mock"}},"user":{"login":"e2e-opener","id":4242}},"repository":{"full_name":"e2e/mock","clone_url":"file://%s/mock.git"}}' "$BROKEN_SHA" "$MOCK_DIR")
+BROKEN_BODY=$(printf '{"action":"opened","number":1000,"pull_request":{"number":1000,"head":{"ref":"e2e/broken","sha":"%s","repo":{"full_name":"e2e/mock"}},"user":{"login":"e2e-opener","id":4242},"updated_at":"%s"},"repository":{"full_name":"e2e/mock","clone_url":"file://%s/mock.git"},"sender":{"login":"e2e-opener","id":4242}}' "$BROKEN_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$MOCK_DIR")
 reply=$(send_webhook pull_request "$BROKEN_BODY")
 BROKEN_ENV=$(printf '%s' "$reply" | sed -n 's/.*"environment_id":"\([a-z0-9-]*\)".*/\1/p')
 [ -n "$BROKEN_ENV" ] || fail "no environment_id for the broken build: $reply"
