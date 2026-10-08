@@ -31,7 +31,7 @@ import (
 // Queue is the job queue the reconciler consumes (store.Store).
 type Queue interface {
 	Acquire(ctx context.Context, now time.Time) (store.Lease, bool, error)
-	Finish(ctx context.Context, l store.Lease, status store.JobStatus) error
+	Finish(ctx context.Context, l store.Lease, status store.JobStatus, now time.Time) error
 	Requeue(ctx context.Context, l store.Lease, notBefore time.Time) error
 	StartupSweep(ctx context.Context, now time.Time, observed []store.Observation) (store.SweepResult, error)
 }
@@ -236,7 +236,7 @@ func (r *Reconciler) deploy(ctx context.Context, l store.Lease, log *slog.Logger
 	cctx, cancel := cleanupContext(ctx)
 	defer cancel()
 	if err == nil {
-		if err = r.cfg.Queue.Finish(cctx, l, store.StatusSuccess); err == nil {
+		if err = r.cfg.Queue.Finish(cctx, l, store.StatusSuccess, r.cfg.Now()); err == nil {
 			log.Info("Environment deployed")
 			return
 		}
@@ -248,7 +248,7 @@ func (r *Reconciler) deploy(ctx context.Context, l store.Lease, log *slog.Logger
 	if rbErr := Teardown(cctx, r.cfg.Engine, r.cfg.Routes, r.cfg.Stager, l.EnvID); rbErr != nil {
 		log.Error("Rollback incomplete: the next startup sweep removes the rest", "error", rbErr)
 	}
-	if fErr := r.cfg.Queue.Finish(cctx, l, store.StatusFailed); fErr != nil {
+	if fErr := r.cfg.Queue.Finish(cctx, l, store.StatusFailed, r.cfg.Now()); fErr != nil {
 		log.Error("Could not record the failed deploy", "error", fErr)
 	}
 }
@@ -313,7 +313,7 @@ func (r *Reconciler) teardown(ctx context.Context, l store.Lease, log *slog.Logg
 		}
 		return
 	}
-	if err := r.cfg.Queue.Finish(cctx, l, store.StatusSuccess); err != nil {
+	if err := r.cfg.Queue.Finish(cctx, l, store.StatusSuccess, r.cfg.Now()); err != nil {
 		log.Error("Could not record the teardown: the next startup sweep requeues it", "error", err)
 		return
 	}

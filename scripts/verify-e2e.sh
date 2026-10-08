@@ -171,7 +171,7 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8080/webh
 echo "    ok: unsigned webhook rejected (401)"
 
 PR_BODY() {
-  printf '{"action":"%s","number":999,"pull_request":{"head":{"ref":"e2e/branch","sha":"%s"}},"repository":{"full_name":"e2e/mock","clone_url":"file://%s/mock.git"}}' \
+  printf '{"action":"%s","number":999,"pull_request":{"head":{"ref":"e2e/branch","sha":"%s","repo":{"full_name":"e2e/mock"}},"user":{"login":"e2e-opener","id":4242}},"repository":{"full_name":"e2e/mock","clone_url":"file://%s/mock.git"}}' \
     "$1" "$MOCK_SHA" "$MOCK_DIR"
 }
 
@@ -280,7 +280,7 @@ done
 echo "    ok: orphan, foreign and partial route files removed; the kept environment and its route survive the crash"
 
 echo "==> 2f. A build that fails in a RUN step is recorded as a build failure..."
-BROKEN_BODY=$(printf '{"action":"opened","number":1000,"pull_request":{"head":{"ref":"e2e/broken","sha":"%s"}},"repository":{"full_name":"e2e/mock","clone_url":"file://%s/mock.git"}}' "$BROKEN_SHA" "$MOCK_DIR")
+BROKEN_BODY=$(printf '{"action":"opened","number":1000,"pull_request":{"head":{"ref":"e2e/broken","sha":"%s","repo":{"full_name":"e2e/mock"}},"user":{"login":"e2e-opener","id":4242}},"repository":{"full_name":"e2e/mock","clone_url":"file://%s/mock.git"}}' "$BROKEN_SHA" "$MOCK_DIR")
 reply=$(send_webhook pull_request "$BROKEN_BODY")
 BROKEN_ENV=$(printf '%s' "$reply" | sed -n 's/.*"environment_id":"\([a-z0-9-]*\)".*/\1/p')
 [ -n "$BROKEN_ENV" ] || fail "no environment_id for the broken build: $reply"

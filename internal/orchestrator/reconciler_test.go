@@ -207,7 +207,9 @@ func (r *rig) enqueue(typ store.JobType) {
 	sum := sha256.Sum256([]byte(id))
 	v, _, err := r.queue.Enqueue(context.Background(), store.Delivery{
 		ID: id, PayloadSHA256: hex.EncodeToString(sum[:]), EnvID: testEnv, Type: typ, Seq: r.seq,
-		Source: store.Source{Repo: "acme/app", PRNumber: 7, CommitSHA: "0123456789abcdef0123456789abcdef01234567", CloneURL: "https://git.example.internal/acme/app.git"},
+		Source: store.Source{Repo: "acme/app", HeadRepo: "acme/app", PRNumber: 7, OpenerLogin: "opener", OpenerID: 4242,
+			CommitSHA: "0123456789abcdef0123456789abcdef01234567", CloneURL: "https://git.example.internal/acme/app.git"},
+		ReceivedAt: r.now,
 	})
 	if err != nil || v != store.VerdictAccepted {
 		r.t.Fatalf("enqueue: %s, %v", v, err)

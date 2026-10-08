@@ -1,6 +1,6 @@
 # V1 formal model design (task A0)
 
-Status: accepted 2026-10-08; implemented by A1 (`previewd.tla`). Section 10 lists what modeling changed, written back as A0 requires. Section 11 lists the two design bugs the A2 state-machine test found beyond the TLC bounds, and the rules that replaced them. Prerequisite of task A1 in `docs/specs/V1-previewd.md`: A1 implements exactly this design in `previewd.tla`. Any deviation found while modeling is written back here first.
+Status: accepted 2026-10-08; implemented by A1 (`previewd.tla`). Section 10 lists what modeling changed, written back as A0 requires. Section 11 lists the two design bugs the A2 state-machine test found beyond the TLC bounds, the rules that replaced them, and the A2-6 rule decided after the security review. Prerequisite of task A1 in `docs/specs/V1-previewd.md`: A1 implements exactly this design in `previewd.tla`. Any deviation found while modeling is written back here first.
 
 The MVP model (`previewd.tla`, `docs/formal/README.md`) stays the base. V1 adds commit identity, trust, approvals, revocation, re-validation, pruning and expiry. Every MVP property keeps holding with the V1 features disabled (section 6.1).
 
@@ -93,7 +93,7 @@ Transition rules beyond the MVP:
   - trusted environment: allow (`authz = "trusted"`);
   - untrusted environment with `LiveApproval(e, j.commit) ∧ j.commit ∈ approvedGH[e]`: allow (`authz = "approved"`);
   - untrusted without both: park. The previous version is destroyed and the job becomes `PENDING_APPROVAL`, in one step;
-  - GHES fault: `QUEUED`, attempt counted, nothing changed on the host.
+  - GHES fault: `QUEUED`, attempt counted. Before that, when the running version was authorized by approval and its approval is not live in the DB (`RevokedVersionRuns`, a DB read), it is destroyed, as the park does (A2-6). Nothing else changes on the host.
 - **`Revalidate(e)`:**
   - if allowed (trusted, or approved in GitHub truth and live in the DB): reset `revalFails[e]`;
   - if not: record an internal `revoke` at the current stamp and queue a teardown (`origin = "revalidation"`, `seq = MaxSeq(e) + 1`);
@@ -137,6 +137,7 @@ A latest job `PENDING_APPROVAL`, a revoked approval and a lost permission all le
 | `SafetyParkRemovesPrevious` | daemon up ∧ latest job of `e` is `PENDING_APPROVAL` ⇒ `¬Exists(e)` | invariant |
 | `SafetyRevocationPending` | daemon up ∧ `e ∈ UntrustedEnvs` ∧ `Exists(e)` ∧ builder `SUCCESS` ∧ `¬LiveApproval(e, environments[e].commit)` ⇒ a job of `e` newer than the builder is `QUEUED`, `IN_PROGRESS` or `PENDING_APPROVAL` | invariant |
 | `SafetyInternalJobsAreNewest` | Every internal job (`origin ≠ "webhook"`) has `seq` above every job and watermark of its environment at creation | action |
+| `SafetyUnavailableRemovesRevoked` | A GHES-unavailable `AuthorizeDeploy` never leaves running a version authorized by approval whose grant the DB no longer holds live (A2-6) | action |
 | `SafetyPruneKeepsVerdicts`, `SafetyPrunedDeliveriesStale`, `SafetyPruneKeepsLatest` | section 3 | invariants |
 | All MVP safety properties | unchanged statements over the extended state | invariants and action |
 
@@ -205,6 +206,7 @@ A1 is accepted when every configuration of 6.1 passes within budget, coverage sh
 | V1-M17 | `Expirer` not fair | `LivenessExpired` | ttl |
 | V1-M18 | Trusted and untrusted jobs of different environments share the lock | `SafetyOneJobPerEnv` / `LivenessEventualCompletion` | mixed |
 | V1-M19 | `Revalidator` checks untrusted environments only (the pre-D-V1-5 design) | `LivenessRevokedTornDown` (offboarded opener) | mixed |
+| V1-M22 | GHES unavailable in `AuthorizeDeploy` leaves a revoked version running (before A2-6) | `SafetyUnavailableRemovesRevoked` | approval |
 
 Out of model, and checked by Go tests instead:
 - an untrusted deploy receiving trusted secrets (`Injector.Section`);
@@ -217,7 +219,7 @@ The task list names the test for each.
 
 ## 8. Mapping to the state-machine test (A2)
 
-Implemented in `internal/store/jobs_spbt_v1_test.go` (reference model and commands), `jobs_spbt_v1_props_test.go` (properties, drain, mutants) and `jobs_spbt_v1_store_test.go` (the store backend, build tag `v1spbt`, which pins the store API until D3).
+Implemented in `internal/store/jobs_spbt_v1_test.go` (reference model and commands), `jobs_spbt_v1_props_test.go` (properties, drain, mutants) and `jobs_spbt_v1_store_test.go` (the store backend; it pinned the store API behind the build tag `v1spbt` until B1 implemented it, and runs untagged since).
 
 | Model action | Store method (V1 spec 3.4, as A2 pins it) | SPBT command |
 |---|---|---|
@@ -316,4 +318,12 @@ The state-machine test (section 8) explores runs far beyond the TLC bounds: up t
   - The spec's event matrix revoked approvals on `closed` (`pr_closed`). The model does not, and GitHub keeps approvals across close and reopen: a reopened PR deploys only if `AuthorizeDeploy` finds the approval live in both the DB and GitHub. The matrix now follows the model. The `pr_closed` and `revalidation_unavailable` reasons stay in the vocabulary, unused by the queue.
 
 
-- **A2-6 (open, owner decision before D4 and D6), a revoked version can outlive a GHES outage.** Security review of A2-1. When a revocation finds that the latest job deploys another commit, no teardown is queued: that newer deploy removes the revoked version when `AuthorizeDeploy` runs it (replaced, or destroyed by the park). While GHES is unavailable, `AuthorizeDeploy` requeues that deploy with backoff and changes nothing on the host, so the revoked version keeps running for the whole outage. The Revalidator does not bound it either: `NeedsRevalidation` requires the builder to be the latest job, so the fail-closed grace never starts. The A1 rule removed it at once, since a teardown needs no GHES, but A1 lost the new head (A2-1). The model's liveness holds only because GHES faults are bounded. Severity MEDIUM (V1 spec invariant: authorized code only, revocable). Proposed rule, to model before D4: in the GHES-unavailable branch of `AuthorizeDeploy`, destroy the running version first when its builder was authorized by approval and its approval is no longer live in the DB (a DB read, no GHES call), as the park does; then requeue. To check: an action property (a GHES-unavailable `AuthorizeDeploy` never leaves running an approval-authorized version whose approval is not live in the DB), a configuration with `MaxGhesFaults` large enough to cover the outage, and a mutant that skips the removal.
+- **A2-6 (decided by the owner 2026-10-08, modeled before D4), a revoked version could outlive a GHES outage.** Security review of A2-1. When a revocation finds that the latest job deploys another commit, no teardown is queued: that newer deploy removes the revoked version when `AuthorizeDeploy` runs it (replaced, or destroyed by the park). While GHES was unavailable, `AuthorizeDeploy` requeued that deploy with backoff and changed nothing on the host, so the revoked version kept running for the whole outage. The Revalidator did not bound it either: `NeedsRevalidation` requires the builder to be the latest job, so the fail-closed grace never started. The same held for a push: its `new_head` revocation queues no teardown. The A1 rule removed the version at once, since a teardown needs no GHES, but lost the new head (A2-1). The model's liveness held only because GHES faults are bounded. Severity MEDIUM (V1 spec invariant: authorized code only, revocable).
+
+  **Rule now:** in the GHES-unavailable branch of `AuthorizeDeploy`, the running version is destroyed first when its builder was authorized by approval and its approval is not live in the DB (`RevokedVersionRuns(e)`, a DB read, no GHES call), as the park does; the deploy is then requeued. Checked by the action property `SafetyUnavailableRemovesRevoked` in every configuration, and by mutant V1-M22 (the removal skipped): killed in `previewd-approval.cfg` at depth 16 (66,441 states, 56 s), and in the Go reference model. One GHES fault is enough: a safety property needs no outage longer than one step, so no configuration was added. `previewd-approval` (211,448 → 212,752 states) and `previewd-grace` (125,236 → 125,796) grew with the destroyed states; the other configurations kept their counts.
+
+  *Residual (LOW, documented):* a trusted version whose opener lost write access (D-V1-5) keeps running during the same outage when a newer deploy waits: the DB holds no evidence of the loss, and a re-validation teardown above the newer deploy would skip it (the A2-1 problem). It is removed when GHES answers.
+
+  In the store (B1): the orchestrator reads the builder's `jobs.trust` and `ApprovalLive` before `Requeue`. The A2 state-machine test asserts that `ApprovalLive` answers as the model in this branch.
+
+- **A2-5 in B1.** The store keeps grants (`approvals`), explicit revocations per `(env, commit)` (`revocations`, with or without a grant) and the new-head revocation (`heads`, one row per environment: every commit but the newest head is revoked at its seq, the head at the newest seq of any other deploy) apart. That represents the model's `approvalsDB` over an unbounded set of commits, including a commit no delivery has named yet. `TestV1Store_StateMachine` compares `ApprovalLive` with the model for every environment and commit after every command.

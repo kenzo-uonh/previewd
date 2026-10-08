@@ -200,11 +200,11 @@ func (m *previewdMachine) modelSweep() []string {
 		j := &m.jobs[i]
 		switch {
 		case j.Status == StatusInProgress && j.Type == JobDeploy:
-			j.Status = StatusFailed
+			j.Status, j.FinishedAt, j.Failure = StatusFailed, m.now.UnixMilli(), FailureInterrupted
 		case j.Status == StatusInProgress && j.Type == JobTeardown:
 			j.Status = StatusQueued
 		case j.Status == StatusSuccess && j.Type == JobDeploy && latest[j.EnvID] == j.ID && !keep[j.EnvID]:
-			j.Status, j.NotBefore = StatusQueued, 0
+			j.Status, j.NotBefore, j.FinishedAt, j.Trust = StatusQueued, 0, 0, TrustUnclassified
 		}
 	}
 	return destroy
@@ -250,6 +250,7 @@ func (m *previewdMachine) ReceiveWebhook(t *rapid.T) {
 		rapid.Int64Range(1, spbtMaxSeq).Draw(t, "seq"))
 	d.Source.PRNumber = rapid.Int64Range(1, 9).Draw(t, "pr")
 	d.Source.CommitSHA = fmt.Sprintf("%040x", rapid.Uint64().Draw(t, "commit"))
+	d.ReceivedAt = m.now
 	m.receive(t, d)
 }
 
@@ -264,7 +265,7 @@ func (m *previewdMachine) ForgedRedelivery(t *rapid.T) {
 	m.nextID++
 	m.receive(t, Delivery{
 		ID: fmt.Sprintf("d-%04d", m.nextID), PayloadSHA256: orig.Payload, EnvID: orig.EnvID,
-		Type: orig.Type, Seq: spbtMaxSeq + 1, Source: orig.Source,
+		Type: orig.Type, Seq: spbtMaxSeq + 1, Source: orig.Source, ReceivedAt: m.now,
 	})
 }
 
@@ -287,7 +288,8 @@ func (m *previewdMachine) receive(t *rapid.T, d Delivery) {
 	}
 	if want == VerdictAccepted {
 		wantID = int64(len(m.jobs) + 1)
-		m.jobs = append(m.jobs, Job{ID: wantID, EnvID: d.EnvID, Type: d.Type, Seq: d.Seq, Status: StatusQueued, Source: d.Source})
+		m.jobs = append(m.jobs, Job{ID: wantID, EnvID: d.EnvID, Type: d.Type, Origin: OriginWebhook, Seq: d.Seq,
+			Status: StatusQueued, Trust: TrustUnclassified, CreatedAt: d.ReceivedAt.UnixMilli(), Source: d.Source})
 	}
 	m.deliveries[d.ID] = modelDelivery{EnvID: d.EnvID, Seq: d.Seq, Verdict: want, Type: d.Type, Payload: d.PayloadSHA256, Source: d.Source}
 	m.payloads[d.PayloadSHA256] = true
@@ -303,7 +305,7 @@ func (m *previewdMachine) Redeliver(t *rapid.T) {
 	}
 	id := rapid.SampledFrom(slices.Sorted(maps.Keys(m.deliveries))).Draw(t, "delivery")
 	d := m.deliveries[id]
-	verdict, jobID, err := m.store.Enqueue(m.ctx, Delivery{ID: id, PayloadSHA256: d.Payload, EnvID: d.EnvID, Type: d.Type, Seq: d.Seq, Source: d.Source})
+	verdict, jobID, err := m.store.Enqueue(m.ctx, Delivery{ID: id, PayloadSHA256: d.Payload, EnvID: d.EnvID, Type: d.Type, Seq: d.Seq, Source: d.Source, ReceivedAt: m.now})
 	m.must(t, err, "redeliver")
 	if verdict != VerdictReplay || jobID != 0 {
 		t.Fatalf("redelivery of %s = %s/%d, want replay", id, verdict, jobID)
@@ -346,8 +348,8 @@ func (m *previewdMachine) acquire(t *rapid.T, w int) bool {
 	}
 	for i := range m.jobs {
 		j := &m.jobs[i]
-		if j.EnvID == lease.EnvID && j.Status == StatusQueued {
-			j.Status = StatusSkipped
+		if j.EnvID == lease.EnvID && j.Status == StatusQueued && j.ID != wantID {
+			j.Status, j.FinishedAt = StatusSkipped, m.now.UnixMilli()
 		}
 	}
 	m.jobs[wantID-1].Status = StatusInProgress
@@ -355,6 +357,10 @@ func (m *previewdMachine) acquire(t *rapid.T, w int) bool {
 
 	m.workers[w] = worker{lease: lease, next: stepExecuteTeardown}
 	if lease.Type == JobDeploy {
+		// AuthorizeDeploy: the MVP has no approval gate, every PR is
+		// trusted. A classified deploy is never requeued (failDeploy).
+		m.must(t, m.store.Classify(m.ctx, lease, TrustTrusted), "classify deploy")
+		m.jobs[wantID-1].Trust = TrustTrusted
 		m.workers[w].next = stepExecuteDeploy
 	}
 	return true
@@ -426,13 +432,13 @@ func (m *previewdMachine) step(t *rapid.T, w int, ok bool) {
 		m.host[l.EnvID] = h
 		wk.next = stepCommitDeploy
 	case stepCommitDeploy:
-		m.must(t, m.store.Finish(m.ctx, l, StatusSuccess), "commit deploy")
-		m.jobs[l.JobID-1].Status = StatusSuccess
+		m.must(t, m.store.Finish(m.ctx, l, StatusSuccess, m.now), "commit deploy")
+		m.jobs[l.JobID-1].Status, m.jobs[l.JobID-1].FinishedAt = StatusSuccess, m.now.UnixMilli()
 		*wk = worker{}
 	case stepExecuteTeardown:
 		if !ok {
 			// Transient failure: back to QUEUED with backoff, never FAILED.
-			if err := m.store.Finish(m.ctx, l, StatusFailed); !errors.Is(err, ErrTeardownCannotFail) {
+			if err := m.store.Finish(m.ctx, l, StatusFailed, m.now); !errors.Is(err, ErrTeardownCannotFail) {
 				t.Fatalf("finishing a teardown as FAILED: got %v, want ErrTeardownCannotFail", err)
 			}
 			j := &m.jobs[l.JobID-1]
@@ -445,8 +451,8 @@ func (m *previewdMachine) step(t *rapid.T, w int, ok bool) {
 		delete(m.host, l.EnvID)
 		wk.next = stepCommitTeardown
 	case stepCommitTeardown:
-		m.must(t, m.store.Finish(m.ctx, l, StatusSuccess), "commit teardown")
-		m.jobs[l.JobID-1].Status = StatusSuccess
+		m.must(t, m.store.Finish(m.ctx, l, StatusSuccess, m.now), "commit teardown")
+		m.jobs[l.JobID-1].Status, m.jobs[l.JobID-1].FinishedAt = StatusSuccess, m.now.UnixMilli()
 		*wk = worker{}
 	default:
 		t.Fatalf("worker %d has no step", w)
@@ -464,8 +470,8 @@ func (m *previewdMachine) failDeploy(t *rapid.T, w int) {
 		t.Fatalf("requeueing a deploy: got %v, want ErrDeployCannotRetry", err)
 	}
 	delete(m.host, l.EnvID)
-	m.must(t, m.store.Finish(m.ctx, l, StatusFailed), "fail deploy")
-	m.jobs[l.JobID-1].Status = StatusFailed
+	m.must(t, m.store.Finish(m.ctx, l, StatusFailed, m.now), "fail deploy")
+	m.jobs[l.JobID-1].Status, m.jobs[l.JobID-1].FinishedAt = StatusFailed, m.now.UnixMilli()
 	m.workers[w] = worker{}
 }
 
@@ -504,7 +510,7 @@ func (m *previewdMachine) StaleWorker(t *rapid.T) {
 	if l.Type == JobTeardown && rapid.Bool().Draw(t, "requeue") {
 		err = m.store.Requeue(m.ctx, l, m.now)
 	} else {
-		err = m.store.Finish(m.ctx, l, StatusSuccess)
+		err = m.store.Finish(m.ctx, l, StatusSuccess, m.now)
 	}
 	if !errors.Is(err, ErrLeaseLost) {
 		t.Fatalf("stale lease %+v: got %v, want ErrLeaseLost", l, err)

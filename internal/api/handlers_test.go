@@ -48,7 +48,8 @@ type countingWaker struct{ n int }
 func (c *countingWaker) Notify() { c.n++ }
 
 func prBody(action string) string {
-	return fmt.Sprintf(`{"action":%q,"number":7,"pull_request":{"head":{"ref":"feature/x","sha":"0123456789abcdef0123456789abcdef01234567"}},`+
+	return fmt.Sprintf(`{"action":%q,"number":7,"pull_request":{"head":{"ref":"feature/x","sha":"0123456789abcdef0123456789abcdef01234567",`+
+		`"repo":{"full_name":"acme/app"}},"user":{"login":"opener","id":4242}},`+
 		`"repository":{"full_name":"acme/app","clone_url":"https://git.example.internal/acme/app.git"}}`, action)
 }
 
@@ -85,7 +86,9 @@ func TestWebhookQueuesDeployAndTeardown(t *testing.T) {
 			want := store.Delivery{
 				ID: v1Delivery, PayloadSHA256: hex.EncodeToString(sum[:]),
 				EnvID: envid.Generate("acme/app", "feature/x", 7), Type: typ, Seq: 136177231445825070,
-				Source: store.Source{Repo: "acme/app", PRNumber: 7, CommitSHA: "0123456789abcdef0123456789abcdef01234567", CloneURL: "https://git.example.internal/acme/app.git"},
+				Source: store.Source{Repo: "acme/app", HeadRepo: "acme/app", PRNumber: 7, OpenerLogin: "opener", OpenerID: 4242,
+					CommitSHA: "0123456789abcdef0123456789abcdef01234567", CloneURL: "https://git.example.internal/acme/app.git"},
+				ReceivedAt: v1Time,
 			}
 			if q.got[0] != want {
 				t.Fatalf("delivery = %+v\nwant %+v", q.got[0], want)

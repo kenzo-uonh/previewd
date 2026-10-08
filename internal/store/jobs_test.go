@@ -43,10 +43,13 @@ func sweptStore(t *testing.T) (*Store, string) {
 }
 
 var testSource = Source{
-	Repo:      "acme/app",
-	PRNumber:  7,
-	CommitSHA: "0123456789abcdef0123456789abcdef01234567",
-	CloneURL:  "https://git.example.internal/acme/app.git",
+	Repo:        "acme/app",
+	HeadRepo:    "acme/app",
+	PRNumber:    7,
+	OpenerLogin: "opener",
+	OpenerID:    4242,
+	CommitSHA:   "0123456789abcdef0123456789abcdef01234567",
+	CloneURL:    "https://git.example.internal/acme/app.git",
 }
 
 // payloadHash stands for the SHA-256 of a signed body; distinct deliveries
@@ -57,7 +60,7 @@ func payloadHash(body string) string {
 }
 
 func testDelivery(id, env string, typ JobType, seq int64) Delivery {
-	return Delivery{ID: id, PayloadSHA256: payloadHash("body of " + id), EnvID: env, Type: typ, Seq: seq, Source: testSource}
+	return Delivery{ID: id, PayloadSHA256: payloadHash("body of " + id), EnvID: env, Type: typ, Seq: seq, Source: testSource, ReceivedAt: t0}
 }
 
 func enqueue(t *testing.T, s *Store, id, env string, typ JobType, seq int64) (Verdict, int64) {
@@ -80,7 +83,7 @@ func acquire(t *testing.T, s *Store) Lease {
 
 func finish(t *testing.T, s *Store, l Lease, st JobStatus) {
 	t.Helper()
-	if err := s.Finish(context.Background(), l, st); err != nil {
+	if err := s.Finish(context.Background(), l, st, t0); err != nil {
 		t.Fatalf("Finish %d %s: %v", l.JobID, st, err)
 	}
 }
@@ -108,7 +111,7 @@ func TestQueueRefusesBeforeSweep(t *testing.T) {
 	if _, _, err := s.Acquire(ctx, t0); !errors.Is(err, ErrNotSwept) {
 		t.Errorf("Acquire: %v, want ErrNotSwept", err)
 	}
-	if err := s.Finish(ctx, Lease{JobID: 1, Type: JobDeploy}, StatusSuccess); !errors.Is(err, ErrNotSwept) {
+	if err := s.Finish(ctx, Lease{JobID: 1, Type: JobDeploy}, StatusSuccess, t0); !errors.Is(err, ErrNotSwept) {
 		t.Errorf("Finish: %v, want ErrNotSwept", err)
 	}
 	if err := s.Requeue(ctx, Lease{JobID: 1, Type: JobTeardown}, t0); !errors.Is(err, ErrNotSwept) {
@@ -138,6 +141,12 @@ func TestEnqueueRejectsInvalidDelivery(t *testing.T) {
 		"non hex commit":     func(d *Delivery) { d.Source.CommitSHA = "g" + d.Source.CommitSHA[1:] },
 		"no clone url":       func(d *Delivery) { d.Source.CloneURL = "" },
 		"clone url too long": func(d *Delivery) { d.Source.CloneURL = long },
+		"long head repo":     func(d *Delivery) { d.Source.HeadRepo = long[:141] },
+		"no opener login":    func(d *Delivery) { d.Source.OpenerLogin = "" },
+		"long opener login":  func(d *Delivery) { d.Source.OpenerLogin = long[:40] },
+		"zero opener id":     func(d *Delivery) { d.Source.OpenerID = 0 },
+		"no receipt time":    func(d *Delivery) { d.ReceivedAt = time.Time{} },
+		"epoch receipt time": func(d *Delivery) { d.ReceivedAt = time.UnixMilli(0) },
 	} {
 		d := testDelivery("d", envA, JobDeploy, 1)
 		mutate(&d)
@@ -222,15 +231,16 @@ func TestAcquireNewestWinsAndLocks(t *testing.T) {
 	}
 }
 
-// Teardowns never fail; deploys are never requeued.
+// Teardowns never fail; a deploy is requeued only while unclassified (GHES
+// unavailable during AuthorizeDeploy), never once classified.
 func TestLeaseTransitionRules(t *testing.T) {
 	s, _ := sweptStore(t)
 	enqueue(t, s, "d1", envA, JobTeardown, 1)
 	td := acquire(t, s)
-	if err := s.Finish(context.Background(), td, StatusFailed); !errors.Is(err, ErrTeardownCannotFail) {
+	if err := s.Finish(context.Background(), td, StatusFailed, t0); !errors.Is(err, ErrTeardownCannotFail) {
 		t.Fatalf("teardown FAILED: %v", err)
 	}
-	if err := s.Finish(context.Background(), td, StatusQueued); err == nil {
+	if err := s.Finish(context.Background(), td, StatusQueued, t0); err == nil {
 		t.Fatal("Finish accepted QUEUED")
 	}
 	if err := s.Requeue(context.Background(), td, t0.Add(time.Minute)); err != nil {
@@ -247,8 +257,18 @@ func TestLeaseTransitionRules(t *testing.T) {
 
 	enqueue(t, s, "d2", envB, JobDeploy, 1)
 	dl := acquire(t, s)
+	if err := s.Requeue(context.Background(), dl, t0); err != nil {
+		t.Fatalf("unclassified deploy requeue: %v", err)
+	}
+	dl = acquire(t, s)
+	if dl.Attempts != 1 {
+		t.Fatalf("requeued deploy lease = %+v, want 1 attempt", dl)
+	}
+	if err := s.Classify(context.Background(), dl, TrustTrusted); err != nil {
+		t.Fatalf("Classify: %v", err)
+	}
 	if err := s.Requeue(context.Background(), dl, t0); !errors.Is(err, ErrDeployCannotRetry) {
-		t.Fatalf("deploy requeue: %v", err)
+		t.Fatalf("classified deploy requeue: %v", err)
 	}
 	jobs, err := s.Jobs(context.Background())
 	if err != nil {
@@ -257,10 +277,14 @@ func TestLeaseTransitionRules(t *testing.T) {
 	if jobs[0].Attempts != 1 || jobs[0].Status != StatusSuccess {
 		t.Fatalf("teardown job = %+v, want SUCCESS after 1 attempt", jobs[0])
 	}
+	if jobs[1].Status != StatusInProgress || jobs[1].Trust != TrustTrusted {
+		t.Fatalf("deploy job = %+v, want IN_PROGRESS and trusted after the refused requeue", jobs[1])
+	}
 }
 
 // Defense in depth: SQLite itself refuses a second IN_PROGRESS job for an
-// environment and a FAILED teardown, whatever the Go code does.
+// environment, a FAILED teardown and a duplicate seq, whatever the Go code
+// does.
 func TestSchemaEnforcesLockAndTeardownRule(t *testing.T) {
 	s, _ := sweptStore(t)
 	enqueue(t, s, "d1", envA, JobTeardown, 1)
@@ -272,10 +296,9 @@ func TestSchemaEnforcesLockAndTeardownRule(t *testing.T) {
 	if _, err := s.db.ExecContext(ctx, `UPDATE jobs SET status = 'FAILED' WHERE type = 'teardown'`); err == nil {
 		t.Error("FAILED teardown accepted")
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE jobs SET attempts = 1 WHERE type = 'deploy'`); err == nil {
-		t.Error("deploy attempts accepted")
-	}
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO jobs (preview_id, type, seq, status) VALUES (?, 'deploy', 2, 'QUEUED')`, envA); err == nil {
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO jobs (preview_id, type, seq, status, created_at, repo, head_repo, pr_number,
+		opener_login, opener_id, commit_sha, clone_url) SELECT preview_id, type, seq, status, created_at, repo, head_repo, pr_number,
+		opener_login, opener_id, commit_sha, clone_url FROM jobs WHERE seq = 2`); err == nil {
 		t.Error("duplicate (preview_id, seq) accepted")
 	}
 }
@@ -398,7 +421,7 @@ func TestSweepRequeuesInterruptedTeardown(t *testing.T) {
 		t.Fatalf("statuses = %v, want [SUCCESS QUEUED]", got)
 	}
 	// The dead worker's lease is refused; the new lease belongs to the new epoch.
-	if err := s.Finish(context.Background(), stale, StatusSuccess); !errors.Is(err, ErrLeaseLost) {
+	if err := s.Finish(context.Background(), stale, StatusSuccess, t0); !errors.Is(err, ErrLeaseLost) {
 		t.Fatalf("stale lease: %v, want ErrLeaseLost", err)
 	}
 	l := acquire(t, s)

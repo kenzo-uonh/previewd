@@ -1,0 +1,7 @@
+{
+  "driver": "modernc.org/sqlite",
+  "driver_version": "v1.60.1",
+  "go_version": "go1.27.1",
+  "schema_version": 2,
+  "sqlite_version": "3.53.4"
+}

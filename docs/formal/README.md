@@ -80,6 +80,7 @@ Every configuration checks every property. The initial state lets each environme
 | `SafetyAuthorizeChecksBoth` | action | An `approved` authorization reads the DB grant and GitHub truth in the same step; a `trusted` one reads GitHub truth |
 | `SafetyApprovalBindsCommit` | action | Only a live grant of the exact commit unparks a job |
 | `SafetyInternalJobsAreNewest` | action | An internal job (approval, revocation, re-validation, expiry) is above every seq of its environment |
+| `SafetyUnavailableRemovesRevoked` | action | A GHES-unavailable `AuthorizeDeploy` never leaves running a version authorized by approval whose grant the DB no longer holds live (A2-6) |
 | `RegressionA21` | action (`previewd_a2` only) | A revocation teardown is created only above a latest intent that deploys the revoked commit (A2-1) |
 | `RegressionA22` | invariant (`previewd_a2` only) | A deploy in flight, newer than every delivery of its environment ever recorded, is never already stale (A2-2) |
 | `LivenessEventualCompletion` | liveness | Every `QUEUED` job reaches a terminal state or waits for an approval |
@@ -92,23 +93,25 @@ Every configuration checks every property. The initial state lets each environme
 
 Budget per configuration (V1-model.md section 6.1): 5 million distinct states and 15 minutes on 16 cores.
 
-After A2 (the rules of V1-model.md section 11), all on one 16-thread, 7 GB host, one TLC at a time, 12 workers:
+After A2-6 (V1-model.md section 11), all on one 16-thread, 7 GB host, one TLC at a time, 12 workers, with `SafetyUnavailableRemovesRevoked` in every configuration:
 
 | Config | Distinct states | Depth | Time | Result |
 |---|---|---|---|---|
-| `previewd.cfg` | 686,226 | 37 | 7 min 42 s | no error |
-| `previewd-workers.cfg` | 48,386 | 32 | 37 s | no error |
-| `previewd-approval.cfg` | 211,448 | 37 | 2 min 34 s | no error |
-| `previewd-reapproval.cfg` | 189,904 | 36 | 2 min 57 s | no error |
-| `previewd-approval-reboot.cfg` | 194,928 | 40 | 2 min 08 s | no error |
-| `previewd-mixed.cfg` | 481,280 | 33 | 11 min 26 s | no error |
-| `previewd-prune.cfg` | 203,029 | 32 | 1 min 53 s | no error |
-| `previewd-ttl.cfg` | 9,144 | 30 | 9 s | no error |
-| `previewd-grace.cfg` | 125,236 | 38 | 1 min 32 s | no error |
-| `previewd_a2.cfg` (safety) | 17,241,260 | 44 | 11 min 32 s | no error |
-| `previewd_a2-trust.cfg` (safety) | 3,156,312 | 41 | 1 min 53 s | no error |
+| `previewd.cfg` | 686,226 | 37 | 14 min 35 s | no error |
+| `previewd-workers.cfg` | 48,386 | 32 | 59 s | no error |
+| `previewd-approval.cfg` | 212,752 | 37 | 2 min 52 s | no error |
+| `previewd-reapproval.cfg` | 189,904 | 36 | 3 min 58 s | no error |
+| `previewd-approval-reboot.cfg` | 194,928 | 40 | 2 min 54 s | no error |
+| `previewd-mixed.cfg` | 481,280 | 33 | 19 min 05 s | no error |
+| `previewd-prune.cfg` | 203,029 | 32 | 2 min 40 s | no error |
+| `previewd-ttl.cfg` | 9,144 | 30 | 10 s | no error |
+| `previewd-grace.cfg` | 125,796 | 38 | 1 min 46 s | no error |
+| `previewd_a2.cfg` (safety) | 17,241,260 | 44 | 17 min 55 s | no error |
+| `previewd_a2-trust.cfg` (safety) | 3,156,312 | 41 | 2 min 19 s | no error |
 
-The MVP regression configurations (`previewd`, `previewd-workers`) have exactly A1's state counts: A2 changes nothing with the V1 features off. The V1 configurations grew (approval 104,240 → 211,448): GitHub stamps are spaced and internal jobs no longer move the clock, so more orderings are distinct. Every acceptance configuration is within the budget. `previewd_a2.cfg` is over the state budget (17 M) and within the time budget; it is a regression run, repeated when the revoke rule or the internal seq changes. `previewd_a2-trust.cfg` runs with 4 GitHub actions: with 5 it passed 33 M states without finishing.
+The host also ran the Go store tests during this sweep, so the times are inflated: on an idle host after A2, `previewd-mixed` took 11 min 26 s and `previewd` 7 min 42 s, within the 15-minute budget; the state counts, not the times, are the comparison. A2-6 adds states only where a GHES fault meets a running approved version: `previewd-approval` (211,448 → 212,752) and `previewd-grace` (125,236 → 125,796). Every other configuration, the two MVP regressions and the two A2 regressions (no GHES fault) have exactly their A2 counts.
+
+After A2 (the rules of V1-model.md section 11, before A2-6), on an idle host: previewd 686,226 states (7 min 42 s), workers 48,386, approval 211,448, reapproval 189,904, approval-reboot 194,928, mixed 481,280 (11 min 26 s), prune 203,029, ttl 9,144, grace 125,236, previewd_a2 17,241,260 (11 min 32 s), previewd_a2-trust 3,156,312, all with no error.
 
 A1 results, before A2: previewd 686,226 states (9 min 05 s), workers 48,386, approval 104,240, reapproval 110,752, approval-reboot 95,710, mixed 390,624, prune 203,029, ttl 8,896, grace 58,876, all with no error.
 
@@ -122,7 +125,7 @@ Three configurations were over budget with the bounds first planned and were red
 
 ## Mutation check (V1-model.md section 7)
 
-The TLA+ mutants below were run on the A1 translation and not re-run after A2. Since A2, `TestV1Model_Mutants` (`internal/store/jobs_spbt_v1_props_test.go`) applies every V1 mutant, plus V1-M06b (arrival order), V1-M20 (the A1 revoke rule) and V1-M21 (the A1 internal seq), to the Go reference model at every `make check`, with at least 1,000 runs each: all killed by the property named below or by `RegressionA21`/`RegressionA22`, and V1-M15 and V1-M16 survive. On the A1 model, TLC reproduces both A2 bugs with `previewd_a2.tla`: `RegressionA21` alone at depth 10 (44,748 states), `RegressionA22` alone at depth 7 (1,499 states), and in the trust variant at depth 8 (2,714 states).
+The TLA+ mutants below were run on the A1 translation and not re-run after A2, except V1-M22 (A2-6). Since A2, `TestV1Model_Mutants` (`internal/store/jobs_spbt_v1_props_test.go`) applies every V1 mutant, plus V1-M06b (arrival order), V1-M20 (the A1 revoke rule), V1-M21 (the A1 internal seq) and V1-M22 (the removal of A2-6 skipped), to the Go reference model at every `make check`, with at least 1,000 runs each: all killed by the property named below or by `RegressionA21`/`RegressionA22`, and V1-M15 and V1-M16 survive. With random seeds, V1-M19 survives about one seed in ten at 1,000 runs (seed 9 on the A2 commit too); `make check` pins seed 1, which kills it. On the A1 model, TLC reproduces both A2 bugs with `previewd_a2.tla`: `RegressionA21` alone at depth 10 (44,748 states), `RegressionA22` alone at depth 7 (1,499 states), and in the trust variant at depth 8 (2,714 states).
 
 Each mutant changes one rule of the translated model and must be rejected. TLC stops at the first violated property. Where that was not the property A0 named, the mutant was run again without the first property, and the named property caught it too (marked ✓²).
 
@@ -148,6 +151,7 @@ Each mutant changes one rule of the translated model and must be rejected. TLC s
 | V1-M17 expiry not fair | ttl | `LivenessExpired` |
 | V1-M18 untrusted environments not locked | mixed | `SafetyMonotonicity`; ✓² `SafetyOneJobPerEnv` |
 | V1-M19 only untrusted environments re-validated (before D-V1-5) | mixed | `LivenessRevokedTornDown` (with `LivenessEventualConsistency`) |
+| V1-M22 GHES unavailable in `AuthorizeDeploy` leaves a revoked version running (before A2-6) | approval | `SafetyUnavailableRemovesRevoked` (depth 16, 66,441 states, 56 s; run on the A2-6 translation) |
 
 The watermark is defense in depth in the model: no reachable state needs it while the latest job is kept. The Go store keeps it, because a manual `DELETE` or a future pruning rule would otherwise reopen replays.
 

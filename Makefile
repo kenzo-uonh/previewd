@@ -1,4 +1,4 @@
-.PHONY: all build run dev clean fmt vet lint test sec deps deps-check vendor-check check verify airgap-check fmt-check repomix vuln docker-up docker-down help e2e airgap-scan
+.PHONY: all build run dev clean fmt vet lint test sec deps deps-check vendor-check check verify airgap-check fmt-check repomix vuln docker-up docker-down help e2e airgap-scan store-fixture-v2
 
 APP_NAME    := previewd
 BIN_DIR     := bin
@@ -74,6 +74,9 @@ test: ## Execute the unit test suite (rapid packages use the fixed RAPID_SEED)
 	@echo "Executing test suite..."
 	@chmod +x scripts/test.sh scripts/rapid-packages.sh
 	@RAPID_SEED=$(RAPID_SEED) ./scripts/test.sh
+
+store-fixture-v2: ## Write internal/store/testdata/schema-v2-modernc.{sqlite,json} with the shipped driver (once; commit both files)
+	CGO_ENABLED=0 PREVIEWD_WRITE_STORE_FIXTURE=1 go test -tags storefixture -count=1 -run '^TestWriteSchemaV2Fixture$$' -v ./internal/store/
 
 airgap-scan: ## Static air-gap scan of source, deployments and specs (fails on LOW and above), after its own regression tests
 	@echo "Running air-gap scanner self-tests..."

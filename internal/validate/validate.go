@@ -13,7 +13,10 @@ var (
 	// GitHub: owner 1-39 of [A-Za-z0-9-]; repository 1-100 of [A-Za-z0-9._-].
 	repoFullNamePattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}$`)
 	commitSHAPattern    = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
-	dnsLabelPattern     = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+	// GitHub login: 1-39 of [A-Za-z0-9-], not starting with a hyphen; GHES
+	// with external authentication may also normalize to underscores.
+	loginPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,38}$`)
+	dnsLabelPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 )
 
 const (
@@ -38,6 +41,15 @@ func RepoFullName(s string) error {
 	}
 	if _, repo, _ := strings.Cut(s, "/"); repo == "." || repo == ".." {
 		return fmt.Errorf("invalid repository name %s", quote(s))
+	}
+	return nil
+}
+
+// Login validates a GitHub login. A login names an account for logs and the
+// audit trail only: identity is the numeric account ID.
+func Login(s string) error {
+	if !loginPattern.MatchString(s) {
+		return fmt.Errorf("invalid login %s", quote(s))
 	}
 	return nil
 }

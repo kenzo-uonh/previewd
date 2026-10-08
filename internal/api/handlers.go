@@ -149,11 +149,15 @@ func (s *Server) handleGitHubWebhook() http.HandlerFunc {
 			Type:          typ,
 			Seq:           delivery.Seq,
 			Source: store.Source{
-				Repo:      pr.Repo,
-				PRNumber:  int64(pr.Number),
-				CommitSHA: pr.HeadSHA,
-				CloneURL:  pr.CloneURL,
+				Repo:        pr.Repo,
+				HeadRepo:    pr.HeadRepo,
+				PRNumber:    int64(pr.Number),
+				OpenerLogin: pr.OpenerLogin,
+				OpenerID:    pr.OpenerID,
+				CommitSHA:   pr.HeadSHA,
+				CloneURL:    pr.CloneURL,
 			},
+			ReceivedAt: s.now(),
 		}
 		log := s.logger.With("delivery_id", delivery.ID, "delivery_time", delivery.Time, "environment_id", envID,
 			"repository", pr.Repo, "pr_number", pr.Number, "action", pr.Action, "commit_sha", pr.HeadSHA)

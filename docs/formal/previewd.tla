@@ -209,6 +209,14 @@ define
         /\ db_jobs[Latest(e)].commit = c
         /\ db_jobs[Latest(e)].status \in {"QUEUED", "IN_PROGRESS", "PENDING_APPROVAL", "SUCCESS"}
 
+    \* A2-6: what runs was authorized by approval, and the DB no longer
+    \* holds a live grant of its commit. A DB read, no GHES call: the
+    \* GHES-unavailable branch of AuthorizeDeploy removes it, as the park does.
+    RevokedVersionRuns(e) ==
+        /\ Exists(e)
+        /\ \E j \in Builder(e) : db_jobs[j].authz = "approved"
+        /\ ~LiveApproval(e, environments[e].commit)
+
     \* Every running environment, trusted or not (D-V1-5).
     NeedsRevalidation(e) == Exists(e) /\ BuilderSucceeded(e) /\ BuilderIsLatest(e)
 
@@ -564,9 +572,15 @@ AuthorizeDeploy:
     else
         with e = db_jobs[job].env_id, c = db_jobs[job].commit do
             either
-                \* GHES unavailable: back to QUEUED, nothing changed on the host.
+                \* GHES unavailable: back to QUEUED. A version authorized by
+                \* approval whose grant the DB no longer holds live is removed
+                \* first (A2-6): a newer intent supersedes it and cannot run
+                \* until GHES answers. Nothing else changes on the host.
                 await ghesFaults < MaxGhesFaults;
                 ghesFaults := ghesFaults + 1;
+                if RevokedVersionRuns(e) then
+                    environments[e] := Destroyed(environments[e]);
+                end if;
                 db_jobs[job].status := "QUEUED";
                 job := 0;
                 goto AcquireJob;
@@ -873,6 +887,14 @@ HeadIntentPresent(e, c) ==
     /\ db_jobs[Latest(e)].type = "deploy"
     /\ db_jobs[Latest(e)].commit = c
     /\ db_jobs[Latest(e)].status \in {"QUEUED", "IN_PROGRESS", "PENDING_APPROVAL", "SUCCESS"}
+
+
+
+
+RevokedVersionRuns(e) ==
+    /\ Exists(e)
+    /\ \E j \in Builder(e) : db_jobs[j].authz = "approved"
+    /\ ~LiveApproval(e, environments[e].commit)
 
 
 NeedsRevalidation(e) == Exists(e) /\ BuilderSucceeded(e) /\ BuilderIsLatest(e)
@@ -1267,10 +1289,13 @@ AuthorizeDeploy(self) == /\ pc[self] = "AuthorizeDeploy"
                                          LET c == db_jobs[job[self]].commit IN
                                            \/ /\ ghesFaults < MaxGhesFaults
                                               /\ ghesFaults' = ghesFaults + 1
+                                              /\ IF RevokedVersionRuns(e)
+                                                    THEN /\ environments' = [environments EXCEPT ![e] = Destroyed(environments[e])]
+                                                    ELSE /\ TRUE
+                                                         /\ UNCHANGED environments
                                               /\ db_jobs' = [db_jobs EXCEPT ![job[self]].status = "QUEUED"]
                                               /\ job' = [job EXCEPT ![self] = 0]
                                               /\ pc' = [pc EXCEPT ![self] = "AcquireJob"]
-                                              /\ UNCHANGED environments
                                            \/ /\ Trusted(e)
                                               /\ db_jobs' = [db_jobs EXCEPT ![job[self]] = [db_jobs[job[self]] EXCEPT !.authz = "trusted", !.authzEpoch = crashes]]
                                               /\ pc' = [pc EXCEPT ![self] = "ExecuteDeploy"]
@@ -1601,6 +1626,23 @@ SafetyApprovalBindsCommit ==
     [][\A j \in DOMAIN db_jobs \cap DOMAIN db_jobs' :
           db_jobs[j].status = "PENDING_APPROVAL" /\ db_jobs'[j].status = "QUEUED" =>
               (LiveApprovalSpec(db_jobs[j].env_id, db_jobs[j].commit))'
+      ]_vars
+
+\* V1, A2-6: a GHES-unavailable AuthorizeDeploy never leaves running a
+\* version authorized by approval whose grant the DB no longer holds live.
+\* Without it, a revoked version superseded by a newer deploy (a push, or
+\* a revocation whose latest intent deploys another commit, A2-1) runs for
+\* the whole outage: the Revalidator skips it, since its builder is not
+\* the latest job.
+SafetyUnavailableRemovesRevoked ==
+    [][\A w \in Workers :
+          pc[w] = "AuthorizeDeploy" /\ pc'[w] = "AcquireJob" /\ ghesFaults' = ghesFaults + 1 =>
+              \* A bound variable, not a LET: priming re-evaluates a LET in
+              \* the next state, where job[w] is already 0.
+              \A e \in {db_jobs[job[w]].env_id} :
+              ~(/\ (Exists(e))'
+                /\ (\E j \in Builder(e) : db_jobs[j].authz = "approved")'
+                /\ (~LiveApprovalSpec(e, environments[e].commit))')
       ]_vars
 
 \* V1: an internal job is above every seq of its environment.

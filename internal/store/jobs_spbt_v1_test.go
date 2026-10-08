@@ -36,13 +36,11 @@ package store
 // the TLA+ model. After the random sequence, drain runs the fair processes
 // with GitHub quiet and no fault, then checks the liveness properties.
 //
-// The store under test is a v1Backend. Until the store implements V1 (tasks
-// B1, D3, F, G), TestV1Model_StateMachine checks the reference model alone
-// and TestV1Model_Mutants proves that each V1 mutant of A0 section 7 is
-// caught by the property A1 named. jobs_spbt_v1_store_test.go (build tag
-// v1spbt) drives the real Store with the same machine and compares every
-// table with the model after every command; it does not compile until those
-// tasks add the API it pins.
+// The store under test is a v1Backend. TestV1Model_StateMachine checks the
+// reference model alone and TestV1Model_Mutants proves that each V1 mutant
+// of A0 section 7 is caught by the property A1 named.
+// jobs_spbt_v1_store_test.go drives the real Store with the same machine and
+// compares every table with the model after every command.
 
 import (
 	"fmt"
@@ -95,7 +93,7 @@ func v1TimeAt(clock int64) time.Time {
 }
 
 // Statuses, origins and trust levels of the V1 schema (spec section 3.1),
-// named here until the store defines them (D3).
+// kept apart from the store's constants so the model does not read them.
 const v1StatusPending JobStatus = "PENDING_APPROVAL"
 
 type v1Origin string
@@ -417,6 +415,7 @@ const (
 	v1M19               // only untrusted environments re-validated (before D-V1-5)
 	v1M20               // a revocation judges any active deploy or the running commit (A1 rule, A2-1)
 	v1M21               // an internal job takes a seq above now (A1 rule, A2-2)
+	v1M22               // GHES unavailable in AuthorizeDeploy leaves a revoked version running (before A2-6)
 )
 
 // v1Grant is a grant delivery as the API hands it to the store, with the
@@ -588,6 +587,15 @@ func (x *v1Machine) allowed(e, c string) bool {
 		return true
 	}
 	return x.trusted(e) || x.approvedNow(e, c)
+}
+
+// revokedVersionRuns is RevokedVersionRuns(e) (A2-6): what runs was
+// authorized by approval and the DB no longer holds a live grant of its
+// commit. A DB read, no GHES call.
+func (x *v1Machine) revokedVersionRuns(e string) bool {
+	m := &x.m
+	b, ok := m.builder(e)
+	return m.exists(e) && ok && b.Trust == v1TrustUntrusted && !x.liveIn(m.approvals, e, m.host[e].Commit)
 }
 
 func (x *v1Machine) needsRevalidation(e string) bool {
@@ -1113,7 +1121,19 @@ func (x *v1Machine) authorize(t *rapid.T, w int, ok bool) {
 		}
 		classify(trust)
 	case !ok:
-		// GHES unavailable: back to QUEUED, nothing changed on the host.
+		// GHES unavailable: back to QUEUED. A version authorized by
+		// approval whose grant the DB no longer holds live is removed
+		// first (A2-6): this deploy supersedes it and cannot run until GHES
+		// answers. Nothing else changes on the host.
+		if b, found := m.builder(e); x.st != nil && m.exists(e) && found && b.Trust == v1TrustUntrusted {
+			if got, want := x.st.approvalLive(t, e, b.Commit), x.liveIn(m.approvals, e, b.Commit); got != want {
+				t.Fatalf("approval of %s at %s live = %v, model %v", e, short(b.Commit), got, want)
+			}
+		}
+		if x.cfg.mutant != v1M22 && x.revokedVersionRuns(e) {
+			delete(m.host, e)
+			x.log("worker %d: GHES unavailable, revoked version of %s removed", w, e)
+		}
 		notBefore := now.Add(backoff(j.Attempts))
 		if x.st != nil && x.st.requeue(t, j.ID, notBefore) {
 			t.Fatalf("requeue of unclassified deploy %d refused", j.ID)

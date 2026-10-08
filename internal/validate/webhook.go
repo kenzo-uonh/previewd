@@ -68,14 +68,18 @@ func VerifySignature(secret, body []byte, header string) error {
 }
 
 // PullRequest is a validated pull_request event: every field has passed its
-// validator.
+// validator. HeadRepo and the opener are recorded with the job; trust is
+// never decided from them, but from GHES at AuthorizeDeploy (D-V1-5).
 type PullRequest struct {
-	Action   string
-	Number   uint32
-	Repo     string
-	HeadRef  string
-	HeadSHA  string
-	CloneURL string
+	Action      string
+	Number      uint32
+	Repo        string
+	HeadRef     string
+	HeadSHA     string
+	CloneURL    string
+	HeadRepo    string // "" when the head repository (a fork) was deleted
+	OpenerLogin string
+	OpenerID    int64
 }
 
 type pullRequestWire struct {
@@ -83,9 +87,16 @@ type pullRequestWire struct {
 	Number      *uint32 `json:"number"`
 	PullRequest *struct {
 		Head *struct {
-			Ref *string `json:"ref"`
-			SHA *string `json:"sha"`
+			Ref  *string `json:"ref"`
+			SHA  *string `json:"sha"`
+			Repo *struct {
+				FullName *string `json:"full_name"`
+			} `json:"repo"`
 		} `json:"head"`
+		User *struct {
+			Login *string `json:"login"`
+			ID    *int64  `json:"id"`
+		} `json:"user"`
 	} `json:"pull_request"`
 	Repository *struct {
 		FullName *string `json:"full_name"`
@@ -95,8 +106,9 @@ type pullRequestWire struct {
 
 // ParsePullRequest decodes and validates a pull_request webhook body. The
 // fields previewd uses are required for every action, so a `closed` event
-// derives the same environment ID as the `opened` one. A well-formed event
-// with another action returns ErrIgnoredAction.
+// derives the same environment ID as the `opened` one. head.repo may be
+// null (a deleted fork) and is then "". A well-formed event with another
+// action returns ErrIgnoredAction.
 func ParsePullRequest(body []byte) (PullRequest, error) {
 	reject := func(format string, args ...any) (PullRequest, error) {
 		return PullRequest{}, fmt.Errorf("%w: %s", ErrPayload, fmt.Sprintf(format, args...))
@@ -111,6 +123,8 @@ func ParsePullRequest(body []byte) (PullRequest, error) {
 	}
 	if w.Action == nil || w.Number == nil || w.PullRequest == nil || w.PullRequest.Head == nil ||
 		w.PullRequest.Head.Ref == nil || w.PullRequest.Head.SHA == nil ||
+		w.PullRequest.User == nil || w.PullRequest.User.Login == nil || w.PullRequest.User.ID == nil ||
+		(w.PullRequest.Head.Repo != nil && w.PullRequest.Head.Repo.FullName == nil) ||
 		w.Repository == nil || w.Repository.FullName == nil || w.Repository.CloneURL == nil {
 		return reject("missing required field")
 	}
@@ -122,9 +136,24 @@ func ParsePullRequest(body []byte) (PullRequest, error) {
 		HeadRef:  *w.PullRequest.Head.Ref,
 		HeadSHA:  *w.PullRequest.Head.SHA,
 		CloneURL: *w.Repository.CloneURL,
+
+		OpenerLogin: *w.PullRequest.User.Login,
+		OpenerID:    *w.PullRequest.User.ID,
+	}
+	if w.PullRequest.Head.Repo != nil {
+		pr.HeadRepo = *w.PullRequest.Head.Repo.FullName
+		if err := RepoFullName(pr.HeadRepo); err != nil {
+			return reject("head %v", err)
+		}
 	}
 	if pr.Number == 0 {
 		return reject("pull request number must be positive")
+	}
+	if err := Login(pr.OpenerLogin); err != nil {
+		return reject("opener %v", err)
+	}
+	if pr.OpenerID <= 0 {
+		return reject("opener id must be positive")
 	}
 	if err := RepoFullName(pr.Repo); err != nil {
 		return reject("%v", err)

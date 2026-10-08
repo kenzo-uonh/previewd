@@ -31,6 +31,8 @@ build-errors.log
 
 # SQLite lock and journal files
 *.sqlite*
+# ...except the committed migration fixture, which is evidence (make store-fixture-v2)
+!internal/store/testdata/schema-v2-modernc.sqlite
 EOF
 
 # TLA+ Model Checker artifacts

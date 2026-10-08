@@ -89,9 +89,9 @@ func TestJobStoreConcurrentTransactionsNeverBusy(t *testing.T) {
 					case l.Type == JobTeardown && i%4 == 1:
 						err = s.Requeue(ctx, l, time.Now())
 					case l.Type == JobDeploy && i%5 == 1:
-						err = s.Finish(ctx, l, StatusFailed)
+						err = s.Finish(ctx, l, StatusFailed, time.Now())
 					default:
-						err = s.Finish(ctx, l, StatusSuccess)
+						err = s.Finish(ctx, l, StatusSuccess, time.Now())
 					}
 					if err != nil {
 						record(fmt.Errorf("complete job %d: %w", l.JobID, err))
@@ -142,7 +142,7 @@ func TestJobStoreConcurrentTransactionsNeverBusy(t *testing.T) {
 			break
 		}
 		leasedBy[l.JobID]++
-		if err := s.Finish(ctx, l, StatusSuccess); err != nil {
+		if err := s.Finish(ctx, l, StatusSuccess, time.Now()); err != nil {
 			t.Fatal(err)
 		}
 	}

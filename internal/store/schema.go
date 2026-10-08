@@ -15,18 +15,26 @@ import (
 // until this list, and that review, are updated.
 var schemaAllowlist = map[string]map[string]string{
 	"jobs": {
-		"id":          "INTEGER", // job ID
-		"preview_id":  "TEXT",    // environment ID: envid.Generate output, a DNS label
-		"type":        "TEXT",    // deploy or teardown (CHECK)
-		"seq":         "INTEGER", // delivery order
-		"status":      "TEXT",    // QUEUED, IN_PROGRESS, SUCCESS, FAILED, SKIPPED (CHECK)
-		"attempts":    "INTEGER", // teardown requeues
-		"not_before":  "INTEGER", // backoff, Unix milliseconds
-		"lease_epoch": "INTEGER", // boot epoch of the lease
-		"repo":        "TEXT",    // repository full name, validate.RepoFullName
-		"pr_number":   "INTEGER", // pull request number
-		"commit_sha":  "TEXT",    // head commit, validate.CommitSHA (40 or 64 hex)
-		"clone_url":   "TEXT",    // validate.cloneURL: absolute, no user info (credentials refused)
+		"id":           "INTEGER", // job ID
+		"preview_id":   "TEXT",    // environment ID: envid.Generate output, a DNS label
+		"type":         "TEXT",    // deploy or teardown (CHECK)
+		"origin":       "TEXT",    // webhook, approval, revocation, revalidation, ttl (CHECK)
+		"seq":          "INTEGER", // delivery order
+		"status":       "TEXT",    // PENDING_APPROVAL, QUEUED, IN_PROGRESS, SUCCESS, FAILED, SKIPPED (CHECK)
+		"trust":        "TEXT",    // unclassified, trusted, untrusted (CHECK)
+		"attempts":     "INTEGER", // teardown requeues, deploy requeues while GHES is unavailable
+		"not_before":   "INTEGER", // backoff, Unix milliseconds
+		"lease_epoch":  "INTEGER", // boot epoch of the lease
+		"created_at":   "INTEGER", // Unix milliseconds
+		"finished_at":  "INTEGER", // Unix milliseconds, 0 while not terminal
+		"failure":      "TEXT",    // closed vocabulary (CHECK), never free text
+		"repo":         "TEXT",    // repository full name, validate.RepoFullName
+		"head_repo":    "TEXT",    // head repository full name; '' if the fork was deleted or before schema 3
+		"pr_number":    "INTEGER", // pull request number
+		"opener_login": "TEXT",    // PR opener's GitHub login; '' before schema 3
+		"opener_id":    "INTEGER", // PR opener's numeric GitHub ID; 0 before schema 3
+		"commit_sha":   "TEXT",    // head commit, validate.CommitSHA (40 or 64 hex)
+		"clone_url":    "TEXT",    // validate.cloneURL: absolute, no user info (credentials refused)
 	},
 	"deliveries": {
 		"delivery_id":    "TEXT",    // X-GitHub-Delivery UUIDv1, canonical lower case
@@ -34,10 +42,55 @@ var schemaAllowlist = map[string]map[string]string{
 		"preview_id":     "TEXT",    // environment ID: envid.Generate output, a DNS label
 		"seq":            "INTEGER", // delivery order
 		"verdict":        "TEXT",    // accepted or stale (CHECK)
+		"received_at":    "INTEGER", // Unix milliseconds
 	},
 	"boots": {
 		"epoch":      "INTEGER", // boot epoch
 		"started_at": "INTEGER", // Unix milliseconds
+	},
+	"watermarks": {
+		"preview_id": "TEXT",    // environment ID
+		"seq":        "INTEGER", // highest seq ever recorded, raised before jobs are pruned
+	},
+	"approvals": {
+		"id":             "INTEGER", // grant ID
+		"preview_id":     "TEXT",    // environment ID
+		"repo":           "TEXT",    // repository full name
+		"pr_number":      "INTEGER", // pull request number
+		"commit_sha":     "TEXT",    // approved commit (40 or 64 hex)
+		"approver_login": "TEXT",    // approver's GitHub login, audit only (matched on approver_id)
+		"approver_id":    "INTEGER", // approver's numeric GitHub ID
+		"via":            "TEXT",    // review or label (CHECK)
+		"review_id":      "INTEGER", // GitHub review ID; 0 for a label approval
+		"granted_seq":    "INTEGER", // delivery order of the newest grant
+		"granted_at":     "INTEGER", // Unix milliseconds, audit only
+	},
+	"revocations": {
+		"preview_id":  "TEXT",    // environment ID
+		"commit_sha":  "TEXT",    // revoked commit (40 or 64 hex), with or without a grant
+		"revoked_seq": "INTEGER", // delivery order of the newest revocation
+		"revoked_at":  "INTEGER", // Unix milliseconds, audit only
+		"reason":      "TEXT",    // closed vocabulary (CHECK)
+	},
+	"heads": {
+		"preview_id": "TEXT",    // environment ID
+		"commit_sha": "TEXT",    // head of the newest accepted deploy delivery (40 or 64 hex)
+		"seq":        "INTEGER", // its seq: every other commit is revoked at it (new_head)
+		"prior_seq":  "INTEGER", // newest accepted deploy seq of another commit: commit_sha is revoked at it
+	},
+	"audit_events": {
+		"id":          "INTEGER", // chain position, from 1
+		"at":          "INTEGER", // Unix milliseconds
+		"kind":        "TEXT",    // closed vocabulary (CHECK)
+		"preview_id":  "TEXT",    // environment ID
+		"repo":        "TEXT",    // repository full name
+		"pr_number":   "INTEGER", // pull request number
+		"commit_sha":  "TEXT",    // commit (40 or 64 hex), '' when none applies
+		"actor_login": "TEXT",    // GitHub login of the actor; '' for previewd itself
+		"actor_id":    "INTEGER", // numeric GitHub ID of the actor; 0 for previewd itself
+		"detail":      "TEXT",    // closed vocabulary per kind (CHECK, auditDetails)
+		"prev_hash":   "TEXT",    // hex SHA-256 of the previous row; 64 zeros for the first
+		"hash":        "TEXT",    // hex SHA-256 of prev_hash and the canonical row
 	},
 }
 

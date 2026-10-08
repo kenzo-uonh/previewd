@@ -106,6 +106,14 @@ func (x *v1Machine) checkActions(t *rapid.T, prev, cur *v1Model) {
 		if p.Trust == v1TrustUnclassified && j.Trust == v1TrustTrusted && !x.trustedSpec(prev, j.EnvID) {
 			t.Fatalf("SafetyAuthorizeChecksBoth: job %d trusted, %s is not trusted in GitHub", id, j.EnvID)
 		}
+		// A2-6: the only IN_PROGRESS -> QUEUED move of a deploy is the
+		// GHES-unavailable branch of AuthorizeDeploy.
+		if p.Status == StatusInProgress && j.Status == StatusQueued && j.Type == JobDeploy && cur.exists(j.EnvID) {
+			if b, ok := cur.builder(j.EnvID); ok && b.Trust == v1TrustUntrusted && !liveSpec(cur.approvals, j.EnvID, cur.host[j.EnvID].Commit) {
+				t.Fatalf("SafetyUnavailableRemovesRevoked: job %d requeued, %s still runs %s (job %d) without a live grant",
+					id, j.EnvID, short(cur.host[j.EnvID].Commit), b.ID)
+			}
+		}
 		if p.Status == v1StatusPending && j.Status == StatusQueued && !liveSpec(cur.approvals, j.EnvID, j.Commit) {
 			t.Fatalf("SafetyApprovalBindsCommit: job %d (%s) unparked without a live grant of its commit", id, j.Commit)
 		}
@@ -444,6 +452,7 @@ var v1MutantCases = []struct {
 	{"V1-M19", v1M19, []string{"LivenessRevokedTornDown", "LivenessEventualConsistency"}},
 	{"V1-M20", v1M20, []string{"RegressionA21", "LivenessHeadDeployed"}},
 	{"V1-M21", v1M21, []string{"RegressionA22", "LivenessHeadDeployed"}},
+	{"V1-M22", v1M22, []string{"SafetyUnavailableRemovesRevoked"}},
 }
 
 // v1MutantChecks is the least number of runs a mutant gets.
@@ -500,7 +509,7 @@ func setTestFlag(t *testing.T, name, value string) {
 // algorithm and requires the generated behaviors to reach a state where the
 // property A1 named fails. It proves that the commands reach every guarded
 // path and that the Go properties are as strong as the TLA+ ones; the same
-// commands and properties then judge the store (v1spbt).
+// commands and properties then judge the store (TestV1Store_StateMachine).
 func TestV1Model_Mutants(t *testing.T) {
 	// A mutant's counterexample is expected: no failure file, and no time
 	// spent minimizing it. Some paths (a silent permission loss on a running

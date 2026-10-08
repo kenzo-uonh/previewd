@@ -19,7 +19,10 @@ func sign(secret, body []byte) string {
 const validPayload = `{
   "action": "opened",
   "number": 42,
-  "pull_request": {"head": {"ref": "feature/login", "sha": "0123456789abcdef0123456789abcdef01234567"}},
+  "pull_request": {
+    "head": {"ref": "feature/login", "sha": "0123456789abcdef0123456789abcdef01234567", "repo": {"full_name": "fork/shop"}},
+    "user": {"login": "octo-cat", "id": 4242}
+  },
   "repository": {"full_name": "acme/shop", "clone_url": "https://ghes.example/acme/shop.git"}
 }`
 
@@ -62,6 +65,9 @@ func FuzzParsePullRequest(f *testing.F) {
 	f.Add([]byte(strings.Replace(validPayload, `42`, `-1`, 1)))
 	f.Add([]byte(strings.Replace(validPayload, `42`, `4294967296`, 1)))
 	f.Add([]byte(strings.Replace(validPayload, `feature/login`, `../../x`, 1)))
+	f.Add([]byte(strings.Replace(validPayload, `{"full_name": "fork/shop"}`, `null`, 1)))
+	f.Add([]byte(strings.Replace(validPayload, `octo-cat`, `-octo`, 1)))
+	f.Add([]byte(strings.Replace(validPayload, `4242`, `0`, 1)))
 	f.Add([]byte(`{"action":"opened"}`))
 	f.Add([]byte(`null`))
 	f.Add([]byte(`[]`))
@@ -87,8 +93,17 @@ func FuzzParsePullRequest(f *testing.F) {
 		if pr.Number == 0 {
 			t.Fatal("accepted PR number 0")
 		}
+		if pr.OpenerID <= 0 {
+			t.Fatalf("accepted opener id %d", pr.OpenerID)
+		}
+		if pr.HeadRepo != "" {
+			if err := RepoFullName(pr.HeadRepo); err != nil {
+				t.Fatalf("accepted invalid head repo: %v", err)
+			}
+		}
 		for name, check := range map[string]error{
 			"repo": RepoFullName(pr.Repo), "ref": GitRef(pr.HeadRef), "sha": CommitSHA(pr.HeadSHA), "clone": cloneURL(pr.CloneURL),
+			"opener": Login(pr.OpenerLogin),
 		} {
 			if check != nil {
 				t.Fatalf("accepted invalid %s: %v", name, check)
@@ -109,9 +124,19 @@ func TestParsePullRequestAcceptsValidPayload(t *testing.T) {
 	want := PullRequest{
 		Action: ActionOpened, Number: 42, Repo: "acme/shop", HeadRef: "feature/login",
 		HeadSHA: "0123456789abcdef0123456789abcdef01234567", CloneURL: "https://ghes.example/acme/shop.git",
+		HeadRepo: "fork/shop", OpenerLogin: "octo-cat", OpenerID: 4242,
 	}
 	if pr != want {
 		t.Fatalf("got %+v, want %+v", pr, want)
+	}
+}
+
+// A deleted fork: head.repo is null. Accepted with no head repository,
+// which the authorizer can only judge untrusted.
+func TestParsePullRequestDeletedHeadRepo(t *testing.T) {
+	pr, err := ParsePullRequest([]byte(strings.Replace(validPayload, `{"full_name": "fork/shop"}`, `null`, 1)))
+	if err != nil || pr.HeadRepo != "" {
+		t.Fatalf("null head.repo = %+v, %v; want accepted with an empty head repository", pr, err)
 	}
 }
 
@@ -119,7 +144,9 @@ func TestParsePullRequestAcceptsValidPayload(t *testing.T) {
 func TestParsePullRequestRejectsMissingFields(t *testing.T) {
 	paths := [][]string{
 		{"action"}, {"number"}, {"pull_request"}, {"pull_request", "head"}, {"pull_request", "head", "ref"},
-		{"pull_request", "head", "sha"}, {"repository"}, {"repository", "full_name"}, {"repository", "clone_url"},
+		{"pull_request", "head", "sha"}, {"pull_request", "head", "repo", "full_name"}, {"pull_request", "user"},
+		{"pull_request", "user", "login"}, {"pull_request", "user", "id"},
+		{"repository"}, {"repository", "full_name"}, {"repository", "clone_url"},
 	}
 	for _, path := range paths {
 		var doc map[string]any
@@ -155,6 +182,13 @@ func TestParsePullRequestRejectsInvalidFields(t *testing.T) {
 		"relative url":     {`https://ghes.example/acme/shop.git`, `acme/shop.git`},
 		"space in url":     {`https://ghes.example/acme/shop.git`, `https://ghes.example/a b.git`},
 		"trailing garbage": {`"https://ghes.example/acme/shop.git"}`, `"https://ghes.example/acme/shop.git"}} x`},
+		"bad head repo":    {`fork/shop`, `fork/../shop`},
+		"hyphen login":     {`octo-cat`, `-octocat`},
+		"long login":       {`octo-cat`, strings.Repeat("o", 40)},
+		"slash login":      {`octo-cat`, `octo/cat`},
+		"zero opener id":   {`4242`, `0`},
+		"negative id":      {`4242`, `-4242`},
+		"string id":        {`4242`, `"4242"`},
 	} {
 		body := strings.Replace(validPayload, edit[0], edit[1], 1)
 		if body == validPayload {
@@ -194,7 +228,7 @@ func TestGitRef(t *testing.T) {
 
 func TestErrorsBoundUntrustedInput(t *testing.T) {
 	long := strings.Repeat("x", 10_000)
-	for _, err := range []error{RepoFullName(long), GitRef(long), CommitSHA(long), DNSLabel(long), DNSName(long)} {
+	for _, err := range []error{RepoFullName(long), GitRef(long), CommitSHA(long), DNSLabel(long), DNSName(long), Login(long)} {
 		if err == nil || len(err.Error()) > 200 {
 			t.Fatalf("error not bounded: %d bytes", len(err.Error()))
 		}

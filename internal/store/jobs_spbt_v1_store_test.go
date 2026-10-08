@@ -1,16 +1,14 @@
-//go:build v1spbt
-
 package store
 
 // The V1 state machine (jobs_spbt_v1_test.go) driving the real Store: task
-// A2 of docs/specs/V1-previewd.md. Run it with
+// A2 of docs/specs/V1-previewd.md. Run it alone with
 //
-//	CGO_ENABLED=0 go test -tags v1spbt -run TestV1Store_StateMachine ./internal/store
+//	CGO_ENABLED=0 go test -run TestV1Store_StateMachine ./internal/store
 //
-// This file pins the store API that tasks B1 (schema version 3), D3
-// (approval gating), F (pruning) and G (expiry) implement, refining V1 spec
-// section 3.4 where it was silent. It does not compile until they do: that
-// is A2's "the tests fail". D3 removes the build tag once the store passes.
+// This file pinned the store API that tasks B1 (schema version 3), D3
+// (approval gating, store side), F (pruning) and G (expiry, store side)
+// implement, refining V1 spec section 3.4 where it was silent. It was
+// behind the build tag v1spbt until the store passed it (B1).
 //
 // The pinned API, in addition to the MVP queue:
 //
@@ -66,9 +64,11 @@ package store
 import (
 	"context"
 	"errors"
+	"flag"
 	"maps"
 	"os"
 	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -286,9 +286,7 @@ func (b *v1StoreBackend) approvalLive(t *rapid.T, envID, commit string) bool {
 }
 
 func (b *v1StoreBackend) prune(t *rapid.T, req v1PruneRequest) (int64, int64) {
-	stats, err := b.store.Prune(b.ctx, PruneRequest{
-		Now: req.Now, Retention: req.Retention, DeliveryMaxAge: req.DeliveryMaxAge, Batch: req.Batch, Builders: req.Builders,
-	})
+	stats, err := b.store.Prune(b.ctx, PruneRequest(req))
 	b.must(t, err, "prune")
 	if stats.Boots != 0 {
 		t.Fatalf("prune deleted %d boots with fewer than 100 recorded", stats.Boots)
@@ -379,10 +377,25 @@ func (b *v1StoreBackend) close(t *rapid.T) {
 	}
 }
 
+// v1StoreMaxChecks caps the runs of the store-backed machine. Each run opens
+// and fsyncs a real SQLite file at every transaction, about a hundred times
+// the cost of a model-only run: make verify's 10,000 checks go to the
+// reference model and its mutants, the store gets at most this many.
+const v1StoreMaxChecks = 500
+
 // TestV1Store_StateMachine drives the real Store, on a real SQLite file
 // (modernc, WAL), in lockstep with the reference model: every table equals
 // the model after every command, and every property of the model holds.
 func TestV1Store_StateMachine(t *testing.T) {
+	checks := flag.Lookup("rapid.checks")
+	if checks == nil {
+		t.Fatal("flag rapid.checks is not registered")
+	}
+	if n, err := strconv.Atoi(checks.Value.String()); err != nil {
+		t.Fatalf("rapid.checks: %v", err)
+	} else if n > v1StoreMaxChecks {
+		setTestFlag(t, "rapid.checks", strconv.Itoa(v1StoreMaxChecks))
+	}
 	base := t.TempDir()
 	rapid.Check(t, func(t *rapid.T) {
 		runV1(t, v1Faithful, newV1StoreBackend(t, base))
