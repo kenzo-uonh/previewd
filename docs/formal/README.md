@@ -1,24 +1,31 @@
 # previewd formal model
 
-`previewd.tla` is a PlusCal algorithm, with its TLA+ translation, for the target orchestration flow:
+`previewd.tla` is a PlusCal algorithm, with its TLA+ translation, of previewd's orchestration. Since task A1 it is the V1 model designed in [`V1-model.md`](V1-model.md) (task A0): commit identity, trust from GitHub truth, approval gating, revocation, continuous re-validation of every environment (D-V1-5), expiry and pruning, on top of the MVP queue.
 
 ```text
-GitHub ──signed delivery──▶ Api ──1 tx──▶ db_jobs (SQLite) ◀──lease── Worker(s) ──Docker──▶ environments
-                                                ▲
-                       Supervisor: StartupSweep at every start   Chaos: SimulateCrash (daemon crash / host reboot)
+GitHub (truth: head, open, approvals, opener write access) ──signed deliveries, reordered──▶ Api ──1 tx──▶ db_jobs, approvals (SQLite)
+                                                                                                │
+Workers: AcquireJob ▶ AuthorizeDeploy (trusted | approved | park | GHES fault) ▶ deploy steps ▶ environments
+Supervisor: StartupSweep at every start      Revalidator, Expirer: fair previewd loops
+Pruner, Chaos (daemon crash, host reboot), GitHub: unfair, bounded
 ```
 
-The daemon implements it: `internal/store/jobs.go` (queue transitions) and `internal/orchestrator/reconciler.go` (workers and startup sweep). `TestJobStore_StateMachine` checks the queue against the model after every command (`docs/specs/phase3_spbt_architecture.md`).
-
-The V1 extension (approval gating, re-validation, pruning, expiry) is designed in [`V1-model.md`](V1-model.md) (task A0), which A1 implements.
+The daemon implements the MVP part: `internal/store/jobs.go` (queue transitions) and `internal/orchestrator/reconciler.go` (workers and startup sweep). `TestJobStore_StateMachine` checks the queue against the model after every command (`docs/specs/phase3_spbt_architecture.md`). The V1 part is specified in `docs/specs/V1-previewd.md`; task A2 extends the state-machine test to it.
 
 ## Files
 
-| File                   | Purpose                                                                                                                                                   |
-|------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `previewd.tla`         | Model, invariants, temporal properties. The block between `BEGIN TRANSLATION` and `END TRANSLATION` is generated: edit the PlusCal, then translate again. |
-| `previewd.cfg`         | Default gate: 1 worker, 3 deliveries, 2 environments, 1 crash, 1 transient teardown fault.                                                                |
-| `previewd-workers.cfg` | Same with 2 workers, to check the per-environment lock and leases.                                                                                        |
+| File | Purpose |
+|---|---|
+| `previewd.tla` | Model, invariants, temporal properties. The block between `BEGIN TRANSLATION` and `END TRANSLATION` is generated: edit the PlusCal, then translate again. |
+| `V1-model.md` | Design of the V1 model (A0), and the deviations found while implementing it (section 10). |
+| `previewd.cfg`, `previewd-workers.cfg` | MVP regression: every V1 feature off (trusted environments only, one commit, no permission loss, no GHES fault, no pruning, no expiry). |
+| `previewd-approval.cfg` | Approval gate, revocation, new head, GHES faults, approver loses write access. |
+| `previewd-reapproval.cfg` | Dismissal then re-approval; approval of the current head with no job waiting. |
+| `previewd-approval-reboot.cfg` | Untrusted environment across a reboot: rebuilt only after a fresh authorization. |
+| `previewd-mixed.cfg` | Trusted and untrusted environments, 2 workers, opener loses write access (D-V1-5). |
+| `previewd-prune.cfg` | Pruning behind the watermark, pruned deliveries. |
+| `previewd-ttl.cfg` | Expiry through the queue. |
+| `previewd-grace.cfg` | GHES unavailable below the grace limit (`Grace = 2`): recovery resets the count, two consecutive failures tear down. |
 
 ## Running TLC offline
 
@@ -31,65 +38,124 @@ cd docs/formal
 # After editing the PlusCal: regenerate the translation. -nocfg keeps the .cfg files.
 # pcal.trans leaves previewd.old (git-ignored).
 java -cp tla2tools.jar pcal.trans -nocfg previewd.tla
-# Model check (TLC writes states/ and, on a violation, *_TTrace_* files: all git-ignored).
-java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers auto -config previewd.cfg previewd.tla
-java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers auto -config previewd-workers.cfg previewd.tla
+# Model check every configuration. -lncheck final checks liveness once, on the
+# complete state graph: same verdict, several times faster. TLC writes states/
+# and, on a violation, *_TTrace_* files: all git-ignored.
+for c in previewd previewd-workers previewd-approval previewd-reapproval \
+         previewd-approval-reboot previewd-mixed previewd-prune previewd-ttl previewd-grace; do
+  java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers auto -lncheck final -config "$c.cfg" previewd.tla
+done
 ```
 
 ## Checked properties
 
-| Property                      | Kind      | Meaning                                                                                                                                                   |
-|-------------------------------|-----------|-----------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `SafetyZeroSecretLeakage`     | invariant | No environment's secret bytes ever reach a block device                                                                                                   |
-| `SafetyNoOrphanedResources`   | invariant | After the sweep, every container, network, staged secret or route document belongs to an `IN_PROGRESS`/`SUCCESS` deploy that no newer teardown has undone |
-| `SafetyMonotonicity`          | invariant | No older intent is pending or running once a newer one has executed; a running environment is never older than a completed intent                         |
-| `SafetyMonotonicStep`         | action    | A job becomes `IN_PROGRESS` only if it is newer than every executed job of its environment                                                                |
-| `SafetyUniqueDelivery`        | invariant | One job per delivery (replay protection)                                                                                                                  |
-| `SafetyOneJobPerEnv`          | invariant | At most one `IN_PROGRESS` job per environment                                                                                                             |
-| `SafetyRouteImpliesRunning`   | invariant | A route document never points at a container that is not running                                                                                          |
-| `SafetyLeases`                | invariant | A current-epoch lease points at an `IN_PROGRESS` job and is never shared                                                                                  |
-| `TypeOK`                      | invariant | Types and bounds                                                                                                                                          |
-| `LivenessEventualCompletion`  | liveness  | Every `QUEUED` job reaches `SUCCESS`, `FAILED` or `SKIPPED`                                                                                               |
-| `LivenessEventualConsistency` | liveness  | `<>[]`: each environment ends intact at the latest job's `ts` iff that job is a `SUCCESS` deploy, absent otherwise                                        |
+Every configuration checks every property. The initial state lets each environment hold a stray (container, network, staged secrets, route document) that no job tracks, so the sweep's convergence is checked too. Properties use their own copies of the operators they judge with (`LiveApprovalSpec`, `HasGrant`, `AllowedTruth`, `Running`), so a mutant of the algorithm cannot weaken its own judge.
 
-The initial state lets each environment hold a stray (container, network, staged secrets) that no job tracks, so the sweep's convergence is checked too.
+| Property | Kind | Meaning |
+|---|---|---|
+| `TypeOK` | invariant | Types and bounds, including the clock and job-ID bounds the properties quantify over |
+| `SafetyZeroSecretLeakage` | invariant | No environment's secret bytes ever reach a block device |
+| `SafetyNoOrphanedResources` | invariant | After the sweep, every container, network, staged secret or route document belongs to an `IN_PROGRESS`/`SUCCESS` deploy that no newer teardown has undone |
+| `SafetyMonotonicity` | invariant | No older intent pending or running once a newer one has executed; a running environment is never older than a completed intent |
+| `SafetyUniqueDelivery` | invariant | One job per seq |
+| `SafetyOneJobPerEnv` | invariant | At most one `IN_PROGRESS` job per environment, trusted or not |
+| `SafetyLeases` | invariant | A current-epoch lease points at an `IN_PROGRESS` job and is never shared |
+| `SafetyRouteImpliesRunning` | invariant | A route document never points at a container that is not running |
+| `SafetyNoUnapprovedUntrusted` | invariant | An untrusted environment runs only from a job authorized as `approved`, against a recorded grant of that exact commit |
+| `SafetyParkRemovesPrevious` | invariant | A parked latest intent means nothing of the environment remains |
+| `SafetyRevocationPending` | invariant | Once the DB holds no live grant for what runs, a teardown or replacement is already queued |
+| `SafetyFailClosedOnUnavailable` | invariant | GHES is never unavailable for `Grace` consecutive re-validations without the fail-closed teardown |
+| `SafetyPruneKeepsVerdicts` | invariant | Pruning never changes a stale or replay verdict |
+| `SafetyPrunedDeliveriesStale` | invariant | Every pruned delivery would still be refused as stale |
+| `SafetyPruneKeepsLatest` | invariant | The latest job of an environment is never pruned |
+| `SafetyAuthorizedThisBoot` | invariant | A deploy past `AuthorizeDeploy` was authorized in the current boot |
+| `SafetyMonotonicStep` | action | A job becomes `IN_PROGRESS` only if newer than every executed job of its environment |
+| `SafetyAuthorizeChecksBoth` | action | An `approved` authorization reads the DB grant and GitHub truth in the same step; a `trusted` one reads GitHub truth |
+| `SafetyApprovalBindsCommit` | action | Only a live grant of the exact commit unparks a job |
+| `SafetyInternalJobsAreNewest` | action | An internal job (approval, revocation, re-validation, expiry) is above every seq of its environment |
+| `LivenessEventualCompletion` | liveness | Every `QUEUED` job reaches a terminal state or waits for an approval |
+| `LivenessEventualConsistency` | liveness | `<>[]`: each environment runs the latest job's commit iff that job is a `SUCCESS` deploy GitHub still allows, absent otherwise |
+| `LivenessRevokedTornDown` | liveness | Access lost in GitHub (revoked approval, approver or opener without write access) eventually removes the environment |
+| `LivenessExpired` | liveness | An expired environment leaves through the queue |
+| `LivenessHeadDeployed` | liveness | The open head GitHub allows eventually runs, unless it changed or previewd gave up by design (fail-closed or expiry teardown, failed deploy of that commit) |
 
-## Results
+## Results (V1 model)
 
-| Config                             | Distinct states | Depth | Result                 |
-|------------------------------------|-----------------|-------|------------------------|
-| `previewd.cfg` (1 worker)          | 634,821         | 24    | no error (1 min 37 s)  |
-| `previewd-workers.cfg` (2 workers) | 2,779,645       | 26    | no error (10 min 44 s) |
+Budget per configuration (V1-model.md section 6.1): 5 million distinct states and 15 minutes on 16 cores.
 
-Since the route documents were added (`route_published`, `PublishRoute`). Before: 548,975 / 2,253,617 states.
+| Config | Distinct states | Depth | Time | Result |
+|---|---|---|---|---|
+| `previewd.cfg` | 686,226 | 37 | 9 min 05 s | no error |
+| `previewd-workers.cfg` | 48,386 | 32 | 51 s | no error |
+| `previewd-approval.cfg` | 104,240 | 31 | 3 min 45 s | no error |
+| `previewd-reapproval.cfg` | 110,752 | 31 | 4 min 12 s | no error |
+| `previewd-approval-reboot.cfg` | 95,710 | 34 | 2 min 21 s | no error |
+| `previewd-mixed.cfg` | 390,624 | 34 | 10 min 02 s | no error |
+| `previewd-prune.cfg` | 203,029 | 32 | 2 min 11 s | no error |
+| `previewd-ttl.cfg` | 8,896 | 30 | 31 s | no error |
+| `previewd-grace.cfg` | 58,876 | 32 | 3 min 35 s | no error |
 
-`-coverage` on `previewd.cfg`: every action (`ReceiveWebhook`, `AcquireJob`, `ExecuteDeploy`, `StartContainer`, `PublishRoute`, `CommitDeploy`, `ExecuteTeardown`, `CommitTeardown`, `StartupSweep`, `SimulateCrash`) produces new states, and no sub-expression is left unevaluated.
+Times are wall clock on a shared 16-thread machine, several configurations at once; they are an upper bound.
 
-## Mutation check
+Three configurations were over budget with the bounds first planned and were reduced or split without dropping a property (V1-model.md, A1-1). `previewd-grace.cfg` was added after coverage showed that `Grace = 1` leaves the recovery path unchecked (A1-12). TLC found one design bug in A0: a grant of the current head re-queued a parked job that was no longer the latest intent. The grant rule now judges the latest job (A1-3).
 
-Each mutant changes one rule in the translated model. TLC must reject it. Rows marked *plan* restore the first draft of `docs/specs/formal_verification_plan.md`. They are the counterexamples behind deviations D1 to D5 in the module header.
+### Coverage
 
-| Mutant                                                                         | Caught by                                                                                                                                                                                                                 |
-|--------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| D1 *plan*: stale check counts only newer `QUEUED`/`IN_PROGRESS`/`SUCCESS` jobs | `SafetyMonotonicity`: deploy ts 2 fails, the delayed ts 1 is accepted                                                                                                                                                     |
-| D2 *plan*: sweep marks an interrupted teardown `FAILED`                        | `SafetyMonotonicity`: environment still running behind a completed teardown                                                                                                                                               |
-| D5 *plan*: Safety 2 requires the owner to be the latest job                    | that formula: deploy ts 1 running, redeploy ts 2 `QUEUED`                                                                                                                                                                 |
-| Secrets passed as container Env (`SecretChannel = "container_env"`)            | `SafetyZeroSecretLeakage`                                                                                                                                                                                                 |
-| Commit ignores the lease epoch after a crash                                   | `LivenessEventualConsistency`                                                                                                                                                                                             |
-| Sweep keeps an environment superseded by an interrupted deploy (D3)            | `SafetyMonotonicity`                                                                                                                                                                                                      |
-| Sweep does not re-arm a deploy whose secrets a reboot wiped (D3)               | `LivenessEventualConsistency`                                                                                                                                                                                             |
-| Sweep keeps intact strays no job tracks                                        | `SafetyNoOrphanedResources`                                                                                                                                                                                               |
-| `AcquireJob` takes the oldest queued job                                       | `LivenessEventualConsistency`                                                                                                                                                                                             |
-| `AcquireJob` leaves older jobs `QUEUED` instead of `SKIPPED`                   | `SafetyMonotonicity`                                                                                                                                                                                                      |
-| No per-environment lock (2 workers, 2 deliveries)                              | `SafetyMonotonicity`                                                                                                                                                                                                      |
-| No replay protection                                                           | `SafetyUniqueDelivery`                                                                                                                                                                                                    |
-| Destroy leaves the route document                                              | `SafetyNoOrphanedResources`                                                                                                                                                                                               |
-| Route document written before the container starts                             | `SafetyRouteImpliesRunning`                                                                                                                                                                                               |
-| Sweep keeps an environment whose route document is missing                     | not killed: equivalent in the model, where only a full destroy removes a route. The case (route deleted by hand) is covered by `TestSweepRouteMustMatchEnvironment` and `TestStartupKeepsThenRebuildsDeployedEnvironment` |
+`-coverage` was run on every configuration except `previewd.cfg`, whose actions `previewd-workers.cfg` covers. In the union, every action produces new states, and none of the 1,028 sub-expressions of the translated actions is left unevaluated. Each feature action is covered by the configurations that target it: `Revalidate` by approval, reapproval, approval-reboot, mixed and grace; `Expire` by ttl; `Prune` by prune; the trusted-opener permission loss by mixed; the teardown fault by workers. The first pass, without `previewd-grace.cfg`, left the `Grace > 1` branches of `Revalidate` unevaluated (A1-12).
+
+## Mutation check (V1-model.md section 7)
+
+Each mutant changes one rule of the translated model and must be rejected. TLC stops at the first violated property. Where that was not the property A0 named, the mutant was run again without the first property, and the named property caught it too (marked ✓²).
+
+| Mutant | Config | Caught by |
+|---|---|---|
+| V1-M01 untrusted job authorized without a live approval | approval | `SafetyAuthorizeChecksBoth`; ✓² `SafetyNoUnapprovedUntrusted` |
+| V1-M02 authorization reads the DB grant, not GitHub truth | approval | `SafetyAuthorizeChecksBoth` |
+| V1-M03 a grant unparks a parked deploy of another commit | approval | `SafetyApprovalBindsCommit` |
+| V1-M04 park leaves the previous version running | approval | `SafetyParkRemovesPrevious` |
+| V1-M05 a revocation is recorded but queues no teardown | approval | `SafetyRevocationPending` |
+| V1-M06 approvals and revocations applied in arrival order | reapproval | `LivenessHeadDeployed` |
+| V1-M07 re-validation not fair | approval | `LivenessRevokedTornDown` (with `LivenessEventualConsistency`) |
+| V1-M08 GHES unavailability during re-validation never escalates | approval | `SafetyFailClosedOnUnavailable` |
+| V1-M09 GHES fault during authorization treated as allow | approval | `SafetyAuthorizeChecksBoth`; ✓² `SafetyNoUnapprovedUntrusted` |
+| V1-M10 `synchronize` queues a teardown newer than its own deploy | previewd | `LivenessHeadDeployed` |
+| V1-M11 a grant of the current head with no job waiting does nothing | reapproval | `LivenessHeadDeployed` |
+| V1-M12 a re-armed deploy skips `AuthorizeDeploy` | approval-reboot | `SafetyAuthorizedThisBoot` |
+| V1-M13 internal job seq not above the latest | approval | `SafetyUniqueDelivery` |
+| V1-M14 prune deletes the latest job | prune | `SafetyPruneKeepsLatest` |
+| V1-M15 prune does not raise the watermark | prune | survives, equivalent (A1-9): the latest job is never pruned, so `MaxSeq` never depends on the watermark |
+| V1-M15b prune deletes the latest job and skips the watermark | prune | `SafetyPruneKeepsVerdicts` |
+| V1-M16 prune deletes any delivery | prune | survives, equivalent (A1-9): every recorded delivery is at or below `MaxSeq` by construction |
+| V1-M17 expiry not fair | ttl | `LivenessExpired` |
+| V1-M18 untrusted environments not locked | mixed | `SafetyMonotonicity`; ✓² `SafetyOneJobPerEnv` |
+| V1-M19 only untrusted environments re-validated (before D-V1-5) | mixed | `LivenessRevokedTornDown` (with `LivenessEventualConsistency`) |
+
+The watermark is defense in depth in the model: no reachable state needs it while the latest job is kept. The Go store keeps it, because a manual `DELETE` or a future pruning rule would otherwise reopen replays.
+
+MVP mutants (Phase 2), re-run on the regression configurations:
+
+| Mutant | Config | Caught by |
+|---|---|---|
+| D1 *plan*: stale check counts only newer `QUEUED`/`IN_PROGRESS`/`SUCCESS` jobs | previewd | `SafetyMonotonicity` |
+| D2 *plan*: sweep marks an interrupted teardown `FAILED` | previewd | `SafetyMonotonicity` |
+| Secrets passed as container Env (`SecretChannel = "container_env"`) | previewd | `SafetyZeroSecretLeakage` |
+| Commit ignores the lease epoch after a crash | previewd | `LivenessEventualConsistency` and `LivenessHeadDeployed` |
+| Sweep keeps an environment superseded by an interrupted deploy (D3) | previewd | `SafetyMonotonicity` |
+| `AcquireJob` takes the oldest queued job | previewd | `LivenessHeadDeployed`; ✓² `LivenessEventualConsistency` |
+| Sweep keeps intact strays no job tracks | previewd | `SafetyNoOrphanedResources` |
+| Sweep does not re-arm a deploy whose secrets a reboot wiped (D3) | previewd | `LivenessEventualConsistency` and `LivenessHeadDeployed` |
+| `AcquireJob` leaves older jobs `QUEUED` instead of `SKIPPED` | previewd | `SafetyMonotonicity` |
+| No per-environment lock | workers | `SafetyMonotonicity`; ✓² `SafetyOneJobPerEnv` |
+| No replay check | previewd | survives, equivalent (A1-9): the stale rule's `>=` already refuses a delivery whose seq exists. The Go store keeps both checks (a resent body under a new delivery ID is not modeled) |
+| Destroy leaves the route document | previewd | `SafetyNoOrphanedResources` |
+| Route document written before the container starts | previewd | `SafetyRouteImpliesRunning` |
+
+Not repeated: the D5 *plan* formula (a property, not a model change; Safety 2 is the prose rule) and "sweep keeps an environment whose route document is missing" (equivalent in Phase 2; `TestSweepRouteMustMatchEnvironment` covers it).
 
 ## Not modeled
 
-- Time: backoff, timeouts, the 90-day clock-skew window.
+- Time: backoff, timeouts, the clock-skew window and the approval time binding (V1-I7). One global clock abstracts UUIDv1 ticks and `now`.
 - Docker errors inside the sweep, and rollback failures after a failed deploy step.
-- Authorization (approvers, fork policy), routes (`proxy`), image builds: covered by unit, property and E2E tests.
-- Bounds beyond the gate configs (2 environments, 3 deliveries, 1 crash, 1 teardown fault). `MaxWebhooks = 4` passed 4.5 M distinct states without a violation but was not run to completion.
+- Payload identity: a body resent under a new delivery ID is refused by the store's payload hash (Go tests). In the model a delivery is its seq.
+- Secret sections, approver identity matching (`login#id`), TLS to GHES, the CIDR filter, the startup preflight and the BuildKit probe: Go unit, property and E2E tests (V1 spec, task list).
+- Bounds beyond the configurations above.

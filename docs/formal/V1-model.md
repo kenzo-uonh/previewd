@@ -1,6 +1,6 @@
 # V1 formal model design (task A0)
 
-Status: draft for owner review, 2026-10-08. Prerequisite of task A1 in `docs/specs/V1-previewd.md`: A1 implements exactly this design in `previewd.tla`. Any deviation found while modeling is written back here first.
+Status: accepted 2026-10-08; implemented by A1 (`previewd.tla`). Section 10 lists what modeling changed, written back as A0 requires. Prerequisite of task A1 in `docs/specs/V1-previewd.md`: A1 implements exactly this design in `previewd.tla`. Any deviation found while modeling is written back here first.
 
 The MVP model (`previewd.tla`, `docs/formal/README.md`) stays the base. V1 adds commit identity, trust, approvals, revocation, re-validation, pruning and expiry. Every MVP property keeps holding with the V1 features disabled (section 6.1).
 
@@ -85,10 +85,9 @@ A fair action that is always enabled but changes nothing would satisfy weak fair
 
 Transition rules beyond the MVP:
 - **`ReceiveWebhook` `deploy`/`teardown`:** MVP rules, with the stale check against `max(MaxSeq(e), watermark[e])`. An accepted `synchronize` also records a `revoke` (ts of the delivery) for every other commit of `e`. No teardown job is queued.
-- **`ReceiveWebhook` `grant`:** recorded unless it is a replay. A `PENDING_APPROVAL` job of `(e, commit)` becomes `QUEUED`. Otherwise, a deploy job with `origin = "approval"` and the delivery ts is queued if all of the following hold:
-  - the delivery ts is above `MaxSeq(e)`;
-  - `head[e] = commit` and `open[e]` (a GHES read, atomic in the model);
-  - no deploy of that commit is pending.
+- **`ReceiveWebhook` `grant`:** recorded, then acted on only for an environment that is not trusted and whose grant is live. Both cases judge the **latest** job (section 10, A1-3):
+  - if the latest job is the parked deploy of `(e, commit)`, it becomes `QUEUED`;
+  - otherwise a deploy with `origin = "approval"` and `seq = ++clock` is queued if `head[e] = commit` and `open[e]` (a GHES read, atomic in the model), unless the latest job already deploys that commit (`QUEUED`, `IN_PROGRESS`, `PENDING_APPROVAL` or `SUCCESS`).
 - **`ReceiveWebhook` `revoke`:** recorded. If the environment runs that commit and no grant of it stays live, a teardown is queued (`origin = "revocation"`, `seq = ++clock`).
 - **`AuthorizeDeploy`:**
   - trusted environment: allow (`authz = "trusted"`);
@@ -100,7 +99,7 @@ Transition rules beyond the MVP:
   - if not: record an internal `revoke` and queue a teardown (`origin = "revalidation"`, `seq = ++clock`);
   - GHES fault: `revalFails[e] + 1`, and at `Grace` the same teardown.
 - **`Expire(e)`:** a teardown with `origin = "ttl"`, `seq = ++clock`.
-- **`Prune`:** delete one terminal job that is not the highest-seq job of its environment, after raising `watermark[e]` to at least its seq. Or delete one delivery record whose ts is at most `MaxSeq(env)`, added to `prunedDeliveries`. Which job or delivery is unconstrained: an over-approximation of "older than the retention".
+- **`Prune`:** delete one terminal job that is not the highest-seq job of its environment and not the builder of what runs there (A1-6), after raising `watermark[e]` to at least its seq. Or delete one delivery record whose ts is at most `MaxSeq(env)`, added to `prunedDeliveries`. Which job or delivery is unconstrained: an over-approximation of "older than the retention".
 - **`StartupSweep`:** MVP rules. `PENDING_APPROVAL` jobs are untouched. A re-armed deploy goes through `AuthorizeDeploy` again, so an untrusted environment comes back after a reboot only with a re-validated approval.
 
 ## 3. Checkable form of "pruning keeps verdicts"
@@ -116,10 +115,10 @@ Together they imply that every future `deploy`/`teardown` verdict is the same as
 ## 4. Desired state (`Converged`) and liveness under gating
 
 ```tla
-Allowed(e, c) == Trusted(e) ∨ (LiveApproval(e, c) ∧ c ∈ approvedGH[e])
+AllowedTruth(e, c) == Trusted(e) ∨ c ∈ approvedGH[e]          \* GitHub's view (A1-7)
 Converged(e) ==
   IF JobsOf(e) ≠ {} ∧ db_jobs[Latest(e)].type = "deploy"
-       ∧ db_jobs[Latest(e)].status = "SUCCESS" ∧ Allowed(e, db_jobs[Latest(e)].commit)
+       ∧ db_jobs[Latest(e)].status = "SUCCESS" ∧ AllowedTruth(e, db_jobs[Latest(e)].commit)
   THEN Intact(e) ∧ environments[e].commit = db_jobs[Latest(e)].commit
   ELSE ¬Exists(e)
 ```
@@ -161,12 +160,14 @@ Each configuration enables only the features it targets. Budget per configuratio
 | Config | Purpose | EnvIDs (untrusted) | Commits | Workers | MaxWebhooks | Crashes | GHES faults | PermLoss | Prunes | TTL |
 |---|---|---|---|---|---|---|---|---|---|---|
 | `previewd.cfg` | MVP regression | e1, e2 (none) | c1 | 1 | 3 | 1 | 0 | 0 | 0 | 0 |
-| `previewd-workers.cfg` | MVP regression, lock | e1, e2 (none) | c1 | 2 | 3 | 1 | 0 | 0 | 0 | 0 |
-| `previewd-approval.cfg` | gate, revocation, new head | e1 (e1) | c1, c2 | 1 | 4 | 0 | 1 | 1 | 0 | 0 |
+| `previewd-workers.cfg` | MVP regression, lock (A1-1: `MaxWebhooks` 3 → 2) | e1, e2 (none) | c1 | 2 | 2 | 1 | 0 | 0 | 0 | 0 |
+| `previewd-approval.cfg` | gate, revocation, new head (A1-1: `MaxWebhooks` 4 → 3) | e1 (e1) | c1, c2 | 1 | 3 | 0 | 1 | 1 | 0 | 0 |
+| `previewd-reapproval.cfg` | dismissal then re-approval, grant of the current head (A1-1) | e1 (e1) | c1 | 1 | 4 | 0 | 0 | 0 | 0 | 0 |
 | `previewd-approval-reboot.cfg` | revalidated rebuild after reboot | e1 (e1) | c1 | 1 | 3 | 1 | 0 | 0 | 0 | 0 |
 | `previewd-mixed.cfg` | trusted and untrusted together, lock across trust, opener offboarded (D-V1-5) | e1, e2 (e2) | c1 | 2 | 3 | 0 | 0 | 1 | 0 | 0 |
-| `previewd-prune.cfg` | watermark, pruned deliveries | e1 (none) | c1 | 1 | 4 | 1 | 0 | 0 | 2 | 0 |
+| `previewd-prune.cfg` | watermark, pruned deliveries (A1-1: `MaxWebhooks` 4 → 3) | e1 (none) | c1 | 1 | 3 | 1 | 0 | 0 | 2 | 0 |
 | `previewd-ttl.cfg` | expiry through the queue | e1 (none) | c1 | 1 | 2 | 0 | 0 | 0 | 0 | 1 |
+| `previewd-grace.cfg` | GHES unavailable below the grace limit, recovery resets the count (A1-12) | e1 (e1) | c1 | 1 | 3 | 0 | 2 | 1 | 0 | 0 |
 
 The MVP regression configurations run the restructured model. Their state counts will differ from the MVP's (634,821 and 2,779,645) because GitHub is now an explicit process. Every MVP property must still hold, and every MVP mutant must still be killed.
 
@@ -176,7 +177,7 @@ Small-scope argument, stated so a reviewer can challenge it:
 - **Two commits** are the least that express "approval of another commit", "a push revokes", and "an approval delivered after the PR moved on".
 - **One untrusted environment** carries every approval rule, since approvals never cross environments (the store keys them by environment).
 - **Interactions across environments** are trust-independent apart from the lock. `previewd-mixed.cfg` and the MVP configurations cover them.
-- **`Grace = 1`** exercises the fail-closed path; larger values only delay it.
+- **`Grace = 1`** exercises the fail-closed path on the first fault. **`Grace = 2`** (`previewd-grace.cfg`) adds the only behavior a larger value has: a failure below the limit, then a success that resets the count (A1-12). Larger values only delay the teardown further.
 - **Pruning** is over-approximated (any terminal non-latest job, at any time), so a bounded `MaxPrunes = 2` explores both "prune before the next delivery" and "prune between replays".
 
 ## 7. Acceptance criteria
@@ -233,3 +234,39 @@ The SPBT reference model implements sections 1 to 4 independently of the store, 
 - **S-1 (applied with this note):** `approvals` stores `granted_seq` and `revoked_seq` (delivery order) instead of relying on timestamps. Liveness of an approval is "a grant newer than every revocation of the same `(repo, pr, commit, approver)`".
 - **S-2 (applied):** A0 inserted before A1 in the task list. A1 means "implement this note".
 - **D-V1-5 (decided 2026-10-08):** every running environment is re-validated. For a trusted one that means its opener's write access, in the same loop with the same grace. Modeled by `openerOK`, `PermissionLoss` on trusted environments, `LivenessRevokedTornDown` over all environments, `previewd-mixed.cfg` with `MaxPermissionLoss = 1`, and mutant V1-M19.
+
+## 10. Deviations found during A1
+
+A1 (`previewd.tla`) follows sections 1 to 9 except for the points below. Each was forced by a TLC result or by a mutant that the properties as first written could not kill.
+
+- **A1-1, configurations split or reduced to stay within budget (section 6.1).** Every property and mutant is kept.
+  - `previewd-approval` with `MaxWebhooks = 4` was still growing at 518,000 states after 9 minutes. It is split into `previewd-approval` (`MaxWebhooks = 3`, both commits, GHES faults, permission loss) and `previewd-reapproval` (`MaxWebhooks = 4`, one commit, no faults), which carries the dismissal-then-re-approval paths (V1-M06, V1-M11).
+  - `previewd-prune` was reduced from 4 deliveries to 3 (721,000 states after 9 minutes, growing).
+  - `previewd-workers` was reduced from 3 deliveries to 2 (590,000 states after 9 minutes, growing). That is the bound Phase 2 used for its no-lock mutant.
+- **A1-2, `-lncheck final`.** Liveness is checked once, on the complete graph. The verdict is the same; it avoids re-checking the partial graph every minute.
+- **A1-3, the grant rule judges the latest intent (a design bug found by TLC).** With the rule of section 2, `previewd-reapproval` violated `LivenessHeadDeployed`:
+  1. `opened(c1)`, `approve`, `dismiss` and `approve` are emitted;
+  2. the dismissal is processed while the first deploy is still queued, and queues a revocation teardown with a newer clock seq;
+  3. the re-approval then sees that queued deploy as "a job waiting" and does nothing;
+  4. the worker takes the newest job, the teardown, and skips the deploy.
+
+  The PR stays open, approved and recorded, and is never deployed. The rule now unparks only a parked deploy that is the latest job, and otherwise queues a new deploy unless the latest job already deploys the commit. The spec's event matrix (section 3.3) is corrected to match.
+- **A1-4, three properties added, because the section 5 properties could not kill three mutants.**
+  - `LivenessHeadDeployed`: the open head that GitHub allows, trusted or approved and recorded, eventually runs. The exceptions are a head that changed and a deliberate give-up: a fail-closed or expiry teardown, or a failed deploy of that commit. `Converged` judges the latest job, so it cannot see an intent that was dropped (V1-M06, V1-M10, V1-M11).
+  - `SafetyFailClosedOnUnavailable` (`revalFails < Grace`): with bounded GHES faults, a missing escalation is masked by the next successful check (V1-M08).
+  - `SafetyAuthorizedThisBoot`: a deploy past `AuthorizeDeploy` was authorized in the current boot. A re-arm that bypasses the step never triggers the action property (V1-M12).
+- **A1-5, two properties reformulated.**
+  - `SafetyNoUnapprovedUntrusted` checks the builder's authorization against a grant of that commit in the DB, not the label the code sets.
+  - `SafetyRevocationPending` applies to every environment whose builder was authorized by approval, which includes trusted PRs whose opener lost write access (D-V1-5).
+- **A1-6, the pruner never deletes the builder of what runs.** Deleting it breaks Safety 2 and the sweep's `Keep`. The spec's `Prune` predicate gains this condition.
+- **A1-7, `Converged` uses GitHub truth (`AllowedTruth`).** The desired state is what GitHub allows, not what the DB has recorded. Liveness then requires previewd to catch up with GitHub.
+- **A1-8, Eventual Completion:** the clause "every `PENDING_APPROVAL` job whose grant is live leaves that status" is dropped. It is not a stable condition: GitHub can withdraw the approval silently. `LivenessHeadDeployed` covers the intent instead.
+- **A1-9, equivalent mutants, documented and not killable by construction.**
+  - **V1-M15 (prune without raising the watermark):** the latest job is never pruned, so it always carries `MaxSeq`, and the watermark never changes a verdict. The combined mutant V1-M15b (prune the latest job and skip the watermark) is killed by `SafetyPruneKeepsVerdicts`. The watermark is therefore defense in depth, not load-bearing.
+  - **V1-M16 (prune any delivery):** every recorded delivery is at or below `MaxSeq` by construction.
+  - **MVP-M12 (no replay check):** the stale rule's `≥` already refuses a delivery with an existing seq.
+
+  The Go store keeps both checks, and both are tested there.
+- **A1-10, V1-M10 is checked on `previewd.cfg`.** On a trusted PR, the extra teardown of the first draft's `synchronize` makes the new head's deploy skipped, which `LivenessHeadDeployed` catches. On an untrusted PR, the re-approval path now re-queues a deploy and masks it.
+- **A1-11, `JobBound = 3 × MaxWebhooks`,** checked by `TypeOK` (`nextId ≤ JobBound + 1`) rather than assumed.
+- **A1-12, `previewd-grace.cfg` added (a coverage finding).** With `Grace = 1` in every configuration, `-coverage` showed two `Revalidate` branches never evaluated: a GHES failure below the limit (`revalFails[e] + 1 < Grace`) and the reset after a successful check (`revalFails[e] > 0` and allowed again). They were never model-checked, not merely uncovered. `previewd-grace.cfg` (`Grace = 2`, two GHES faults, one untrusted environment, one commit) exercises both, and the escalation after two consecutive failures. Section 6.2 is corrected: a larger `Grace` adds the recovery path, it does not only delay the teardown.
