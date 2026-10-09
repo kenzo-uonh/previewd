@@ -13,6 +13,9 @@ type Engine interface {
 	// "none" for every RUN, no pull, no cache. It fails on any error the
 	// daemon reports in the response stream: HTTP 200 is not success.
 	Build(ctx context.Context, spec BuildSpec) error
+	// BuildProbe builds the startup probe image with the request PR builds
+	// get, and fails unless its RUN step found no network (VerifyBuildIsolation).
+	BuildProbe(ctx context.Context, addr netip.AddrPort) error
 	ProvisionNetwork(ctx context.Context, envID string) error
 	// Deploy starts the environment and returns the address its route
 	// document points to.

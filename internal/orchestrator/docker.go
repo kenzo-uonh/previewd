@@ -159,20 +159,26 @@ func buildOptions(spec BuildSpec) (client.ImageBuildOptions, error) {
 	if spec.ContextTar == nil {
 		return client.ImageBuildOptions{}, fmt.Errorf("build %s: no build context", spec.EnvID)
 	}
+	return lockedBuildOptions(spec.Tag, map[string]string{
+		LabelEnv: spec.EnvID,
+		LabelJob: strconv.FormatInt(spec.JobID, 10),
+	}), nil
+}
+
+// lockedBuildOptions is the request every build sends, PR builds and the
+// startup build probe alike, so the probe proves the request PRs get.
+func lockedBuildOptions(tag string, labels map[string]string) client.ImageBuildOptions {
 	return client.ImageBuildOptions{
 		Version:     build.BuilderBuildKit,
 		Dockerfile:  dockerfileName,
-		Tags:        []string{spec.Tag},
+		Tags:        []string{tag},
 		NetworkMode: string(network.NetworkNone),
 		PullParent:  false,
 		NoCache:     true,
 		Remove:      true,
 		ForceRemove: true,
-		Labels: map[string]string{
-			LabelEnv: spec.EnvID,
-			LabelJob: strconv.FormatInt(spec.JobID, 10),
-		},
-	}, nil
+		Labels:      labels,
+	}
 }
 
 // Build streams spec.ContextTar to the daemon as the /build request body

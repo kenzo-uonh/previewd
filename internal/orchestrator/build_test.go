@@ -29,6 +29,7 @@ type fakeDaemon struct {
 	mu       sync.Mutex
 	stream   []byte
 	images   map[string]image.InspectResponse // by the reference inspected
+	bridge   string                           // GET /networks/bridge reply
 	requests []*http.Request
 	bodies   [][]byte
 }
@@ -47,6 +48,12 @@ func (f *fakeDaemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case p == "/_ping":
 		w.Header().Set("Api-Version", "1.56")
 		_, _ = io.WriteString(w, "OK")
+	case r.Method == http.MethodDelete && strings.Contains(p, "/images/"):
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, "[]")
+	case strings.HasSuffix(p, "/networks/bridge"):
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, f.bridge)
 	case strings.HasSuffix(p, "/build"):
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(f.stream)
@@ -120,16 +127,32 @@ func TestBuildRequestIsLockedDown(t *testing.T) {
 	if r.Method != http.MethodPost {
 		t.Fatalf("method %s", r.Method)
 	}
+	assertLockedQuery(t, r.URL.Query(), testEnv+":latest", `{"previewd.env":"`+testEnv+`","previewd.job":"42"}`)
+	if ct := r.Header.Get("Content-Type"); ct != "application/x-tar" {
+		t.Errorf("Content-Type %q", ct)
+	}
+	reg, err := base64.URLEncoding.DecodeString(r.Header.Get("X-Registry-Config"))
+	if err != nil || (string(reg) != "null" && string(reg) != "{}") {
+		t.Errorf("X-Registry-Config = %q, %v: no registry credential may be sent", reg, err)
+	}
+	if !bytes.Equal(body, tarball) {
+		t.Errorf("body = %q, want the validated tar", body)
+	}
+}
+
+// assertLockedQuery: exactly the D-V1-2 build parameters, with tag and
+// labels, and none of the parameters previewd must never send.
+func assertLockedQuery(t *testing.T, got url.Values, tag, labels string) {
+	t.Helper()
 	want := url.Values{
 		"version":     {"2"},
 		"networkmode": {"none"},
 		"nocache":     {"1"},
 		"forcerm":     {"1"},
 		"dockerfile":  {"Dockerfile"},
-		"t":           {testEnv + ":latest"},
-		"labels":      {`{"previewd.env":"` + testEnv + `","previewd.job":"42"}`},
+		"t":           {tag},
+		"labels":      {labels},
 	}
-	got := r.URL.Query()
 	for _, k := range slices.Sorted(maps.Keys(got)) {
 		if _, ok := want[k]; !ok {
 			t.Errorf("unexpected build parameter %s=%q", k, got[k])
@@ -146,16 +169,6 @@ func TestBuildRequestIsLockedDown(t *testing.T) {
 		if got.Has(k) {
 			t.Errorf("build parameter %s must not be sent, got %q", k, got[k])
 		}
-	}
-	if ct := r.Header.Get("Content-Type"); ct != "application/x-tar" {
-		t.Errorf("Content-Type %q", ct)
-	}
-	reg, err := base64.URLEncoding.DecodeString(r.Header.Get("X-Registry-Config"))
-	if err != nil || (string(reg) != "null" && string(reg) != "{}") {
-		t.Errorf("X-Registry-Config = %q, %v: no registry credential may be sent", reg, err)
-	}
-	if !bytes.Equal(body, tarball) {
-		t.Errorf("body = %q, want the validated tar", body)
 	}
 }
 

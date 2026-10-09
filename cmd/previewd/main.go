@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"slices"
@@ -31,6 +32,11 @@ const (
 	// startupSweepTimeout bounds the inventory, the sweep and the removal of
 	// what the database does not keep.
 	startupSweepTimeout = 5 * time.Minute
+	// buildProbeTimeout bounds the startup build probe; defaultProbePort is
+	// the probe's TCP port on the bridge gateway (discard: nothing should
+	// listen, and nothing may answer).
+	buildProbeTimeout = 3 * time.Minute
+	defaultProbePort  = 9
 )
 
 func main() {
@@ -150,6 +156,39 @@ func main() {
 	logger.Info("Build preflight armed",
 		"allowed_base_images", slices.Sorted(maps.Keys(cfg.AllowedBaseImages)),
 		"max_build_context_bytes", cfg.MaxBuildContextBytes)
+
+	// Startup build probe (V1 F2, E2b, D-V1-4), before the sweep and before
+	// any worker: the request PR builds get must give its RUN step no
+	// network, inside the bounded build cgroup, leaving nothing behind.
+	probeAddr := cfg.BuildProbeAddr
+	if !probeAddr.IsValid() {
+		gw, err := engine.BridgeGateway(pingCtx)
+		if err != nil {
+			logger.Error("Build probe address unknown", "error", err)
+			os.Exit(1)
+		}
+		probeAddr = netip.AddrPortFrom(gw, defaultProbePort)
+	}
+	isolation := orchestrator.BuildIsolation{Prober: engine, ProbeAddr: probeAddr, Unbounded: cfg.AllowUnboundedBuilds}
+	if cfg.AllowUnboundedBuilds {
+		logger.Error("Opt-in active: builds are not verified to run in a bounded cgroup (memory, swap, tasks, CPU)",
+			"opt_in", "PREVIEWD_ALLOW_UNBOUNDED_BUILDS")
+	} else {
+		buildCgroup, err := hardening.NewBuildCgroup(cfg.BuildKitCgroup)
+		if err != nil {
+			logger.Error("Build cgroup refused", "build_cgroup", cfg.BuildKitCgroup, "error", err)
+			os.Exit(1)
+		}
+		isolation.Cgroup = buildCgroup
+	}
+	probeCtx, probeCancel := context.WithTimeout(ctx, buildProbeTimeout)
+	err = orchestrator.VerifyBuildIsolation(probeCtx, isolation)
+	probeCancel()
+	if err != nil {
+		logger.Error("Startup build probe failed: refusing to start", "probe_addr", probeAddr, "error", err)
+		os.Exit(1)
+	}
+	logger.Info("Startup build probe passed", "probe_addr", probeAddr, "build_cgroup", cfg.BuildKitCgroup)
 
 	// Approval gating (V1 F1): GHES truth through the GitHub App (C3),
 	// judged by the deploy gate (D4) before any build.

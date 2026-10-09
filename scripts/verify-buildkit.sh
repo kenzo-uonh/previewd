@@ -16,7 +16,14 @@
 #   no-session    the context goes as a tar body, no client session
 #   stream-error  a failed RUN answers HTTP 200 with the error in the stream
 #   nocache       nocache=1: a second identical build re-runs its RUN
-#   no-pull       no registry connection for a present pinned base or a missing one
+#   egress-filter the engine's registry connections are blocked by the host
+#                 egress filter (D-V1-2, decided 2026-10-09): pull=0 does not
+#                 stop BuildKit from contacting a base image's registry, so the
+#                 filter is the control. The "registry" is the counting
+#                 listener on the host bridge gateway, standing for any
+#                 destination outside the filter's allow list: zero
+#                 connections for a present and a missing base, and the present
+#                 pinned base still builds from its local record
 #   offline-base  registry unreachable: a name:tag@digest base loaded locally builds
 #   digest-enforced  a local name:tag on another image is refused under the digest
 #   limits-ignored  per-build memory, cpuquota and cgroupparent have no effect (D-V1-4)
@@ -318,14 +325,14 @@ from_case() { # from_case NAME FROM: build FROM + RUN true; prints status|detail
 }
 
 since="$(date +%s)"
-IFS='|' read -r st_local det_local contacts_local <<<"$(from_case no-pull-local "${REG_COUNT}/probe-local:pinned@${DIGEST}")"
-IFS='|' read -r st_missing det_missing contacts_missing <<<"$(from_case no-pull-missing "${REG_COUNT}/probe-missing:pinned@sha256:0000000000000000000000000000000000000000000000000000000000000000")"
-docker events --since "$since" --until "$(( $(date +%s) + 1 ))" --filter type=image --format '{{.Action}} {{.Actor.ID}}' >"$OUT_DIR/no-pull.events"
-pulls="$(grep -c '^pull' "$OUT_DIR/no-pull.events" || true)"
-if [ "$contacts_local" = 0 ] && [ "$contacts_missing" = 0 ] && [ "$st_missing" != ok ] && [ "$pulls" = 0 ]; then
-  record PASS no-pull "no registry contact for a present or a missing base (pull=0 honoured)"
+IFS='|' read -r st_local det_local contacts_local <<<"$(from_case egress-present "${REG_COUNT}/probe-local:pinned@${DIGEST}")"
+IFS='|' read -r st_missing det_missing contacts_missing <<<"$(from_case egress-missing "${REG_COUNT}/probe-missing:pinned@sha256:0000000000000000000000000000000000000000000000000000000000000000")"
+docker events --since "$since" --until "$(( $(date +%s) + 1 ))" --filter type=image --format '{{.Action}} {{.Actor.ID}}' >"$OUT_DIR/egress.events"
+pulls="$(grep -c '^pull' "$OUT_DIR/egress.events" || true)"
+if [ "$contacts_local" = 0 ] && [ "$contacts_missing" = 0 ] && [ "$st_local" = ok ] && [ "$st_missing" != ok ]; then
+  record PASS egress-filter "the engine's registry connections are blocked: none for a present or a missing base; the present pinned base built from its local record"
 else
-  record FAIL no-pull "pull=0 does not stop registry access: present pinned base ${st_local} after ${contacts_local} registry connection(s), missing base ${st_missing} after ${contacts_missing}, ${pulls} pull event(s); only the host egress filter blocks it"
+  record FAIL egress-filter "the engine reached a registry outside the egress filter (present pinned base ${st_local} after ${contacts_local} connection(s), missing base ${st_missing} after ${contacts_missing}; ${pulls} pull event(s)): install the dockerd egress filter (V1-I5, D-V1-2) and keep the host bridge gateway out of its allow list"
 fi
 
 IFS='|' read -r st det _ <<<"$(from_case offline-base "${REG_DOWN}/probe-offline:pinned@${DIGEST}")"

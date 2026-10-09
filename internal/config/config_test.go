@@ -55,6 +55,56 @@ func minimalEnv(t *testing.T) {
 	t.Setenv("PREVIEWD_TLS_CERT_FILE", "/etc/previewd/tls.pem")
 	t.Setenv("PREVIEWD_TLS_KEY_CREDENTIAL", "tls-key")
 	t.Setenv("PREVIEWD_ALLOWED_BASE_IMAGES", testBase)
+	t.Setenv("PREVIEWD_BUILDKIT_CGROUP", testBuildCgroup)
+}
+
+const testBuildCgroup = "/sys/fs/cgroup/previewd-builds.slice"
+
+// The build probe keys (E2b) fail closed: the bounded subtree or the
+// explicit opt-in, never neither nor both; the probe address an IP:PORT.
+func TestLoadBuildProbeKeys(t *testing.T) {
+	minimalEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BuildKitCgroup != testBuildCgroup || cfg.AllowUnboundedBuilds || cfg.BuildProbeAddr.IsValid() {
+		t.Fatalf("defaults = %q, %v, %v", cfg.BuildKitCgroup, cfg.AllowUnboundedBuilds, cfg.BuildProbeAddr)
+	}
+	t.Setenv("PREVIEWD_BUILD_PROBE_ADDR", "10.1.2.3:9")
+	if cfg, err = Load(); err != nil || cfg.BuildProbeAddr.String() != "10.1.2.3:9" {
+		t.Fatalf("probe address = %v, %v", cfg, err)
+	}
+	t.Setenv("PREVIEWD_BUILDKIT_CGROUP", "")
+	t.Setenv("PREVIEWD_ALLOW_UNBOUNDED_BUILDS", "1")
+	if cfg, err = Load(); err != nil || !cfg.AllowUnboundedBuilds || cfg.BuildKitCgroup != "" {
+		t.Fatalf("opt-in = %v, %v", cfg, err)
+	}
+	for name, env := range map[string]map[string]string{
+		"neither":            {"PREVIEWD_BUILDKIT_CGROUP": "", "PREVIEWD_ALLOW_UNBOUNDED_BUILDS": ""},
+		"both":               {"PREVIEWD_BUILDKIT_CGROUP": testBuildCgroup, "PREVIEWD_ALLOW_UNBOUNDED_BUILDS": "1"},
+		"opt-in not exact":   {"PREVIEWD_BUILDKIT_CGROUP": "", "PREVIEWD_ALLOW_UNBOUNDED_BUILDS": "true"},
+		"relative cgroup":    {"PREVIEWD_BUILDKIT_CGROUP": "sys/fs/cgroup/x", "PREVIEWD_ALLOW_UNBOUNDED_BUILDS": ""},
+		"cgroup outside":     {"PREVIEWD_BUILDKIT_CGROUP": "/tmp/x", "PREVIEWD_ALLOW_UNBOUNDED_BUILDS": ""},
+		"cgroup root":        {"PREVIEWD_BUILDKIT_CGROUP": "/sys/fs/cgroup", "PREVIEWD_ALLOW_UNBOUNDED_BUILDS": ""},
+		"cgroup escapes":     {"PREVIEWD_BUILDKIT_CGROUP": "/sys/fs/cgroup/../../tmp", "PREVIEWD_ALLOW_UNBOUNDED_BUILDS": ""},
+		"cgroup trailing":    {"PREVIEWD_BUILDKIT_CGROUP": "/sys/fs/cgroup/x/", "PREVIEWD_ALLOW_UNBOUNDED_BUILDS": ""},
+		"probe hostname":     {"PREVIEWD_BUILD_PROBE_ADDR": "gateway:9"},
+		"probe without port": {"PREVIEWD_BUILD_PROBE_ADDR": "10.1.2.3"},
+		"probe port 0":       {"PREVIEWD_BUILD_PROBE_ADDR": "10.1.2.3:0"},
+		"probe unspecified":  {"PREVIEWD_BUILD_PROBE_ADDR": "0.0.0.0:9"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("PREVIEWD_BUILDKIT_CGROUP", testBuildCgroup)
+			t.Setenv("PREVIEWD_ALLOW_UNBOUNDED_BUILDS", "")
+			for k, v := range env {
+				t.Setenv(k, v)
+			}
+			if _, err := Load(); err == nil {
+				t.Fatalf("%v accepted", env)
+			}
+		})
+	}
 }
 
 const testBase = "busybox:latest@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e"

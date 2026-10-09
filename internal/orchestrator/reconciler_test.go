@@ -109,6 +109,8 @@ func tarFile(r io.Reader, name string) (string, error) {
 	}
 }
 
+func (h *hostEngine) BuildProbe(context.Context, netip.AddrPort) error { return h.step("probe") }
+
 func (h *hostEngine) ProvisionNetwork(_ context.Context, env string) error {
 	if err := h.step("network"); err != nil {
 		return err

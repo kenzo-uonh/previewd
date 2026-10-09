@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/kenzo-uonh/previewd/internal/config"
+	"github.com/kenzo-uonh/previewd/internal/hardening"
 	"github.com/kenzo-uonh/previewd/internal/store"
 )
 
@@ -159,9 +160,11 @@ func subcommand() (code int, ran bool) {
 	switch os.Args[1] {
 	case "audit":
 		return runAudit(context.Background(), os.Args[2:], os.Stdout, os.Stderr), true
+	case "build-probe":
+		return runBuildProbe(context.Background(), os.Args[2:], os.Stdout, os.Stderr, hardening.ProbeNoNetwork), true
 	default:
 		diag := &console{w: os.Stderr}
-		diag.printf("previewd: unknown command %q (run without arguments to start the daemon)\n%s", os.Args[1], auditUsage)
+		diag.printf("previewd: unknown command %q (run without arguments to start the daemon)\n%s%s", os.Args[1], auditUsage, buildProbeUsage)
 		return exitUsage, true
 	}
 }
