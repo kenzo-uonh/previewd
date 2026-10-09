@@ -740,20 +740,6 @@ func (d *DockerEngine) FreeDisk(ctx context.Context) (int64, error) {
 	return free, nil
 }
 
-// Logs returns the standard output and error streams.
-func (d *DockerEngine) Logs(ctx context.Context, id string) (io.ReadCloser, error) {
-	opts := client.ContainerLogsOptions{
-		ShowStdout: true,
-		ShowStderr: true,
-		Follow:     true,
-	}
-	logs, err := d.client.ContainerLogs(ctx, id, opts)
-	if err != nil {
-		return nil, fmt.Errorf("failed to stream logs for environment %s: %w", id, err)
-	}
-	return logs, nil
-}
-
 // Close gracefully terminates the SDK connection.
 func (d *DockerEngine) Close() error {
 	return d.client.Close()

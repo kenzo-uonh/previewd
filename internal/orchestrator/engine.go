@@ -6,7 +6,10 @@ import (
 	"net/netip"
 )
 
-// Engine defines the strictly air-gapped orchestration contract.
+// Engine defines the strictly air-gapped orchestration contract. It never
+// returns container output (V1-I10): no method reads a container's logs or
+// attaches to it, and the Semgrep rule previewd-no-container-output keeps
+// ContainerLogs and ContainerAttach out of non-test code.
 type Engine interface {
 	Ping(ctx context.Context) error
 	// Build builds spec.ContextTar with BuildKit, the network forced to
@@ -24,7 +27,6 @@ type Engine interface {
 	// Observe reports what the engine holds for every environment previewd
 	// owns, including leftovers no job tracks.
 	Observe(ctx context.Context) (map[string]EngineState, error)
-	Logs(ctx context.Context, id string) (io.ReadCloser, error)
 	// PruneImages removes every image previewd built (ownership labels)
 	// whose environment is not in keep, and reports the bytes reclaimed. An
 	// image a container still uses is kept (V1-I9).

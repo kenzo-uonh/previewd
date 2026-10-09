@@ -48,9 +48,10 @@ package store
 //	    now's UUIDv1 ticks in the same transaction.
 //	ApprovalLive(ctx, envID, commitSHA) (bool, error)
 //	    a grant newer than every revocation of (env, commit), by seq.
-//	Expired(ctx, ttl, now) ([]string, error)
-//	    sorted environments whose latest job is a SUCCESS deploy finished
-//	    at or before now - ttl.
+//	Expired(ctx, ttl, now) ([]Job, error)
+//	    the latest job, sorted by environment, of every environment whose
+//	    latest job is a SUCCESS deploy finished, or a PENDING_APPROVAL
+//	    deploy created, at or before now - ttl.
 //	Prune(ctx, PruneRequest) (PruneStats, error)
 //	    terminal jobs finished before Now - Retention that are neither the
 //	    latest of their environment nor in Builders, after raising the
@@ -364,8 +365,12 @@ func (b *v1StoreBackend) verify(t *rapid.T, x *v1Machine) {
 	}
 
 	if x.cfg.ttl > 0 {
-		expired, err := b.store.Expired(b.ctx, time.Duration(x.cfg.ttl)*v1Tick, x.now())
+		jobs, err := b.store.Expired(b.ctx, time.Duration(x.cfg.ttl)*v1Tick, x.now())
 		b.must(t, err, "expired")
+		var expired []string
+		for _, j := range jobs {
+			expired = append(expired, j.EnvID)
+		}
 		if want := x.expirableEnvs(); !slices.Equal(expired, want) {
 			t.Fatalf("expired = %v in the store, %v in the model", expired, want)
 		}

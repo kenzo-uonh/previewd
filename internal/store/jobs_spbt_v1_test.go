@@ -421,6 +421,7 @@ const (
 	v1M20               // a revocation judges any active deploy or the running commit (A1 rule, A2-1)
 	v1M21               // an internal job takes a seq above now (A1 rule, A2-2)
 	v1M22               // GHES unavailable in AuthorizeDeploy leaves a revoked version running (before A2-6)
+	v1M23               // a parked intent never expires (before the G leftover)
 )
 
 // v1Grant is a grant delivery as the API hands it to the store, with the
@@ -617,9 +618,18 @@ func (x *v1Machine) needsRevalidation(e string) bool {
 	return x.m.exists(e) && x.m.builderSucceeded(e) && x.m.builderIsLatest(e)
 }
 
+// expirable is Expirable(e): what runs is older than the TTL, or the
+// latest intent is a deploy parked for an approval since it was created at
+// least the TTL ago (G leftover: a parked fork does not wait forever).
 func (x *v1Machine) expirable(e string) bool {
 	m := &x.m
-	return x.cfg.ttl > 0 && m.intact(e) && m.builderSucceeded(e) && m.builderIsLatest(e) &&
+	if x.cfg.ttl <= 0 {
+		return false
+	}
+	if l, ok := m.latest(e); ok && l.Type == JobDeploy && l.Status == v1StatusPending && x.cfg.mutant != v1M23 {
+		return x.now().UnixMilli()-l.CreatedAt >= (time.Duration(x.cfg.ttl) * v1Tick).Milliseconds()
+	}
+	return m.intact(e) && m.builderSucceeded(e) && m.builderIsLatest(e) &&
 		m.clock-m.deployedAt[e] >= x.cfg.ttl
 }
 
@@ -1288,7 +1298,8 @@ func (x *v1Machine) Expire(t *rapid.T) {
 
 func (x *v1Machine) expire(t *rapid.T, e string) {
 	now := x.now()
-	wantID := x.internal(e, JobTeardown, x.m.host[e].Commit, v1OriginTTL).ID
+	l, _ := x.m.latest(e)
+	wantID := x.internal(e, JobTeardown, l.Commit, v1OriginTTL).ID
 	if x.st != nil {
 		if jobID := x.st.enqueueInternal(t, e, v1OriginTTL, false, now); jobID != wantID {
 			t.Fatalf("ttl teardown of %s = job %d, model %d", e, jobID, wantID)

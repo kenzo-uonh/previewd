@@ -433,3 +433,46 @@ func TestMaintainQueuesTTLTeardowns(t *testing.T) {
 	cancel()
 	<-done
 }
+
+// G leftover: a deploy parked for an approval that never comes expires
+// with the TTL, counted from its creation: a TTL teardown of its commit
+// supersedes it (SKIPPED), audited ttl_expired; nothing is built.
+func TestTTLExpiresParkedDeploys(t *testing.T) {
+	r := newRig(t)
+	r.envTTL = 2 * time.Hour
+	rec := r.started()
+	r.auth.set(func(store.Lease) (Decision, error) {
+		return Decision{}, refuse("", "fork without approval")
+	}, nil)
+	r.enqueue(store.JobDeploy)
+	parked := lastOf(r.drain(rec))
+	if parked.Status != store.StatusPendingApproval {
+		t.Fatalf("deploy = %+v, want PENDING_APPROVAL", parked)
+	}
+
+	r.now = r.now.Add(2*time.Hour - time.Millisecond)
+	rec.expireOnce(context.Background())
+	if n := len(r.jobs()); n != 1 {
+		t.Fatalf("%d jobs: a parked deploy expired before its TTL", n)
+	}
+	r.now = r.now.Add(time.Millisecond)
+	rec.expireOnce(context.Background())
+	td := lastOf(r.jobs())
+	if td.Type != store.JobTeardown || td.Origin != store.OriginTTL || td.Source.CommitSHA != parked.Source.CommitSHA {
+		t.Fatalf("jobs %+v, want a ttl teardown of the parked commit", r.jobs())
+	}
+	if got := r.audit(); !slices.Equal(got, []string{"deploy_refused/not_approved", "ttl_expired/ttl"}) {
+		t.Fatalf("audit %v", got)
+	}
+	jobs := r.drain(rec)
+	if jobs[0].Status != store.StatusSkipped || lastOf(jobs).Status != store.StatusSuccess {
+		t.Fatalf("jobs %+v, want the parked deploy SKIPPED and the teardown SUCCESS", jobs)
+	}
+	if r.built() || r.running() {
+		t.Fatal("the expired parked deploy was built or runs")
+	}
+	rec.expireOnce(context.Background())
+	if n := len(r.jobs()); n != 2 {
+		t.Fatalf("%d jobs: the TTL teardown was queued twice", n)
+	}
+}

@@ -252,22 +252,36 @@ func execCount(ctx context.Context, tx *sql.Tx, what, query string, args ...any)
 	return n, nil
 }
 
-// Expired returns, sorted, the environments whose latest job is a SUCCESS
-// deploy finished at or before now - ttl: what runs is older than its TTL
-// and nothing newer is recorded. The Expirer queues their teardown
-// (EnqueueInternal, origin ttl); a later push deploys again.
-func (s *Store) Expired(ctx context.Context, ttl time.Duration, now time.Time) (envs []string, err error) {
+// queryExpired selects the latest job of each environment when it is a
+// SUCCESS deploy finished, or a PENDING_APPROVAL deploy created, at or
+// before the cutoff (both arguments).
+const queryExpired = `SELECT ` + jobColumns + ` FROM jobs j
+	WHERE j.type = 'deploy'
+	  AND ((j.status = 'SUCCESS' AND j.finished_at <= ?) OR (j.status = 'PENDING_APPROVAL' AND j.created_at <= ?))
+	  AND NOT EXISTS (SELECT 1 FROM jobs n WHERE n.preview_id = j.preview_id AND n.seq > j.seq)
+	ORDER BY j.preview_id`
+
+// Expired returns, sorted by environment, the latest job of every
+// environment past its TTL, with nothing newer recorded:
+//   - a SUCCESS deploy finished at or before now - ttl: what runs is older
+//     than its TTL;
+//   - a PENDING_APPROVAL deploy created at or before now - ttl: an intent
+//     parked for an approval that has not come (a fork waits no longer than
+//     a running environment lives).
+//
+// The Expirer queues their teardown (EnqueueInternal, origin ttl), pinned
+// to that job's commit; for a parked job the teardown supersedes it
+// (Acquire skips it). A later push, or an approval of the open head,
+// deploys again.
+func (s *Store) Expired(ctx context.Context, ttl time.Duration, now time.Time) (jobs []Job, err error) {
 	if ttl <= 0 {
 		return nil, fmt.Errorf("expired: ttl %s is not positive", ttl)
 	}
 	if !validTime(now) {
 		return nil, fmt.Errorf("expired: %w", ErrInvalidTime)
 	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT j.preview_id FROM jobs j
-		WHERE j.type = 'deploy' AND j.status = 'SUCCESS' AND j.finished_at <= ?
-		  AND NOT EXISTS (SELECT 1 FROM jobs n WHERE n.preview_id = j.preview_id AND n.seq > j.seq)
-		ORDER BY j.preview_id`, now.Add(-ttl).UnixMilli())
+	cutoff := now.Add(-ttl).UnixMilli()
+	rows, err := s.db.QueryContext(ctx, queryExpired, cutoff, cutoff)
 	if err != nil {
 		return nil, fmt.Errorf("expired: %w", err)
 	}
@@ -277,14 +291,14 @@ func (s *Store) Expired(ctx context.Context, ttl time.Duration, now time.Time) (
 		}
 	}()
 	for rows.Next() {
-		var env string
-		if err := rows.Scan(&env); err != nil {
+		j, err := scanJob(rows)
+		if err != nil {
 			return nil, fmt.Errorf("expired: scan: %w", err)
 		}
-		envs = append(envs, env)
+		jobs = append(jobs, j)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("expired: %w", err)
 	}
-	return envs, nil
+	return jobs, nil
 }

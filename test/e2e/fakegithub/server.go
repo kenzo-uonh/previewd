@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,12 +67,16 @@ type ghes struct {
 	tokens map[string]*minted    // token value -> grant
 	misuse []string              // refused token uses, for the ledger
 	calls  map[string]int        // reads by kind
+	// Tarball API (H2): the bare repository of each owner/repo, and the
+	// one-time archive codes issued (code -> used).
+	gitDirs map[string]string
+	codes   map[string]bool
 }
 
 func newGHES(appID, installation int64, key *rsa.PublicKey, logger *slog.Logger) *ghes {
 	return &ghes{appID: appID, installation: installation, appKey: key, logger: logger,
 		pulls: map[string]pull{}, perms: map[string]permission{}, revs: map[string][]review{},
-		tokens: map[string]*minted{}, calls: map[string]int{}}
+		tokens: map[string]*minted{}, calls: map[string]int{}, gitDirs: map[string]string{}, codes: map[string]bool{}}
 }
 
 func (g *ghes) routes() http.Handler {
@@ -82,6 +87,8 @@ func (g *ghes) routes() http.Handler {
 	mux.HandleFunc("GET /api/v3/repos/{owner}/{repo}/pulls/{n}", g.pullRequest)
 	mux.HandleFunc("GET /api/v3/repos/{owner}/{repo}/pulls/{n}/reviews", g.reviews)
 	mux.HandleFunc("GET /api/v3/repos/{owner}/{repo}/collaborators/{login}/permission", g.permission)
+	mux.HandleFunc("GET /api/v3/repos/{owner}/{repo}/tarball/{sha}", g.tarball)
+	mux.HandleFunc("GET /_codeload/{owner}/{repo}/legacy.tar.gz/{sha}", g.codeload)
 	// Control endpoints for the suite.
 	mux.HandleFunc("PUT /_fake/pulls/{owner}/{repo}/{n}", g.setPull)
 	mux.HandleFunc("PUT /_fake/permissions/{owner}/{repo}/{login}", g.setPermission)
@@ -302,6 +309,65 @@ func (g *ghes) reviews(w http.ResponseWriter, r *http.Request) {
 			"submitted_at": time.Now().UTC().Format(time.RFC3339)})
 	}
 	reply(w, http.StatusOK, out)
+}
+
+// tarball answers as GHES does: a redirect to the archive, on a one-time
+// URL that carries its own credential.
+func (g *ghes) tarball(w http.ResponseWriter, r *http.Request) {
+	repo := repoOf(r)
+	if !g.authorize(w, r, repo, "contents") {
+		return
+	}
+	sha := r.PathValue("sha")
+	g.mu.Lock()
+	_, known := g.gitDirs[repo]
+	g.calls["tarball"]++
+	g.mu.Unlock()
+	if !known || len(sha) != 40 || strings.Trim(sha, "0123456789abcdef") != "" {
+		refuse(w, http.StatusNotFound, "Not Found")
+		return
+	}
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		refuse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	code := hex.EncodeToString(buf)
+	g.mu.Lock()
+	g.codes[code] = false
+	g.mu.Unlock()
+	w.Header().Set("Location", "https://"+r.Host+"/_codeload/"+repo+"/legacy.tar.gz/"+sha+"?token="+code)
+	w.WriteHeader(http.StatusFound)
+}
+
+// codeload streams git archive of the commit, once per code. An installation
+// token sent here is misuse: the archive URL is its own credential.
+func (g *ghes) codeload(w http.ResponseWriter, r *http.Request) {
+	repo, sha, code := repoOf(r), r.PathValue("sha"), r.URL.Query().Get("token")
+	g.mu.Lock()
+	if r.Header.Get("Authorization") != "" {
+		g.misuse = append(g.misuse, "credential sent to the archive host for "+repo)
+	}
+	used, issued := g.codes[code]
+	dir := g.gitDirs[repo]
+	if issued && !used {
+		g.codes[code] = true
+		g.calls["archive"]++
+	}
+	g.mu.Unlock()
+	if !issued || used || dir == "" {
+		refuse(w, http.StatusNotFound, "Not Found")
+		return
+	}
+	owner, name, _ := strings.Cut(repo, "/")
+	// #nosec G204 -- test tool: sha checked by the tarball API, dir from the command line.
+	cmd := exec.CommandContext(r.Context(), "git", "--git-dir", dir, "archive", "--format=tar.gz",
+		"--prefix="+owner+"-"+name+"-"+sha[:7]+"/", sha)
+	cmd.Stdout = w
+	w.Header().Set("Content-Type", "application/x-gzip")
+	if err := cmd.Run(); err != nil {
+		g.logger.Error("git archive failed", "repo", repo, "sha", sha, "error", err)
+	}
 }
 
 func (g *ghes) setPull(w http.ResponseWriter, r *http.Request) {

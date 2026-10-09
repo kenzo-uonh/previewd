@@ -66,7 +66,7 @@ type Queue interface {
 	EnqueueInternal(ctx context.Context, envID string, origin store.Origin, reason store.RevocationReason, now time.Time, audit store.AuditEvent) (int64, error)
 	// Maintain (V1 F3, G3).
 	Prune(ctx context.Context, req store.PruneRequest) (store.PruneStats, error)
-	Expired(ctx context.Context, ttl time.Duration, now time.Time) ([]string, error)
+	Expired(ctx context.Context, ttl time.Duration, now time.Time) ([]store.Job, error)
 }
 
 // Authorizer is the deploy gate (GHESAuthorizer).
@@ -87,8 +87,10 @@ type SecretSource interface {
 	Section(repo string, untrusted, fullOptIn bool) (map[string]string, error)
 }
 
-// FetchFunc checks out commitSHA of cloneURL into destDir (vcs.FetchRepository).
-type FetchFunc func(ctx context.Context, cloneURL, commitSHA, destDir string) error
+// FetchFunc writes the tree of commitSHA of repo into destDir, which does
+// not exist yet (vcs.Fetcher.Fetch: the GHES tarball through the GitHub App,
+// git fetch --depth=1 of cloneURL without one).
+type FetchFunc func(ctx context.Context, repo, cloneURL, commitSHA, destDir string) error
 
 // ReconcilerConfig wires the reconciler. Every dependency is required.
 type ReconcilerConfig struct {
@@ -171,7 +173,6 @@ const (
 	defaultMinFreeDisk = 10240 << 20
 	minFreeDisk        = 1024 << 20
 	defaultEnvTTL      = 168 * time.Hour
-	minEnvTTL          = time.Hour
 	// buildDirPrefix names the build directory of a deploy.
 	buildDirPrefix = "previewd-build-"
 	// pruneTimeout bounds an image prune, which holds deployMu (every
@@ -553,7 +554,7 @@ func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, l
 		}
 	}()
 	srcDir := filepath.Join(dir, "src")
-	if err := r.cfg.Fetch(ctx, l.Source.CloneURL, l.Source.CommitSHA, srcDir); err != nil {
+	if err := r.cfg.Fetch(ctx, l.Source.Repo, l.Source.CloneURL, l.Source.CommitSHA, srcDir); err != nil {
 		return failAt(store.FailureFetch, fmt.Errorf("fetch: %w", err))
 	}
 	buildContext, err := PrepareBuildContext(srcDir, filepath.Join(dir, "context.tar"), r.cfg.MaxBuildContextBytes, r.cfg.AllowedBaseImages)
@@ -561,7 +562,9 @@ func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, l
 		return failAt(store.FailurePreflight, fmt.Errorf("preflight: %w", err))
 	}
 	defer func() {
-		if cErr := buildContext.Close(); cErr != nil {
+		// The build request's transport closes the file once it has sent
+		// it (net/http closes an io.Closer body): already closed is fine.
+		if cErr := buildContext.Close(); cErr != nil && !errors.Is(cErr, os.ErrClosed) {
 			log.Error("Could not close the build context", "error", cErr)
 		}
 	}()
@@ -1018,16 +1021,18 @@ func (r *Reconciler) Maintain(ctx context.Context) {
 }
 
 // expireOnce queues an internal teardown (origin ttl, audited ttl_expired)
-// for every environment whose running version finished deploying at least
-// EnvTTL ago and nothing newer is recorded (Store.Expired). The teardown is
-// pinned to that version's commit: when a newer intent for another commit
-// was recorded since, the store refuses it. A later push deploys again.
+// for every environment past its TTL (Store.Expired): its running version
+// finished deploying at least EnvTTL ago, or its latest intent is a deploy
+// parked for an approval since at least EnvTTL, and nothing newer is
+// recorded. The teardown is pinned to that job's commit: when a newer
+// intent for another commit was recorded since, the store refuses it. A
+// later push, or an approval of the open head, deploys again.
 func (r *Reconciler) expireOnce(ctx context.Context) {
 	if r.cfg.DisableTTL {
 		return
 	}
 	now := r.cfg.Now()
-	envs, err := r.cfg.Queue.Expired(ctx, r.cfg.EnvTTL, now)
+	jobs, err := r.cfg.Queue.Expired(ctx, r.cfg.EnvTTL, now)
 	if err != nil {
 		if ctx.Err() == nil {
 			r.cfg.Logger.Error("TTL: could not list the expired environments: the next pass retries", "error", err)
@@ -1035,34 +1040,31 @@ func (r *Reconciler) expireOnce(ctx context.Context) {
 		return
 	}
 	queued := 0
-	for _, env := range envs {
+	for _, j := range jobs {
 		if ctx.Err() != nil {
 			break
 		}
-		log := r.cfg.Logger.With("environment_id", env, "ttl", r.cfg.EnvTTL)
-		v, ok, err := r.cfg.Queue.RunningVersion(ctx, env)
-		switch {
-		case err != nil:
-			log.Error("TTL: could not read the running version: the next pass retries", "error", err)
-			continue
-		case !ok:
+		log := r.cfg.Logger.With("environment_id", j.EnvID, "ttl", r.cfg.EnvTTL, "expired_job_id", j.ID,
+			"status", string(j.Status), "repository", j.Source.Repo, "pr_number", j.Source.PRNumber, "commit_sha", j.Source.CommitSHA)
+		id, err := r.ttlTeardown(ctx, j, now)
+		if err != nil {
+			log.Error("Could not queue the TTL teardown: the next pass retries", "error", err)
 			continue
 		}
-		if id, err := r.ttlTeardown(ctx, v, now); err != nil {
-			log.Error("Could not queue the TTL teardown: the next pass retries", "builder_job_id", v.ID, "error", err)
-		} else {
-			log.Info("Environment past its TTL: teardown queued", "builder_job_id", v.ID, "teardown_job_id", id,
-				"repository", v.Source.Repo, "pr_number", v.Source.PRNumber, "commit_sha", v.Source.CommitSHA,
-				"deployed_at", time.UnixMilli(v.FinishedAt).UTC())
-			queued++
+		since := j.FinishedAt
+		if j.Status == store.StatusPendingApproval {
+			since = j.CreatedAt
 		}
+		log.Info("Environment past its TTL: teardown queued", "teardown_job_id", id, "since", time.UnixMilli(since).UTC())
+		queued++
 	}
 	if queued > 0 {
 		r.Notify()
 	}
 }
 
-// ttlTeardown queues the TTL teardown of v's environment, pinned to v.
+// ttlTeardown queues the TTL teardown of v's environment, pinned to v, the
+// environment's latest job.
 func (r *Reconciler) ttlTeardown(ctx context.Context, v store.Job, now time.Time) (int64, error) {
 	cctx, cancel := cleanupContext(ctx)
 	defer cancel()

@@ -54,6 +54,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	if config.TestOnlyBounds != "" {
+		logger.Error("Test-only build: never run it in production", "build", config.TestOnlyBounds)
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -237,6 +241,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Source fetch (H2, V1-I11): the commit tarball from GHES through the
+	// GitHub App, extracted under bounds; git fetch --depth=1 only without
+	// an App, which this daemon always has.
+	fetcher, err := vcs.NewFetcher(ghes, cfg.MaxBuildContextBytes)
+	if err != nil {
+		logger.Error("Source fetcher refused", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("Source fetch armed", "ghes_tarball", fetcher.Tarball(), "max_bytes", cfg.MaxBuildContextBytes)
+
 	reconciler, err := orchestrator.NewReconciler(orchestrator.ReconcilerConfig{
 		Queue:                db,
 		Engine:               engine,
@@ -244,7 +258,7 @@ func main() {
 		Stager:               stager,
 		Secrets:              injector,
 		Authorizer:           authorizer,
-		Fetch:                vcs.FetchRepository,
+		Fetch:                fetcher.Fetch,
 		Logger:               logger,
 		Domain:               cfg.TraefikDomain,
 		AppPort:              appPort,

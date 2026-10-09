@@ -79,7 +79,7 @@ Rule: a human or external actor is never fair, and a previewd loop that enforces
 
 Guards keep the fair loops from stuttering forever:
 - `Revalidate(e)` is enabled only for an environment, trusted or not (D-V1-5), that exists, has a successful builder, and either is no longer allowed in GitHub truth or has `revalFails[e] > 0`, or while a GHES fault remains in the budget. Allowed: `Trusted(e)`, or a live approval of its commit in the DB and in GitHub truth.
-- `Expire(e)` is enabled only when `clock − deployedAt[e] ≥ TTL > 0` and no newer job exists.
+- `Expire(e)` is enabled only when `TTL > 0` and either `clock − deployedAt[e] ≥ TTL` and no newer job exists, or the latest job is `PENDING_APPROVAL` and `clock − parkedAt[e] ≥ TTL` (`ExpirableParked(e)`, section 14).
 
 A fair action that is always enabled but changes nothing would satisfy weak fairness vacuously.
 
@@ -98,7 +98,7 @@ Transition rules beyond the MVP:
   - if allowed (trusted, or approved in GitHub truth and live in the DB): reset `revalFails[e]`;
   - if not: record an internal `revoke` at the current stamp and queue a teardown (`origin = "revalidation"`, `seq = MaxSeq(e) + 1`);
   - GHES fault: `revalFails[e] + 1`, and at `Grace` the same teardown.
-- **`Expire(e)`:** a teardown with `origin = "ttl"`, `seq = MaxSeq(e) + 1`.
+- **`Expire(e)`:** a teardown with `origin = "ttl"`, `seq = MaxSeq(e) + 1`, of the running commit, or of the parked job's commit when the latest intent is parked (section 14).
 - **`Prune`:** delete one terminal job that is not the highest-seq job of its environment, not the builder of what runs there (A1-6) and not newer than that builder (section 13), after raising `watermark[e]` to at least its seq. Or delete one delivery record whose ts is at most `MaxSeq(env)`, added to `prunedDeliveries`. Which job or delivery is unconstrained: an over-approximation of "older than the retention".
 - **`StartupSweep`:** MVP rules. `PENDING_APPROVAL` jobs are untouched. A re-armed deploy goes through `AuthorizeDeploy` again, so an untrusted environment comes back after a reboot only with a re-validated approval.
 
@@ -149,6 +149,7 @@ The statement "an untrusted environment runs only with a live approval" cannot b
 |---|---|
 | `LivenessRevokedTornDown` | `∀ e ∈ EnvIDs: (Exists(e) ∧ ¬AllowedTruth(e, environments[e].commit)) ~> (¬Exists(e) ∨ AllowedTruth(e, environments[e].commit))`, with `AllowedTruth(e, c) == Trusted(e) ∨ c ∈ approvedGH[e]`. It covers a revoked fork approval and an offboarded opener alike (D-V1-5). Relies on WF of `Revalidator`, `Worker` and `Api`. |
 | `LivenessExpired` | `∀ e: (TTL > 0 ∧ Exists(e) ∧ clock − deployedAt[e] ≥ TTL) ~> (¬Exists(e) ∨ a newer deploy SUCCESS)` |
+| `LivenessParkedExpired` | `∀ e: (TTL > 0 ∧ the latest job is PENDING_APPROVAL ∧ clock − parkedAt[e] ≥ TTL) ~> (no job ∨ the latest job is not PENDING_APPROVAL)` (section 14) |
 | `LivenessEventualCompletion` (amended) | every `QUEUED` job reaches a terminal state or `PENDING_APPROVAL`; every `PENDING_APPROVAL` job whose grant is live leaves that status |
 | `LivenessEventualConsistency` (amended) | `<>[] ∀ e: Converged(e)` with the section 4 definition |
 
@@ -207,6 +208,7 @@ A1 is accepted when every configuration of 6.1 passes within budget, coverage sh
 | V1-M18 | Trusted and untrusted jobs of different environments share the lock | `SafetyOneJobPerEnv` / `LivenessEventualCompletion` | mixed |
 | V1-M19 | `Revalidator` checks untrusted environments only (the pre-D-V1-5 design) | `LivenessRevokedTornDown` (offboarded opener) | mixed |
 | V1-M22 | GHES unavailable in `AuthorizeDeploy` leaves a revoked version running (before A2-6) | `SafetyUnavailableRemovesRevoked` | approval |
+| V1-M23 | `Expire` ignores a parked intent (before section 14) | `LivenessParkedExpired` | ttl-parked |
 
 Out of model, and checked by Go tests instead:
 - an untrusted deploy receiving trusted secrets (`Injector.Section`);
@@ -345,3 +347,12 @@ The TLA+ model is unchanged and TLC was not re-run. Each item is a refinement or
 - **F2-1, pruning a job newer than a host builder changed the sweep.** `Keep(e)` reads the builder of what runs in `e` and every job newer than it (all must be `QUEUED` or an interrupted teardown). A1-6 protected the builder only. Path: builder 1 runs; deploy 2 and teardown 3 queue; teardown 3 is leased, so deploy 2 is `SKIPPED`; teardown 3 fails before removing anything and is requeued. Unpruned, the next sweep sees job 2 (`SKIPPED`, not `QUEUED`) and destroys `e`. With job 2 pruned (terminal, not the latest, not the builder), it keeps `e`. Not a safety violation: queued teardown 3 removes `e` either way, and no model property compares a pruned run with an unpruned one, which is why TLC did not report it (and `previewd-prune.cfg` has `MaxFaults = 0`, so the failed teardown is out of its bounds). `TestJobStore_StateMachine`, which since F2 compares every operation of a pruned twin store with a store that is never pruned, does compare them. `TestPruneKeepsWhatTheSweepReads` pins the path.
 
   **Rule now:** `PrunableJobs` excludes every job at or above `deployed_ts` of an environment that exists with a builder (`deployed_ts # 0`), and the store's predicate excludes every job at or above the seq of a builder in `Builders` of the same environment. The Go V1 machine follows. The PlusCal was edited and translated again; TLC was re-run on `previewd-prune.cfg` only (the one configuration with `MaxPrunes > 0`; the others cannot reach `Prune`).
+
+## 14. A parked intent expires with the TTL (G leftover, 2026-10-09)
+
+**Finding (phase G review, MEDIUM):** section 3.2 of the V1 spec says a `PENDING_APPROVAL` job is "approved, superseded or expires with the environment TTL", but `Expire(e)` was enabled only for a running environment. A fork that nobody approves kept its parked intent forever, and nothing in the model said otherwise: no property watched a parked job.
+
+**Rule now:** `parkedAt[e]` records the clock at the park. `Expirable(e)` gains `ExpirableParked(e)`: the latest job is `PENDING_APPROVAL` and `clock − parkedAt[e] ≥ TTL`. The Expirer then queues the TTL teardown of the parked job's commit (the running commit otherwise, as before), which supersedes the parked job: the next lease skips it. The new property `LivenessParkedExpired` (above) holds in every configuration. `previewd-ttl-parked.cfg` (one untrusted environment, TTL 1) checks it where parks happen; removing the disjunct (V1-M23) violates it there.
+
+**Store and model:** `Store.Expired` counts a parked job from its `created_at` (the delivery time; no column records the park), at or before the park, so the implementation expires a parked job no later than the model. The Go reference model (`jobs_spbt_v1_test.go`) uses the job's creation time like the store, so the twin comparison of `Expired` is exact; its property copy `LivenessParkedExpired` kills V1-M23 there too.
+

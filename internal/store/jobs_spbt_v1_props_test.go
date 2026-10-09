@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"pgregory.net/rapid"
 )
@@ -331,6 +332,10 @@ func (x *v1Machine) checkLiveness(t *rapid.T) {
 		if x.cfg.ttl > 0 && m.intact(e) && m.builderSucceeded(e) && m.builderIsLatest(e) && m.clock-m.deployedAt[e] >= x.cfg.ttl {
 			t.Fatalf("LivenessExpired: %s deployed at %d still runs at %d, TTL %d", e, m.deployedAt[e], m.clock, x.cfg.ttl)
 		}
+		if l, ok := m.latest(e); x.cfg.ttl > 0 && ok && l.Type == JobDeploy && l.Status == v1StatusPending &&
+			x.now().UnixMilli()-l.CreatedAt >= (time.Duration(x.cfg.ttl)*v1Tick).Milliseconds() {
+			t.Fatalf("LivenessParkedExpired: %s still parked at %d, created %d, TTL %d", e, x.now().UnixMilli(), l.CreatedAt, x.cfg.ttl)
+		}
 		for _, c := range v1Commits {
 			if m.open[e] && m.head[e] == c && x.allowedTruth(m, e, c) && (x.trustedSpec(m, e) || liveSpec(m.approvals, e, c)) &&
 				!runningSpec(m, e, c) && !gaveUp(m, e, c) {
@@ -448,7 +453,7 @@ var v1MutantCases = []struct {
 	{"V1-M15", v1M15, nil, 0},
 	{"V1-M15b", v1M15b, []string{"SafetyPruneKeepsVerdicts"}, 0},
 	{"V1-M16", v1M16, nil, 0},
-	{"V1-M17", v1M17, []string{"LivenessExpired"}, 0},
+	{"V1-M17", v1M17, []string{"LivenessExpired", "LivenessParkedExpired"}, 0},
 	{"V1-M18", v1M18, []string{"SafetyMonotonicity", "SafetyOneJobPerEnv", "SafetyMonotonicStep"}, 0},
 	// A trusted opener losing write access under a running environment,
 	// then a quiet ending: about 4 seeds in 12 missed it at 1,000 runs.
@@ -458,6 +463,7 @@ var v1MutantCases = []struct {
 	// An approved version superseded, then a GHES fault at the next
 	// authorization: rare at 1,000 runs.
 	{"V1-M22", v1M22, []string{"SafetyUnavailableRemovesRevoked"}, 5 * v1MutantChecks},
+	{"V1-M23", v1M23, []string{"LivenessParkedExpired"}, 0},
 }
 
 // v1MutantChecks is the least number of runs a mutant gets.

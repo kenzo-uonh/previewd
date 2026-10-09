@@ -136,6 +136,7 @@ variables
     \* previewd: host and memory.
     environments \in [EnvIDs -> {Absent, Stray}],
     deployedAt = [e \in EnvIDs |-> 0],
+    parkedAt = [e \in EnvIDs |-> 0],    \* clock at the last Park (G leftover)
     revalFails = [e \in EnvIDs |-> 0],
     daemon = "down",
     crashes = 0,
@@ -220,8 +221,16 @@ define
     \* Every running environment, trusted or not (D-V1-5).
     NeedsRevalidation(e) == Exists(e) /\ BuilderSucceeded(e) /\ BuilderIsLatest(e)
 
-    Expirable(e) == /\ TTL > 0 /\ Intact(e) /\ BuilderSucceeded(e) /\ BuilderIsLatest(e)
-                    /\ clock - deployedAt[e] >= TTL
+    \* What runs is older than the TTL, or the latest intent has been parked
+    \* for an approval for at least the TTL (G leftover: a fork does not
+    \* wait forever). The store counts a parked job from its creation, at or
+    \* before the park: it expires no later than here.
+    ExpirableParked(e) == /\ JobsOf(e) # {} /\ db_jobs[Latest(e)].status = "PENDING_APPROVAL"
+                          /\ clock - parkedAt[e] >= TTL
+    Expirable(e) == /\ TTL > 0
+                    /\ \/ /\ Intact(e) /\ BuilderSucceeded(e) /\ BuilderIsLatest(e)
+                          /\ clock - deployedAt[e] >= TTL
+                       \/ ExpirableParked(e)
 
     \* Terminal, not the latest of its environment, not the builder of what
     \* runs (the sweep and Safety 2 read it).
@@ -290,6 +299,7 @@ define
         /\ faults \in 0..MaxFaults
         /\ ghesFaults \in 0..MaxGhesFaults
         /\ revalFails \in [EnvIDs -> 0..Grace]
+        /\ parkedAt \in [EnvIDs -> 0..ClockBound]
 
     \* Safety 1: no secret byte ever reaches a block device.
     SafetyZeroSecretLeakage ==
@@ -601,6 +611,8 @@ AuthorizeDeploy:
                 await ~Trusted(e) /\ ~ApprovedNow(e, c);
                 environments[e] := Destroyed(environments[e]);
                 db_jobs[job].status := "PENDING_APPROVAL";
+                \* Only a TTL reads it: without one it stays 0, and adds no state.
+                parkedAt[e] := IF TTL > 0 THEN clock ELSE 0;
                 job := 0;
                 goto AcquireJob;
             end either;
@@ -757,7 +769,7 @@ Expire:
     while TRUE do
         await daemon = "up";
         with e \in {x \in EnvIDs : Expirable(x)} do
-            Internal(e, "teardown", environments[e].commit, "ttl");
+            Internal(e, "teardown", IF ExpirableParked(e) THEN db_jobs[Latest(e)].commit ELSE environments[e].commit, "ttl");
         end with;
     end while;
 end process;
@@ -826,8 +838,8 @@ end algorithm; *)
 \* BEGIN TRANSLATION
 VARIABLES pc, head, open, approvedGH, openerOK, clock, ghActions, permLosses, 
           ticks, emitted, inflight, deliveries, db_jobs, nextId, approvalsDB, 
-          watermark, environments, deployedAt, revalFails, daemon, crashes, 
-          faults, ghesFaults, prunes, maxTs, prunedDeliveries
+          watermark, environments, deployedAt, parkedAt, revalFails, daemon, 
+          crashes, faults, ghesFaults, prunes, maxTs, prunedDeliveries
 
 (* define statement *)
 JobsOf(e) == {j \in DOMAIN db_jobs : db_jobs[j].env_id = e}
@@ -903,8 +915,16 @@ RevokedVersionRuns(e) ==
 
 NeedsRevalidation(e) == Exists(e) /\ BuilderSucceeded(e) /\ BuilderIsLatest(e)
 
-Expirable(e) == /\ TTL > 0 /\ Intact(e) /\ BuilderSucceeded(e) /\ BuilderIsLatest(e)
-                /\ clock - deployedAt[e] >= TTL
+
+
+
+
+ExpirableParked(e) == /\ JobsOf(e) # {} /\ db_jobs[Latest(e)].status = "PENDING_APPROVAL"
+                      /\ clock - parkedAt[e] >= TTL
+Expirable(e) == /\ TTL > 0
+                /\ \/ /\ Intact(e) /\ BuilderSucceeded(e) /\ BuilderIsLatest(e)
+                      /\ clock - deployedAt[e] >= TTL
+                   \/ ExpirableParked(e)
 
 
 
@@ -973,6 +993,7 @@ TypeOK ==
     /\ faults \in 0..MaxFaults
     /\ ghesFaults \in 0..MaxGhesFaults
     /\ revalFails \in [EnvIDs -> 0..Grace]
+    /\ parkedAt \in [EnvIDs -> 0..ClockBound]
 
 
 SafetyZeroSecretLeakage ==
@@ -1080,8 +1101,9 @@ VARIABLES job, epoch
 
 vars == << pc, head, open, approvedGH, openerOK, clock, ghActions, permLosses, 
            ticks, emitted, inflight, deliveries, db_jobs, nextId, approvalsDB, 
-           watermark, environments, deployedAt, revalFails, daemon, crashes, 
-           faults, ghesFaults, prunes, maxTs, prunedDeliveries, job, epoch >>
+           watermark, environments, deployedAt, parkedAt, revalFails, daemon, 
+           crashes, faults, ghesFaults, prunes, maxTs, prunedDeliveries, job, 
+           epoch >>
 
 ProcSet == {"github"} \cup {"api"} \cup (Workers) \cup {"revalidator"} \cup {"expirer"} \cup {"pruner"} \cup {"supervisor"} \cup {"chaos"}
 
@@ -1103,6 +1125,7 @@ Init == (* Global variables *)
         /\ watermark = [e \in EnvIDs |-> 0]
         /\ environments \in [EnvIDs -> {Absent, Stray}]
         /\ deployedAt = [e \in EnvIDs |-> 0]
+        /\ parkedAt = [e \in EnvIDs |-> 0]
         /\ revalFails = [e \in EnvIDs |-> 0]
         /\ daemon = "down"
         /\ crashes = 0
@@ -1188,9 +1211,9 @@ GitHubActs == /\ pc["github"] = "GitHubActs"
                     /\ UNCHANGED <<head, open, approvedGH, openerOK, ghActions, permLosses, emitted, inflight>>
               /\ pc' = [pc EXCEPT !["github"] = "GitHubActs"]
               /\ UNCHANGED << deliveries, db_jobs, nextId, approvalsDB, 
-                              watermark, environments, deployedAt, revalFails, 
-                              daemon, crashes, faults, ghesFaults, prunes, 
-                              maxTs, prunedDeliveries, job, epoch >>
+                              watermark, environments, deployedAt, parkedAt, 
+                              revalFails, daemon, crashes, faults, ghesFaults, 
+                              prunes, maxTs, prunedDeliveries, job, epoch >>
 
 GitHub == GitHubActs
 
@@ -1257,9 +1280,9 @@ ReceiveWebhook == /\ pc["api"] = "ReceiveWebhook"
                   /\ UNCHANGED << head, open, approvedGH, openerOK, clock, 
                                   ghActions, permLosses, ticks, emitted, 
                                   watermark, environments, deployedAt, 
-                                  revalFails, daemon, crashes, faults, 
-                                  ghesFaults, prunes, prunedDeliveries, job, 
-                                  epoch >>
+                                  parkedAt, revalFails, daemon, crashes, 
+                                  faults, ghesFaults, prunes, prunedDeliveries, 
+                                  job, epoch >>
 
 Api == ReceiveWebhook
 
@@ -1283,8 +1306,8 @@ AcquireJob(self) == /\ pc[self] = "AcquireJob"
                                     ghActions, permLosses, ticks, emitted, 
                                     inflight, deliveries, nextId, approvalsDB, 
                                     watermark, environments, deployedAt, 
-                                    revalFails, daemon, crashes, faults, 
-                                    ghesFaults, prunes, maxTs, 
+                                    parkedAt, revalFails, daemon, crashes, 
+                                    faults, ghesFaults, prunes, maxTs, 
                                     prunedDeliveries >>
 
 AuthorizeDeploy(self) == /\ pc[self] = "AuthorizeDeploy"
@@ -1292,7 +1315,7 @@ AuthorizeDeploy(self) == /\ pc[self] = "AuthorizeDeploy"
                                THEN /\ job' = [job EXCEPT ![self] = 0]
                                     /\ pc' = [pc EXCEPT ![self] = "AcquireJob"]
                                     /\ UNCHANGED << db_jobs, environments, 
-                                                    ghesFaults >>
+                                                    parkedAt, ghesFaults >>
                                ELSE /\ LET e == db_jobs[job[self]].env_id IN
                                          LET c == db_jobs[job[self]].commit IN
                                            \/ /\ ghesFaults < MaxGhesFaults
@@ -1304,17 +1327,19 @@ AuthorizeDeploy(self) == /\ pc[self] = "AuthorizeDeploy"
                                               /\ db_jobs' = [db_jobs EXCEPT ![job[self]].status = "QUEUED"]
                                               /\ job' = [job EXCEPT ![self] = 0]
                                               /\ pc' = [pc EXCEPT ![self] = "AcquireJob"]
+                                              /\ UNCHANGED parkedAt
                                            \/ /\ Trusted(e)
                                               /\ db_jobs' = [db_jobs EXCEPT ![job[self]] = [db_jobs[job[self]] EXCEPT !.authz = "trusted", !.authzEpoch = crashes]]
                                               /\ pc' = [pc EXCEPT ![self] = "ExecuteDeploy"]
-                                              /\ UNCHANGED <<environments, ghesFaults, job>>
+                                              /\ UNCHANGED <<environments, parkedAt, ghesFaults, job>>
                                            \/ /\ ~Trusted(e) /\ ApprovedNow(e, c)
                                               /\ db_jobs' = [db_jobs EXCEPT ![job[self]] = [db_jobs[job[self]] EXCEPT !.authz = "approved", !.authzEpoch = crashes]]
                                               /\ pc' = [pc EXCEPT ![self] = "ExecuteDeploy"]
-                                              /\ UNCHANGED <<environments, ghesFaults, job>>
+                                              /\ UNCHANGED <<environments, parkedAt, ghesFaults, job>>
                                            \/ /\ ~Trusted(e) /\ ~ApprovedNow(e, c)
                                               /\ environments' = [environments EXCEPT ![e] = Destroyed(environments[e])]
                                               /\ db_jobs' = [db_jobs EXCEPT ![job[self]].status = "PENDING_APPROVAL"]
+                                              /\ parkedAt' = [parkedAt EXCEPT ![e] = IF TTL > 0 THEN clock ELSE 0]
                                               /\ job' = [job EXCEPT ![self] = 0]
                                               /\ pc' = [pc EXCEPT ![self] = "AcquireJob"]
                                               /\ UNCHANGED ghesFaults
@@ -1349,8 +1374,8 @@ ExecuteDeploy(self) == /\ pc[self] = "ExecuteDeploy"
                                        ghActions, permLosses, ticks, emitted, 
                                        inflight, deliveries, nextId, 
                                        approvalsDB, watermark, deployedAt, 
-                                       revalFails, daemon, crashes, faults, 
-                                       ghesFaults, prunes, maxTs, 
+                                       parkedAt, revalFails, daemon, crashes, 
+                                       faults, ghesFaults, prunes, maxTs, 
                                        prunedDeliveries, epoch >>
 
 StartContainer(self) == /\ pc[self] = "StartContainer"
@@ -1370,8 +1395,8 @@ StartContainer(self) == /\ pc[self] = "StartContainer"
                                         clock, ghActions, permLosses, ticks, 
                                         emitted, inflight, deliveries, nextId, 
                                         approvalsDB, watermark, deployedAt, 
-                                        revalFails, daemon, crashes, faults, 
-                                        ghesFaults, prunes, maxTs, 
+                                        parkedAt, revalFails, daemon, crashes, 
+                                        faults, ghesFaults, prunes, maxTs, 
                                         prunedDeliveries, epoch >>
 
 PublishRoute(self) == /\ pc[self] = "PublishRoute"
@@ -1391,8 +1416,8 @@ PublishRoute(self) == /\ pc[self] = "PublishRoute"
                                       ghActions, permLosses, ticks, emitted, 
                                       inflight, deliveries, nextId, 
                                       approvalsDB, watermark, deployedAt, 
-                                      revalFails, daemon, crashes, faults, 
-                                      ghesFaults, prunes, maxTs, 
+                                      parkedAt, revalFails, daemon, crashes, 
+                                      faults, ghesFaults, prunes, maxTs, 
                                       prunedDeliveries, epoch >>
 
 CommitDeploy(self) == /\ pc[self] = "CommitDeploy"
@@ -1408,8 +1433,8 @@ CommitDeploy(self) == /\ pc[self] = "CommitDeploy"
                                       ghActions, permLosses, ticks, emitted, 
                                       inflight, deliveries, nextId, 
                                       approvalsDB, watermark, environments, 
-                                      revalFails, daemon, crashes, faults, 
-                                      ghesFaults, prunes, maxTs, 
+                                      parkedAt, revalFails, daemon, crashes, 
+                                      faults, ghesFaults, prunes, maxTs, 
                                       prunedDeliveries, epoch >>
 
 ExecuteTeardown(self) == /\ pc[self] = "ExecuteTeardown"
@@ -1432,7 +1457,7 @@ ExecuteTeardown(self) == /\ pc[self] = "ExecuteTeardown"
                                          clock, ghActions, permLosses, ticks, 
                                          emitted, inflight, deliveries, nextId, 
                                          approvalsDB, watermark, deployedAt, 
-                                         revalFails, daemon, crashes, 
+                                         parkedAt, revalFails, daemon, crashes, 
                                          ghesFaults, prunes, maxTs, 
                                          prunedDeliveries, epoch >>
 
@@ -1448,9 +1473,9 @@ CommitTeardown(self) == /\ pc[self] = "CommitTeardown"
                                         clock, ghActions, permLosses, ticks, 
                                         emitted, inflight, deliveries, nextId, 
                                         approvalsDB, watermark, environments, 
-                                        deployedAt, revalFails, daemon, 
-                                        crashes, faults, ghesFaults, prunes, 
-                                        maxTs, prunedDeliveries, epoch >>
+                                        deployedAt, parkedAt, revalFails, 
+                                        daemon, crashes, faults, ghesFaults, 
+                                        prunes, maxTs, prunedDeliveries, epoch >>
 
 Worker(self) == AcquireJob(self) \/ AuthorizeDeploy(self)
                    \/ ExecuteDeploy(self) \/ StartContainer(self)
@@ -1489,7 +1514,7 @@ Revalidate == /\ pc["revalidator"] = "Revalidate"
               /\ UNCHANGED << head, open, approvedGH, openerOK, clock, 
                               ghActions, permLosses, ticks, emitted, inflight, 
                               deliveries, watermark, environments, deployedAt, 
-                              daemon, crashes, faults, prunes, 
+                              parkedAt, daemon, crashes, faults, prunes, 
                               prunedDeliveries, job, epoch >>
 
 Revalidator == Revalidate
@@ -1497,15 +1522,15 @@ Revalidator == Revalidate
 Expire == /\ pc["expirer"] = "Expire"
           /\ daemon = "up"
           /\ \E e \in {x \in EnvIDs : Expirable(x)}:
-               /\ db_jobs' = db_jobs @@ (nextId :> NewJob("teardown", e, MaxSeq(e) + 1, (environments[e].commit), "ttl"))
+               /\ db_jobs' = db_jobs @@ (nextId :> NewJob("teardown", e, MaxSeq(e) + 1, (IF ExpirableParked(e) THEN db_jobs[Latest(e)].commit ELSE environments[e].commit), "ttl"))
                /\ nextId' = nextId + 1
                /\ maxTs' = [maxTs EXCEPT ![e] = MaxSeq(e) + 1]
           /\ pc' = [pc EXCEPT !["expirer"] = "Expire"]
           /\ UNCHANGED << head, open, approvedGH, openerOK, clock, ghActions, 
                           permLosses, ticks, emitted, inflight, deliveries, 
                           approvalsDB, watermark, environments, deployedAt, 
-                          revalFails, daemon, crashes, faults, ghesFaults, 
-                          prunes, prunedDeliveries, job, epoch >>
+                          parkedAt, revalFails, daemon, crashes, faults, 
+                          ghesFaults, prunes, prunedDeliveries, job, epoch >>
 
 Expirer == Expire
 
@@ -1527,9 +1552,9 @@ Prune == /\ pc["pruner"] = "Prune"
                                     prunedDeliveries >>
          /\ UNCHANGED << head, open, approvedGH, openerOK, clock, ghActions, 
                          permLosses, ticks, emitted, inflight, nextId, 
-                         approvalsDB, environments, deployedAt, revalFails, 
-                         daemon, crashes, faults, ghesFaults, maxTs, job, 
-                         epoch >>
+                         approvalsDB, environments, deployedAt, parkedAt, 
+                         revalFails, daemon, crashes, faults, ghesFaults, 
+                         maxTs, job, epoch >>
 
 Pruner == Prune
 
@@ -1545,9 +1570,9 @@ StartupSweep == /\ pc["supervisor"] = "StartupSweep"
                 /\ UNCHANGED << head, open, approvedGH, openerOK, clock, 
                                 ghActions, permLosses, ticks, emitted, 
                                 inflight, deliveries, nextId, approvalsDB, 
-                                watermark, deployedAt, crashes, faults, 
-                                ghesFaults, prunes, maxTs, prunedDeliveries, 
-                                job, epoch >>
+                                watermark, deployedAt, parkedAt, crashes, 
+                                faults, ghesFaults, prunes, maxTs, 
+                                prunedDeliveries, job, epoch >>
 
 Supervisor == StartupSweep
 
@@ -1566,7 +1591,7 @@ SimulateCrash == /\ pc["chaos"] = "SimulateCrash"
                  /\ UNCHANGED << head, open, approvedGH, openerOK, clock, 
                                  ghActions, permLosses, ticks, emitted, 
                                  inflight, deliveries, db_jobs, nextId, 
-                                 approvalsDB, watermark, deployedAt, 
+                                 approvalsDB, watermark, deployedAt, parkedAt, 
                                  revalFails, faults, ghesFaults, prunes, maxTs, 
                                  prunedDeliveries, job, epoch >>
 
@@ -1684,6 +1709,14 @@ LivenessExpired ==
         (TTL > 0 /\ Intact(e) /\ BuilderSucceeded(e) /\ BuilderIsLatest(e)
                  /\ clock - deployedAt[e] >= TTL)
             ~> (~Exists(e) \/ ~BuilderIsLatest(e))
+
+\* G leftover: an intent parked for at least the TTL leaves through the
+\* queue (approved meanwhile, superseded, or torn down by the Expirer).
+LivenessParkedExpired ==
+    \A e \in EnvIDs :
+        (TTL > 0 /\ JobsOf(e) # {} /\ db_jobs[Latest(e)].status = "PENDING_APPROVAL"
+                 /\ clock - parkedAt[e] >= TTL)
+            ~> (JobsOf(e) = {} \/ db_jobs[Latest(e)].status # "PENDING_APPROVAL")
 
 \* V1: the open head GitHub allows (trusted, or approved and recorded)
 \* eventually runs, unless it changed or previewd gave up by design.

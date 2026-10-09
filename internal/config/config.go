@@ -123,7 +123,6 @@ const (
 	minPruneBatch             = 10
 	maxPruneBatch             = 10000
 	defaultEnvTTL             = 168 * time.Hour
-	minEnvTTL                 = time.Hour
 	maxEnvTTL                 = 10 * 8760 * time.Hour
 	defaultMinFreeDiskMiB     = 10240
 	minMinFreeDiskMiB         = 1024
@@ -294,7 +293,7 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	pruneInterval, err := boundedDuration("PREVIEWD_PRUNE_INTERVAL", defaultPruneInterval, time.Minute, maxPruneInterval)
+	pruneInterval, err := boundedDuration("PREVIEWD_PRUNE_INTERVAL", defaultPruneInterval, minPruneInterval, maxPruneInterval)
 	if err != nil {
 		return nil, err
 	}

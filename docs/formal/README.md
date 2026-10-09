@@ -26,6 +26,7 @@ The daemon implements the MVP part: `internal/store/jobs.go` (queue transitions)
 | `previewd-mixed.cfg` | Trusted and untrusted environments, 2 workers, opener loses write access (D-V1-5). |
 | `previewd-prune.cfg` | Pruning behind the watermark, pruned deliveries. |
 | `previewd-ttl.cfg` | Expiry through the queue. |
+| `previewd-ttl-parked.cfg` | Expiry of a parked intent: an untrusted environment with a TTL (V1-model.md section 14). |
 | `previewd-grace.cfg` | GHES unavailable below the grace limit (`Grace = 2`): recovery resets the count, two consecutive failures tear down. |
 
 ## Running TLC offline
@@ -43,7 +44,7 @@ java -cp tla2tools.jar pcal.trans -nocfg previewd.tla
 # complete state graph: same verdict, several times faster. TLC writes states/
 # and, on a violation, *_TTrace_* files: all git-ignored.
 for c in previewd previewd-workers previewd-approval previewd-reapproval \
-         previewd-approval-reboot previewd-mixed previewd-prune previewd-ttl previewd-grace; do
+         previewd-approval-reboot previewd-mixed previewd-prune previewd-ttl previewd-ttl-parked previewd-grace; do
   java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers auto -lncheck final -config "$c.cfg" previewd.tla
 done
 # A2 regression (safety only; the module extends previewd).
@@ -52,7 +53,7 @@ for c in previewd_a2 previewd_a2-trust; do
 done
 ```
 
-One TLC at a time on a host with less than 16 GB: on a 7 GB host, four parallel runs with 5 GB heaps were killed (exit 137).
+One TLC at a time on a host with less than 16 GB: on a 7 GB host, four parallel runs with 5 GB heaps were killed (exit 137). Since `LivenessParkedExpired`, `previewd.cfg` and `previewd-mixed.cfg` need `-Xmx4608m` there (results below).
 
 ## Checked properties
 
@@ -87,6 +88,7 @@ Every configuration checks every property. The initial state lets each environme
 | `LivenessEventualConsistency` | liveness | `<>[]`: each environment runs the latest job's commit iff that job is a `SUCCESS` deploy GitHub still allows, absent otherwise |
 | `LivenessRevokedTornDown` | liveness | Access lost in GitHub (revoked approval, approver or opener without write access) eventually removes the environment |
 | `LivenessExpired` | liveness | An expired environment leaves through the queue |
+| `LivenessParkedExpired` | liveness | An intent parked for the TTL leaves through the queue (V1-model.md section 14) |
 | `LivenessHeadDeployed` | liveness | The open head GitHub allows eventually runs, unless it changed or previewd gave up by design (fail-closed or expiry teardown, failed deploy of that commit) |
 
 ## Results (V1 model)
@@ -110,6 +112,25 @@ After A2-6 (V1-model.md section 11), all on one 16-thread, 7 GB host, one TLC at
 | `previewd_a2-trust.cfg` (safety) | 3,156,312 | 41 | 2 min 19 s | no error |
 
 The host also ran the Go store tests during this sweep, so the times are inflated: on an idle host after A2, `previewd-mixed` took 11 min 26 s and `previewd` 7 min 42 s, within the 15-minute budget; the state counts, not the times, are the comparison. A2-6 adds states only where a GHES fault meets a running approved version: `previewd-approval` (211,448 → 212,752) and `previewd-grace` (125,236 → 125,796). Every other configuration, the two MVP regressions and the two A2 regressions (no GHES fault) have exactly their A2 counts. F2-1 (2026-10-09, V1-model.md section 13) keeps every job newer than a host builder from pruning: `previewd-prune` (203,029 → 201,580, re-run alone, the only configuration that prunes) lost the states where such a job was pruned.
+
+After the parked-intent expiry (V1-model.md section 14, 2026-10-10), same host, one TLC at a time, with `LivenessParkedExpired` in every configuration:
+
+| Config | Distinct states | Depth | Time | Result |
+|---|---|---|---|---|
+| `previewd.cfg` | 686,226 | 37 | 9 min 58 s (`-Xmx4608m`) | no error |
+| `previewd-workers.cfg` | 48,386 | 32 | 37 s | no error |
+| `previewd-approval.cfg` | 212,752 | 37 | 2 min 39 s | no error |
+| `previewd-reapproval.cfg` | 189,904 | 36 | 2 min 53 s | no error |
+| `previewd-approval-reboot.cfg` | 194,928 | 40 | 2 min 02 s | no error |
+| `previewd-mixed.cfg` | 481,280 | 33 | 11 min 03 s (`-Xmx4608m`) | no error |
+| `previewd-prune.cfg` | 201,580 | 32 | 1 min 53 s | no error |
+| `previewd-ttl.cfg` | 9,144 | 30 | 8 s | no error |
+| `previewd-ttl-parked.cfg` (new) | 11,736 | 30 | 10 s | no error |
+| `previewd-grace.cfg` | 125,796 | 38 | 1 min 34 s | no error |
+| `previewd_a2.cfg` (safety) | 17,241,260 | 44 | 11 min 20 s | no error |
+| `previewd_a2-trust.cfg` (safety) | 3,156,312 | 41 | 1 min 52 s | no error |
+
+`parkedAt` is written only when `TTL > 0` (it is read nowhere else), so every configuration without a TTL keeps exactly its previous count; a first translation that always recorded the clock grew `previewd-approval` to 309,192 states and `previewd-mixed` to 624,448. The added liveness property costs memory, not states: `previewd` and `previewd-mixed` ran out of heap in the liveness check at the default heap (a quarter of 7 GB) and pass with `-Xmx4608m`. Run them alone with that flag on a 7 GB host. Mutant V1-M23 (the `ExpirableParked` disjunct removed) violates `LivenessParkedExpired` in `previewd-ttl-parked` (7,064 states, depth 30).
 
 After A2 (the rules of V1-model.md section 11, before A2-6), on an idle host: previewd 686,226 states (7 min 42 s), workers 48,386, approval 211,448, reapproval 189,904, approval-reboot 194,928, mixed 481,280 (11 min 26 s), prune 203,029, ttl 9,144, grace 125,236, previewd_a2 17,241,260 (11 min 32 s), previewd_a2-trust 3,156,312, all with no error.
 
@@ -149,6 +170,7 @@ Each mutant changes one rule of the translated model and must be rejected. TLC s
 | V1-M15b prune deletes the latest job and skips the watermark | prune | `SafetyPruneKeepsVerdicts` |
 | V1-M16 prune deletes any delivery | prune | survives, equivalent (A1-9): every recorded delivery is at or below `MaxSeq` by construction |
 | V1-M17 expiry not fair | ttl | `LivenessExpired` |
+| V1-M23 `Expire` ignores a parked intent | ttl-parked | `LivenessParkedExpired` (run on the section 14 translation) |
 | V1-M18 untrusted environments not locked | mixed | `SafetyMonotonicity`; ✓² `SafetyOneJobPerEnv` |
 | V1-M19 only untrusted environments re-validated (before D-V1-5) | mixed | `LivenessRevokedTornDown` (with `LivenessEventualConsistency`) |
 | V1-M22 GHES unavailable in `AuthorizeDeploy` leaves a revoked version running (before A2-6) | approval | `SafetyUnavailableRemovesRevoked` (depth 16, 66,441 states, 56 s; run on the A2-6 translation) |

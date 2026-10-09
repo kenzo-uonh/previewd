@@ -8,7 +8,8 @@ package vcs
 // its use, none is stored, logged, or put in a URL.
 //
 // REST over net/http only (no SDK), HTTPS only, the site CA when one is
-// configured, no proxy from the environment, no redirect, every reply
+// configured, no proxy from the environment, no redirect (but the archive
+// redirect of a source fetch, checked by hand: tarball.go), every reply
 // bounded and every call timed out. A reply that cannot be read completely
 // and consistently is an error, never a default.
 
@@ -133,6 +134,7 @@ type Client struct {
 	appID  int64
 	key    *rsa.PrivateKey
 	http   *http.Client
+	dl     *http.Client
 	logger *slog.Logger
 	now    func() time.Time
 }
@@ -160,23 +162,24 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	transport := &http.Transport{
+		Proxy:               nil, // never HTTP(S)_PROXY from the environment
+		DialContext:         (&net.Dialer{Timeout: callTimeout}).DialContext,
+		TLSClientConfig:     tlsCfg,
+		TLSHandshakeTimeout: callTimeout,
+		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        4,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	noRedirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &Client{
 		api:   base + apiPrefix,
 		appID: cfg.AppID,
 		key:   key,
-		http: &http.Client{
-			Timeout: callTimeout,
-			Transport: &http.Transport{
-				Proxy:               nil, // never HTTP(S)_PROXY from the environment
-				DialContext:         (&net.Dialer{Timeout: callTimeout}).DialContext,
-				TLSClientConfig:     tlsCfg,
-				TLSHandshakeTimeout: callTimeout,
-				ForceAttemptHTTP2:   true,
-				MaxIdleConns:        4,
-				IdleConnTimeout:     90 * time.Second,
-			},
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		},
+		http:  &http.Client{Timeout: callTimeout, Transport: transport, CheckRedirect: noRedirect},
+		// Archive downloads (H2) last longer than one call: bounded by the
+		// fetch's context instead, still without proxy or redirect.
+		dl:     &http.Client{Transport: transport, CheckRedirect: noRedirect},
 		logger: logger,
 		now:    time.Now,
 	}, nil

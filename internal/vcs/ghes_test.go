@@ -68,6 +68,8 @@ type fakeGHES struct {
 	revokeCode  int
 	prCode      int
 	prRedirect  bool // answer the PR read with a redirect to a valid document
+	// archive serves the tarball API and the archive host (H2), when set.
+	archive *fakeArchive
 }
 
 func newFakeGHES(t *testing.T) *fakeGHES {
@@ -142,6 +144,23 @@ func newFakeGHES(t *testing.T) *fakeGHES {
 				"state": "APPROVED", "commit_id": testHead, "submitted_at": "2026-10-08T12:00:00Z"}
 		}
 		writeJSON(w, http.StatusOK, reviews)
+	})
+	mux.HandleFunc("GET /api/v3/repos/acme/app/tarball/{sha}", func(w http.ResponseWriter, r *http.Request) {
+		if f.archive == nil {
+			t.Errorf("unexpected tarball call %s", r.URL.Path)
+			return
+		}
+		f.serveTarball(w, r)
+	})
+	mux.HandleFunc("GET /_codeload/", func(w http.ResponseWriter, r *http.Request) {
+		if f.archive == nil {
+			t.Errorf("unexpected archive download %s", r.URL.Path)
+			return
+		}
+		f.serveCodeload(w, r)
+	})
+	mux.HandleFunc("GET /_redirect", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/_codeload/acme/app/legacy.tar.gz/x?token="+r.URL.Query().Get("token"), http.StatusFound)
 	})
 	f.srv = httptest.NewTLSServer(mux)
 	t.Cleanup(f.srv.Close)

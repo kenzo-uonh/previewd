@@ -62,15 +62,17 @@ jobs:
 
       - name: Rule self-test (each rule must fire on its fixture)
         run: |
-          docker run --rm --network none -v "${PWD}:/src:ro" -w /src "${SEMGREP_IMAGE}" \
-            semgrep --test --metrics=off --disable-version-check \
-            --config .semgrep/previewd-rules.yaml .semgrep/previewd-rules.go
+          for rules in previewd-rules previewd-no-container-output; do
+            docker run --rm --network none -v "${PWD}:/src:ro" -w /src "${SEMGREP_IMAGE}" \
+              semgrep --test --metrics=off --disable-version-check \
+              --config ".semgrep/${rules}.yaml" ".semgrep/${rules}.go"
+          done
 
       - name: Scan
         run: |
           docker run --rm --network none -v "${PWD}:/src:ro" -w /src "${SEMGREP_IMAGE}" \
-            semgrep scan --metrics=off --disable-version-check --error \
-            --config .semgrep/previewd-rules.yaml .
+            semgrep scan --metrics=off --disable-version-check --error --strict --timeout 0 \
+            --config .semgrep/previewd-rules.yaml --config .semgrep/previewd-no-container-output.yaml .
 
   codeql:
     runs-on: ubuntu-24.04

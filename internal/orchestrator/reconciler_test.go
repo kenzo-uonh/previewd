@@ -83,10 +83,7 @@ func (h *hostEngine) set(env string, f func(*EngineState)) {
 }
 
 func (h *hostEngine) Ping(context.Context) error { return nil }
-func (h *hostEngine) Logs(context.Context, string) (io.ReadCloser, error) {
-	return nil, errors.New("no logs")
-}
-func (h *hostEngine) Close() error { return nil }
+func (h *hostEngine) Close() error               { return nil }
 
 // Build records the Dockerfile of the context it is streamed: the tar the
 // preflight validated, never a host path.
@@ -374,9 +371,12 @@ func (r *rig) reconciler() *Reconciler {
 		RevalidateInterval: r.interval, RevalidateGrace: r.grace, AuthorizeMaxAttempts: r.maxAttempts,
 		MaxConcurrentBuilds: r.maxBuilds, BuildTimeout: r.buildTimeout, PruneInterval: r.pruneInterval, PruneBatch: 2,
 		MinFreeDiskBytes: r.minFreeDisk, EnvTTL: r.envTTL, DisableTTL: r.disableTTL, BuildDir: r.buildDir,
-		Fetch: func(_ context.Context, _, _, dest string) error {
+		Fetch: func(_ context.Context, repo, _, _, dest string) error {
 			if r.fetchErr != nil {
 				return r.fetchErr
+			}
+			if repo != "acme/app" {
+				return fmt.Errorf("fetch of repository %q, want the job's acme/app", repo)
 			}
 			return writeCheckout(dest, cmp.Or(r.dockerfile, testDockerfile))
 		},
@@ -699,7 +699,7 @@ func TestNewReconcilerRequiresThePreflight(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			cfg := ReconcilerConfig{
 				Queue: r.queue, Engine: r.engine, Routes: r.routes, Stager: r.stager, Secrets: sectionSecrets{},
-				Authorizer: r.auth, Fetch: func(context.Context, string, string, string) error { return nil },
+				Authorizer: r.auth, Fetch: func(context.Context, string, string, string, string) error { return nil },
 				Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Domain: "local.previewd", AppPort: 8080,
 				AllowedBaseImages: testBases, MaxBuildContextBytes: 1 << 20,
 			}

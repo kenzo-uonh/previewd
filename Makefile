@@ -1,4 +1,4 @@
-.PHONY: all build run dev clean fmt vet lint test sec deps deps-check vendor-check check verify airgap-check fmt-check repomix vuln docker-up docker-down help e2e verify-buildkit airgap-scan store-fixture-v2
+.PHONY: all build run dev clean fmt vet lint test sec deps deps-check vendor-check check verify airgap-check fmt-check repomix vuln docker-up docker-down help e2e verify-buildkit airgap-scan store-fixture-v2 semgrep
 
 APP_NAME    := previewd
 BIN_DIR     := bin
@@ -91,6 +91,21 @@ airgap-scan: ## Static air-gap scan of source, deployments and specs (fails on L
 airgap-check: ## Fail if the binary links telemetry SDKs/exporters, gRPC, cloud SDKs or docker/docker
 	@chmod +x scripts/airgap-check.sh
 	@./scripts/airgap-check.sh
+
+# The CI's pinned Semgrep image, run offline (--network none); it must be
+# loaded on the host (docker load), never pulled by this target. The scan
+# fails closed: no per-rule timeout (a rule that timed out on a file did not
+# scan it) and --strict (any warning fails).
+SEMGREP_IMAGE ?= semgrep/semgrep:1.179.0@sha256:93963d9295a366f59e4850127b1550400ee7b388f04fe144e4a1f6325d96e01b
+SEMGREP_RULES := previewd-rules previewd-no-container-output
+
+semgrep: ## Semgrep rule self-tests, then the scan, in the pinned image without network (as CI)
+	@for r in $(SEMGREP_RULES); do \
+		docker run --rm --pull never --network none -v "$(CURDIR):/src:ro" -w /src "$(SEMGREP_IMAGE)" \
+			semgrep --test --metrics=off --disable-version-check --config ".semgrep/$$r.yaml" ".semgrep/$$r.go" || exit 1; \
+	done
+	@docker run --rm --pull never --network none -v "$(CURDIR):/src:ro" -w /src "$(SEMGREP_IMAGE)" \
+		semgrep scan --metrics=off --disable-version-check --error --strict --timeout 0 $(foreach r,$(SEMGREP_RULES),--config .semgrep/$(r).yaml) .
 
 sec: ## Run gosec AST security scanner
 	@echo "Running AST security scanner..."

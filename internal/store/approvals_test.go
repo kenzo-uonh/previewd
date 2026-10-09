@@ -492,26 +492,66 @@ func TestPruneRefusesInvalidRequest(t *testing.T) {
 	}
 }
 
-// Expired lists environments whose latest job is a SUCCESS deploy older
-// than the TTL; a newer intent hides it.
+// Expired lists the latest job of every environment past its TTL: a
+// SUCCESS deploy finished, or a deploy parked in PENDING_APPROVAL created,
+// at least the TTL ago. A newer intent hides it; a failed deploy runs
+// nothing and never expires.
 func TestExpired(t *testing.T) {
 	s, _ := sweptStore(t)
 	ctx := context.Background()
+	const envC, envD = "pr-3-0c0c0c0c0c", "pr-4-0d0d0d0d0d"
 	enqueue(t, s, "d1", envA, JobDeploy, 1)
 	finish(t, s, acquire(t, s), StatusSuccess)
 	enqueue(t, s, "d2", envB, JobDeploy, 1)
 	finish(t, s, acquire(t, s), StatusSuccess)
 	enqueue(t, s, "d3", envB, JobTeardown, 2)
+	finish(t, s, acquire(t, s), StatusSuccess)
+	_, parked := enqueue(t, s, "d4", envC, JobDeploy, 1)
+	if err := s.Park(ctx, acquire(t, s)); err != nil {
+		t.Fatal(err)
+	}
+	enqueue(t, s, "d5", envD, JobDeploy, 1)
+	finish(t, s, acquire(t, s), StatusFailed)
 	for _, tc := range []struct {
 		at   time.Time
 		want []string
 	}{
 		{t0.Add(59 * time.Minute), nil},
-		{t0.Add(time.Hour), []string{envA}},
+		{t0.Add(time.Hour), []string{envA, envC}},
 	} {
 		got, err := s.Expired(ctx, time.Hour, tc.at)
-		if err != nil || !slices.Equal(got, tc.want) {
-			t.Fatalf("Expired at %s = %v, %v; want %v", tc.at, got, err, tc.want)
+		var envs []string
+		for _, j := range got {
+			envs = append(envs, j.EnvID)
+		}
+		if err != nil || !slices.Equal(envs, tc.want) {
+			t.Fatalf("Expired at %s = %v, %v; want %v", tc.at, envs, err, tc.want)
+		}
+		if len(got) == 2 && (got[1].ID != parked || got[1].Status != StatusPendingApproval || got[1].Source != testSource) {
+			t.Fatalf("expired parked job = %+v, want job %d as recorded", got[1], parked)
+		}
+	}
+
+	// The TTL teardown of the parked environment supersedes the parked job.
+	ev := testAuditEvent(AuditTTLExpired, "ttl")
+	ev.EnvID = envC
+	if _, err := s.EnqueueInternal(ctx, envC, OriginTTL, "", t0.Add(time.Hour), ev); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.Expired(ctx, time.Hour, t0.Add(time.Hour)); err != nil || len(got) != 1 || got[0].EnvID != envA {
+		t.Fatalf("Expired after the TTL teardown = %+v, %v; want %s only", got, err, envA)
+	}
+	l := acquire(t, s)
+	if l.EnvID != envC || l.Type != JobTeardown {
+		t.Fatalf("acquired %+v, want the TTL teardown of %s", l, envC)
+	}
+	jobs, err := s.Jobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, j := range jobs {
+		if j.ID == parked && j.Status != StatusSkipped {
+			t.Fatalf("parked job %+v after the TTL teardown was leased, want SKIPPED", j)
 		}
 	}
 	if _, err := s.Expired(ctx, 0, t0); err == nil {

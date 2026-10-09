@@ -10,8 +10,10 @@
 //	    listener.pem, listener-key.pem (previewd's webhook listener) and
 //	    app-key.pem (the GitHub App's private key), for 127.0.0.1 and
 //	    localhost, valid one day.
-//	fakegithub serve -dir DIR -listen 127.0.0.1:18443 -app-id N -installation M
-//	    serves the API and the /_fake control endpoints.
+//	fakegithub serve -dir DIR -listen 127.0.0.1:18443 -app-id N -installation M [-git-repo owner/repo=PATH]
+//	    serves the API and the /_fake control endpoints; with -git-repo, the
+//	    tarball API of that repository from the bare repository at PATH
+//	    (git archive), through a one-time archive URL as GHES redirects to.
 package main
 
 import (
@@ -33,6 +35,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -127,6 +130,7 @@ func serve(args []string, logger *slog.Logger) error {
 	listen := fs.String("listen", "127.0.0.1:18443", "listen address (loopback only)")
 	appID := fs.Int64("app-id", 0, "GitHub App ID")
 	installation := fs.Int64("installation", 0, "the App's installation ID on every repository")
+	gitRepo := fs.String("git-repo", "", "owner/repo=PATH: the bare repository the tarball API archives")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -154,6 +158,13 @@ func serve(args []string, logger *slog.Logger) error {
 		return err
 	}
 	g := newGHES(*appID, *installation, &key.PublicKey, logger)
+	if *gitRepo != "" {
+		name, dir, ok := strings.Cut(*gitRepo, "=")
+		if !ok || !strings.Contains(name, "/") || !filepath.IsAbs(dir) {
+			return fmt.Errorf("-git-repo %q: want owner/repo=/absolute/path", *gitRepo)
+		}
+		g.gitDirs[name] = dir
+	}
 	srv := &http.Server{Addr: *listen, Handler: g.routes(), ReadHeaderTimeout: 5 * time.Second,
 		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}}}
 	stop := make(chan os.Signal, 1)

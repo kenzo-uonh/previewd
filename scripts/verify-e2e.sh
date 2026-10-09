@@ -182,9 +182,14 @@ PKI_DIR="$MOCK_DIR/pki"
 mkdir -p "$PKI_DIR"
 go build -tags e2e -o "$MOCK_DIR/fakegithub" ./test/e2e/fakegithub
 "$MOCK_DIR/fakegithub" init -dir "$PKI_DIR"
-"$MOCK_DIR/fakegithub" serve -dir "$PKI_DIR" -listen "$GHES_ADDR" -app-id "$E2E_APP_ID" -installation 77 \
-  >>"$MOCK_DIR/fakegithub.log" 2>&1 &
-FAKE_PID=$!
+# start_fake: the fake GHES, serving e2e/mock's tarballs from the bare
+# repository (H2: previewd fetches sources as GHES tarballs, never with git).
+start_fake() {
+  "$MOCK_DIR/fakegithub" serve -dir "$PKI_DIR" -listen "$GHES_ADDR" -app-id "$E2E_APP_ID" -installation 77 \
+    -git-repo "e2e/mock=$MOCK_DIR/mock.git" >>"$MOCK_DIR/fakegithub.log" 2>&1 &
+  FAKE_PID=$!
+}
+start_fake
 # fake_put PATH JSON: set the fake's GitHub truth.
 fake_put() { curl -sf --cacert "$PKI_DIR/ca.pem" -X PUT -H 'Content-Type: application/json' -d "$2" "$GHES_URL/_fake/$1"; }
 fake_ledger() { curl -sf --cacert "$PKI_DIR/ca.pem" "$GHES_URL/_fake/ledger"; }
@@ -224,6 +229,8 @@ chmod 0600 "$MOCK_DIR/secrets.env"
 
 # start_agent: run the daemon in the background on the E2E state (database,
 # routes, staging), and wait until it serves (the startup sweep runs first).
+# AGENT_BIN (default ./bin/previewd, the release build) and AGENT_EXTRA_ENV
+# (NAME=value words) change what runs: the short-TTL scenario (6) only.
 start_agent() {
   # Unlocked memory is accepted here (logged as an error): mlockall needs
   # LimitMEMLOCK=infinity, which the dev shell does not have.
@@ -247,7 +254,7 @@ start_agent() {
     PREVIEWD_APPROVAL_REVALIDATE_INTERVAL=1m \
     PREVIEWD_APPROVAL_REVALIDATE_GRACE=1m \
     CREDENTIALS_DIRECTORY="$CREDS_DIR" \
-    ./bin/previewd >>"$MOCK_DIR/agent.log" 2>&1 &
+    env ${AGENT_EXTRA_ENV:-} "${AGENT_BIN:-./bin/previewd}" >>"$MOCK_DIR/agent.log" 2>&1 &
   AGENT_PID=$!
   wait_for 60 "the agent to serve" agent_curl -sf "$AGENT_URL/healthz"
 }
@@ -442,8 +449,14 @@ revoked=$(printf '%s' "$ledger" | sed -n 's/.*"revoked":\([0-9]*\).*/\1/p')
 [ "$minted" -ge 3 ] && [ "$minted" = "$revoked" ] || fail "tokens minted $minted, revoked $revoked: $ledger"
 case "$ledger" in *'"live":0'*) ;; *) fail "a token is still live: $ledger" ;; esac
 case "$ledger" in *'"misuse":null'*) ;; *) fail "a token was misused: $ledger" ;; esac
-case "$ledger" in *'contents'*|*':write'*) fail "a token carried more than read on pull requests: $ledger" ;; esac
-echo "    ok: trusted and untrusted judged from GHES; $minted tokens, each scoped to e2e/mock, read-only, revoked"
+case "$ledger" in *':write'*) fail "a token carried a write permission: $ledger" ;; esac
+# ledger_field NAME: one number of the ledger's scopes or reads.
+ledger_field() { printf '%s' "$ledger" | python3 -I -c 'import json,sys; d=json.load(sys.stdin); print({**d["scopes"], **d["reads"]}.get(sys.argv[1], 0))' "$1"; }
+[ "$(ledger_field archive)" -ge 1 ] && [ "$(ledger_field archive)" = "$(ledger_field tarball)" ] \
+  || fail "sources not fetched as GHES tarballs, each archive URL used once (tarball $(ledger_field tarball), archive $(ledger_field archive)): $ledger"
+[ "$(ledger_field contents:read)" = "$(ledger_field tarball)" ] || fail "a contents token served anything but one tarball: $ledger"
+grep -q '"msg":"Source fetch armed".*"ghes_tarball":true' "$MOCK_DIR/agent.log" || fail "the daemon did not arm the GHES tarball fetch"
+echo "    ok: trusted and untrusted judged from GHES; $minted tokens, each scoped to e2e/mock, read-only, revoked; sources as $(ledger_field tarball) GHES tarballs (contents:read)"
 
 echo "==> 2h. Build isolation (E2b, E3): startup probe, exfiltration attempts reach nothing, RUN --network=host refused..."
 # E2b: the daemon refused to serve unless its startup build probe passed.
@@ -525,6 +538,16 @@ if docker image inspect "$NETHOST_ENV:latest" >/dev/null 2>&1; then fail "an ima
 echo "    ok: RUN --network=host refused by the preflight before any build request; no image"
 kill -SIGTERM "$EXFIL_PID" 2>/dev/null || true
 EXFIL_PID=""
+
+echo "==> 2i. Auto-cleanup (G1, G2): the engine's prune and free-disk calls on the real API, then the daemon's use of them..."
+go test -tags e2e -count=1 -run '^TestDockerCleanupAgainstTheEngine$' ./test/e2e/dockerapi/ || fail "the auto-cleanup calls failed against the engine"
+grep -q '"msg":"Free-disk floor armed"' "$MOCK_DIR/agent.log" || fail "the daemon did not arm the free-disk floor"
+[ "$(grep -c '"msg":"Build cache pruned"' "$MOCK_DIR/agent.log")" -ge 2 ] || fail "the build cache was not pruned after the builds"
+grep -q '"msg":"Images pruned"' "$MOCK_DIR/agent.log" || fail "no image prune after a teardown or a maintenance pass"
+# The build request's transport closes the context file itself: closing it
+# again is not an error worth a log line.
+if grep -q '"msg":"Could not close the build context"' "$MOCK_DIR/agent.log"; then fail "a build context close was logged as an error"; fi
+echo "    ok: PruneImages, PruneBuildCache and FreeDisk on Docker $(docker version -f '{{.Server.Version}}'); the daemon pruned the build cache and images"
 
 echo "==> 3. Testing Exhaustive Teardown (Action: closed)..."
 case "$(send_webhook pull_request "$(PR_BODY closed)")" in
@@ -656,3 +679,47 @@ for want in '"kind":"deploy_refused"' '"kind":"untrusted_deploy".*"actor_login":
 done
 if grep -q "$E2E_SECRET" "$MOCK_DIR/audit.jsonl"; then fail "a secret value reached the audit trail"; fi
 echo "    ok: chain intact, $(wc -l < "$MOCK_DIR/audit.jsonl") rows exported, every gating decision attributed"
+
+echo "==> 6. Short TTL (G3): an e2e build expires a running environment and a parked fork through the queue..."
+# The release binary carries no test-only bound; the e2e build logs its own
+# as an error at every start.
+if grep -aq previewd-e2e-test-only-bounds bin/previewd; then fail "the release binary carries the e2e test-only bounds"; fi
+if grep -q '"msg":"Test-only build' "$MOCK_DIR/agent.log"; then fail "the release binary logged a test-only build"; fi
+# Static, as scripts/build.sh builds the release: the startup build probe
+# runs this very binary inside a busybox RUN step.
+CGO_ENABLED=0 go build -trimpath -tags 'netgo e2e' -o "$MOCK_DIR/previewd-e2e" ./cmd/previewd
+grep -aq previewd-e2e-test-only-bounds "$MOCK_DIR/previewd-e2e" || fail "the e2e build lacks its marker"
+kill -SIGTERM "$AGENT_PID"
+wait "$AGENT_PID" 2>/dev/null || true
+AGENT_PID=""
+start_fake
+wait_for 15 "the fake GHES" fake_ledger
+fake_put permissions/e2e/mock/e2e-opener '{"id":4242,"permission":"write"}'
+fake_put pulls/e2e/mock/1005 "{\"state\":\"open\",\"head_sha\":\"$MOCK_SHA\",\"head_repo\":\"e2e/mock\",\"opener\":{\"login\":\"e2e-opener\",\"id\":4242}}"
+fake_put pulls/e2e/mock/1006 "{\"state\":\"open\",\"head_sha\":\"$FORK_SHA1\",\"head_repo\":\"outside/mock\",\"opener\":{\"login\":\"outsider\",\"id\":555}}"
+fake_put reviews/e2e/mock/1006 '[]'
+AGENT_BIN="$MOCK_DIR/previewd-e2e" AGENT_EXTRA_ENV="PREVIEWD_ENV_TTL=20s PREVIEWD_PRUNE_INTERVAL=2s" start_agent
+grep -q '"msg":"Test-only build: never run it in production"' "$MOCK_DIR/agent.log" || fail "the e2e build did not log its test-only bounds"
+reply=$(send_webhook pull_request "$(E3_PR_BODY opened 1005 e2e/ttl "$MOCK_SHA")")
+TTL_ENV=$(printf '%s' "$reply" | sed -n 's/.*"environment_id":"\([a-z0-9-]*\)".*/\1/p')
+[ -n "$TTL_ENV" ] || fail "no environment_id for the TTL PR: $reply"
+reply=$(send_webhook pull_request "$(printf '{"action":"opened","number":1006,"pull_request":{"number":1006,"head":{"ref":"ttl-fork","sha":"%s","repo":{"full_name":"outside/mock"}},"user":{"login":"outsider","id":555},"updated_at":"%s"},"repository":{"full_name":"e2e/mock","clone_url":"file://%s/mock.git"},"sender":{"login":"outsider","id":555}}' "$FORK_SHA1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$MOCK_DIR")")
+PARKED_ENV=$(printf '%s' "$reply" | sed -n 's/.*"environment_id":"\([a-z0-9-]*\)".*/\1/p')
+[ -n "$PARKED_ENV" ] || fail "no environment_id for the TTL fork: $reply"
+wait_for 90 "the TTL environment to serve" test -f "$ROUTES_DIR/$TTL_ENV.yml"
+deployed_at=$(date +%s)
+# ttl_log ENV: the daemon's TTL line for ENV.
+ttl_log() { grep '"msg":"Environment past its TTL: teardown queued"' "$MOCK_DIR/agent.log" | grep "\"environment_id\":\"$1\""; }
+wait_for 90 "the TTL teardown of $TTL_ENV" sh -c "! docker inspect '$TTL_ENV' >/dev/null 2>&1 && ! docker image inspect '$TTL_ENV:latest' >/dev/null 2>&1 && [ ! -e '$ROUTES_DIR/$TTL_ENV.yml' ] && [ ! -e '$STAGING_DIR/$TTL_ENV' ]"
+ttl_log "$TTL_ENV" | grep -q '"status":"SUCCESS"' || fail "the TTL environment was not torn down by its TTL"
+[ $(( $(date +%s) - deployed_at )) -ge 15 ] || fail "the TTL environment went before its 20s TTL"
+wait_for 60 "the TTL teardown of the parked fork $PARKED_ENV" ttl_log "$PARKED_ENV"
+ttl_log "$PARKED_ENV" | grep -q '"status":"PENDING_APPROVAL"' || fail "the parked fork's TTL line names no parked job"
+if docker image inspect "$PARKED_ENV:latest" >/dev/null 2>&1; then fail "an image was built for the parked fork"; fi
+./bin/previewd audit export -db "$MOCK_DIR/previewd.sqlite" > "$MOCK_DIR/audit.jsonl" || fail "audit export failed"
+for env in "$TTL_ENV" "$PARKED_ENV"; do
+  grep '"kind":"ttl_expired"' "$MOCK_DIR/audit.jsonl" | grep -q "\"environment_id\":\"$env\"" || fail "no ttl_expired audit row for $env"
+done
+wait_for 15 "every GHES token revoked" ledger_clean
+echo "    ok: the running environment expired after $(( $(date +%s) - deployed_at ))s and the parked fork too, both through the queue and audited; no token left"
+
