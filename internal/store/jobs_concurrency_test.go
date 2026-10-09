@@ -2,7 +2,8 @@ package store
 
 // Invariant 1 of the store (formal_verification_plan.md section 2):
 // high-frequency overlapping read/write transactions never surface
-// SQLITE_BUSY. The controls below show the detector is not vacuous: the same
+// SQLITE_BUSY, with Prune and its incremental_vacuum running in parallel
+// (V1 F3). The controls below show the detector is not vacuous: the same
 // kind of load on a pool without the connection parameters does.
 
 import (
@@ -16,6 +17,10 @@ import (
 	"testing"
 	"time"
 )
+
+// pruneTestYield is orchestrator's pruneYield: longer than the longest
+// sleep of SQLite's busy handler (100 ms).
+const pruneTestYield = 150 * time.Millisecond
 
 func TestJobStoreConcurrentTransactionsNeverBusy(t *testing.T) {
 	const (
@@ -104,6 +109,27 @@ func TestJobStoreConcurrentTransactionsNeverBusy(t *testing.T) {
 			}
 		})
 	}
+	// The maintenance loop, back to back, yielding between transactions as
+	// the reconciler's does: every job finished during the load is past a
+	// zero retention. Without the yield, under -race, a writer lost every
+	// race for the lock to the next batch until its busy_timeout expired.
+	var pruned atomic.Int64
+	var prunerWG sync.WaitGroup
+	prunerWG.Go(func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			stats, err := s.Prune(ctx, PruneRequest{Now: time.Now().Add(time.Hour), DeliveryMaxAge: time.Minute, Batch: 5, Yield: pruneTestYield})
+			if err != nil {
+				record(fmt.Errorf("prune: %w", err))
+				continue
+			}
+			pruned.Add(stats.Jobs)
+		}
+	})
 	var readerWG sync.WaitGroup
 	for range readers {
 		readerWG.Go(func() {
@@ -122,6 +148,10 @@ func TestJobStoreConcurrentTransactionsNeverBusy(t *testing.T) {
 	wg.Wait()
 	close(done)
 	readerWG.Wait()
+	prunerWG.Wait()
+	if pruned.Load() == 0 {
+		t.Error("Prune deleted nothing during the load: it ran in parallel with nothing")
+	}
 
 	for _, err := range errs {
 		if isBusy(err) {

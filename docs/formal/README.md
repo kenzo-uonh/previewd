@@ -103,13 +103,13 @@ After A2-6 (V1-model.md section 11), all on one 16-thread, 7 GB host, one TLC at
 | `previewd-reapproval.cfg` | 189,904 | 36 | 3 min 58 s | no error |
 | `previewd-approval-reboot.cfg` | 194,928 | 40 | 2 min 54 s | no error |
 | `previewd-mixed.cfg` | 481,280 | 33 | 19 min 05 s | no error |
-| `previewd-prune.cfg` | 203,029 | 32 | 2 min 40 s | no error |
+| `previewd-prune.cfg` | 201,580 | 32 | 1 min 57 s | no error |
 | `previewd-ttl.cfg` | 9,144 | 30 | 10 s | no error |
 | `previewd-grace.cfg` | 125,796 | 38 | 1 min 46 s | no error |
 | `previewd_a2.cfg` (safety) | 17,241,260 | 44 | 17 min 55 s | no error |
 | `previewd_a2-trust.cfg` (safety) | 3,156,312 | 41 | 2 min 19 s | no error |
 
-The host also ran the Go store tests during this sweep, so the times are inflated: on an idle host after A2, `previewd-mixed` took 11 min 26 s and `previewd` 7 min 42 s, within the 15-minute budget; the state counts, not the times, are the comparison. A2-6 adds states only where a GHES fault meets a running approved version: `previewd-approval` (211,448 → 212,752) and `previewd-grace` (125,236 → 125,796). Every other configuration, the two MVP regressions and the two A2 regressions (no GHES fault) have exactly their A2 counts.
+The host also ran the Go store tests during this sweep, so the times are inflated: on an idle host after A2, `previewd-mixed` took 11 min 26 s and `previewd` 7 min 42 s, within the 15-minute budget; the state counts, not the times, are the comparison. A2-6 adds states only where a GHES fault meets a running approved version: `previewd-approval` (211,448 → 212,752) and `previewd-grace` (125,236 → 125,796). Every other configuration, the two MVP regressions and the two A2 regressions (no GHES fault) have exactly their A2 counts. F2-1 (2026-10-09, V1-model.md section 13) keeps every job newer than a host builder from pruning: `previewd-prune` (203,029 → 201,580, re-run alone, the only configuration that prunes) lost the states where such a job was pruned.
 
 After A2 (the rules of V1-model.md section 11, before A2-6), on an idle host: previewd 686,226 states (7 min 42 s), workers 48,386, approval 211,448, reapproval 189,904, approval-reboot 194,928, mixed 481,280 (11 min 26 s), prune 203,029, ttl 9,144, grace 125,236, previewd_a2 17,241,260 (11 min 32 s), previewd_a2-trust 3,156,312, all with no error.
 

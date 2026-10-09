@@ -100,6 +100,11 @@ func TestContainerSpecHardening(t *testing.T) {
 	if h.PidsLimit == nil || *h.PidsLimit != testLimits.Pids {
 		t.Errorf("pids limit = %v, want %d", h.PidsLimit, testLimits.Pids)
 	}
+	// Never the daemon's default parent: with the BuildKit drop-in that is
+	// the build slice (D-V1-4).
+	if h.CgroupParent != "system.slice" {
+		t.Errorf("cgroup parent = %q, want system.slice", h.CgroupParent)
+	}
 }
 
 // Fail closed: a container is never created without limits.

@@ -153,6 +153,56 @@ func TestLoadBuildKeys(t *testing.T) {
 	}
 }
 
+// The build bounds (E2b) and maintenance keys (F3) fail closed: a value
+// outside its range, or not a number, refuses to start; nothing falls back
+// to the default.
+func TestLoadBuildBoundsAndPruneKeys(t *testing.T) {
+	minimalEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Workers != 2 || cfg.MaxConcurrentBuilds != 1 || cfg.BuildTimeout != 20*time.Minute ||
+		cfg.Retention != 720*time.Hour || cfg.PruneInterval != time.Hour || cfg.PruneBatch != 500 {
+		t.Fatalf("defaults = workers %d, builds %d, timeout %s, retention %s, interval %s, batch %d",
+			cfg.Workers, cfg.MaxConcurrentBuilds, cfg.BuildTimeout, cfg.Retention, cfg.PruneInterval, cfg.PruneBatch)
+	}
+	for key, v := range map[string]string{
+		"PREVIEWD_MAX_BUILDS":            "64",
+		"PREVIEWD_MAX_CONCURRENT_BUILDS": "16",
+		"PREVIEWD_BUILD_TIMEOUT":         "2h",
+		"PREVIEWD_RETENTION":             "24h",
+		"PREVIEWD_PRUNE_INTERVAL":        "1m",
+		"PREVIEWD_PRUNE_BATCH":           "10",
+	} {
+		t.Setenv(key, v)
+	}
+	if cfg, err = Load(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Workers != 64 || cfg.MaxConcurrentBuilds != 16 || cfg.BuildTimeout != 2*time.Hour ||
+		cfg.Retention != 24*time.Hour || cfg.PruneInterval != time.Minute || cfg.PruneBatch != 10 {
+		t.Fatalf("bounds = %+v", cfg)
+	}
+	for key, bads := range map[string][]string{
+		"PREVIEWD_MAX_BUILDS":            {"0", "65", "-1", "two", "2.0", " 2"},
+		"PREVIEWD_MAX_CONCURRENT_BUILDS": {"0", "17", "-1", "one", "1.5"},
+		"PREVIEWD_BUILD_TIMEOUT":         {"59s", "2h1m", "0", "-20m", "20", "forever"},
+		"PREVIEWD_RETENTION":             {"23h59m", "0", "-720h", "720", "87601h"},
+		"PREVIEWD_PRUNE_INTERVAL":        {"59s", "24h1m", "0", "1"},
+		"PREVIEWD_PRUNE_BATCH":           {"9", "10001", "0", "-500", "500rows"},
+	} {
+		for _, bad := range bads {
+			t.Run(key+"="+bad, func(t *testing.T) {
+				t.Setenv(key, bad)
+				if _, err := Load(); err == nil {
+					t.Fatalf("%s=%q accepted", key, bad)
+				}
+			})
+		}
+	}
+}
+
 // The approval keys fail closed: a malformed value refuses to start.
 func TestLoadApprovalKeys(t *testing.T) {
 	minimalEnv(t)

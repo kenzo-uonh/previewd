@@ -13,16 +13,20 @@ package orchestrator
 //	               requeue it unclassified (GHES unavailable: remove a revoked
 //	               version first, A2-6; park at the attempt ceiling); then
 //	               ExecuteDeploy (remove previous version, fetch, network,
-//	               build, stage the secret section of its trust),
-//	               StartContainer, PublishRoute, CommitDeploy; any failure
-//	               rolls back and records FAILED
+//	               build within the build bounds, stage the secret section of
+//	               its trust), StartContainer, PublishRoute, CommitDeploy; any
+//	               failure rolls back and records FAILED with the step that
+//	               failed
 //	  teardown     ExecuteTeardown, CommitTeardown; a failure requeues with
 //	               backoff, never FAILED
 //	Revalidator    every interval, each running environment is re-checked
 //	               (D-V1-5); one no longer authorized, or unverifiable past
 //	               the grace period, gets an internal teardown
+//	Maintain       every prune interval, Prune with the builders of what
+//	               exists on the host (V1 F3, V1-I6), then incremental_vacuum
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -42,6 +46,8 @@ import (
 type Queue interface {
 	Acquire(ctx context.Context, now time.Time) (store.Lease, bool, error)
 	Finish(ctx context.Context, l store.Lease, status store.JobStatus, now time.Time) error
+	// Fail records a deploy FAILED with the step that failed.
+	Fail(ctx context.Context, l store.Lease, failure store.Failure, now time.Time) error
 	Requeue(ctx context.Context, l store.Lease, notBefore time.Time) error
 	StartupSweep(ctx context.Context, now time.Time, observed []store.Observation) (store.SweepResult, error)
 	// AuthorizeDeploy (V1).
@@ -52,6 +58,8 @@ type Queue interface {
 	// Revalidator (D-V1-5).
 	Running(ctx context.Context) ([]store.Job, error)
 	EnqueueInternal(ctx context.Context, envID string, origin store.Origin, reason store.RevocationReason, now time.Time, audit store.AuditEvent) (int64, error)
+	// Maintain (V1 F3).
+	Prune(ctx context.Context, req store.PruneRequest) (store.PruneStats, error)
 }
 
 // Authorizer is the deploy gate (GHESAuthorizer).
@@ -92,6 +100,19 @@ type ReconcilerConfig struct {
 	// preflight lets reach the engine (V1 F2). Both are required.
 	AllowedBaseImages    map[string]bool
 	MaxBuildContextBytes int64
+	// MaxConcurrentBuilds and BuildTimeout are PREVIEWD_MAX_CONCURRENT_BUILDS
+	// and PREVIEWD_BUILD_TIMEOUT (default 1 and 20 m): every build shares the
+	// daemon-level BuildKit limits (D-V1-4), and a build past its timeout is
+	// cancelled and fails its deploy.
+	MaxConcurrentBuilds int
+	BuildTimeout        time.Duration
+	// Retention, DeliveryMaxAge, PruneInterval and PruneBatch drive Maintain
+	// (PREVIEWD_RETENTION, PREVIEWD_DELIVERY_MAX_AGE, PREVIEWD_PRUNE_INTERVAL,
+	// PREVIEWD_PRUNE_BATCH; default 720 h, 15 m, 1 h, 500).
+	Retention      time.Duration
+	DeliveryMaxAge time.Duration
+	PruneInterval  time.Duration
+	PruneBatch     int
 	// RevalidateInterval and RevalidateGrace are
 	// PREVIEWD_APPROVAL_REVALIDATE_INTERVAL and _GRACE (default 10 m, 1 h);
 	// the grace is never shorter than the interval.
@@ -112,12 +133,33 @@ const (
 	defaultRevalidateInterval   = 10 * time.Minute
 	defaultRevalidateGrace      = time.Hour
 	defaultAuthorizeMaxAttempts = 10
+	defaultBuildTimeout         = 20 * time.Minute
+	maxConcurrentBuilds         = 16
+	defaultRetention            = 720 * time.Hour
+	defaultDeliveryMaxAge       = 15 * time.Minute
+	defaultPruneInterval        = time.Hour
+	defaultPruneBatch           = 500
+	// minRetention keeps Prune far behind the host inventory it is given: a
+	// job that becomes a builder after Observe returns finished during the
+	// pass, long after now - retention, so that pass cannot prune it.
+	minRetention = 24 * time.Hour
+	// pruneYield is the pause between Prune's transactions: longer than the
+	// longest sleep of SQLite's busy handler (100 ms), so a webhook's Enqueue
+	// waiting for the lock retries in each gap instead of timing out behind
+	// a long run of batches (a 500 GitHub does not redeliver).
+	pruneYield = 150 * time.Millisecond
 )
 
-// Reconciler runs the startup sweep and the deployment workers.
+// ErrBuildTimeout fails a build still running at PREVIEWD_BUILD_TIMEOUT.
+var ErrBuildTimeout = errors.New("build cancelled at PREVIEWD_BUILD_TIMEOUT")
+
+// Reconciler runs the startup sweep, the deployment workers, the
+// re-validation loop and the maintenance loop.
 type Reconciler struct {
 	cfg  ReconcilerConfig
 	wake chan struct{}
+	// builds holds one token per build in flight (MaxConcurrentBuilds).
+	builds chan struct{}
 }
 
 // NewReconciler validates cfg.
@@ -151,7 +193,23 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 2 * time.Second
 	}
-	return &Reconciler{cfg: cfg, wake: make(chan struct{}, 1)}, nil
+	if cfg.MaxConcurrentBuilds < 0 || cfg.MaxConcurrentBuilds > maxConcurrentBuilds || cfg.BuildTimeout < 0 {
+		return nil, fmt.Errorf("reconciler: invalid build bounds (%d concurrent builds, timeout %s)", cfg.MaxConcurrentBuilds, cfg.BuildTimeout)
+	}
+	cfg.MaxConcurrentBuilds = cmp.Or(cfg.MaxConcurrentBuilds, 1)
+	cfg.BuildTimeout = cmp.Or(cfg.BuildTimeout, defaultBuildTimeout)
+	if cfg.Retention < 0 || cfg.DeliveryMaxAge < 0 || cfg.PruneInterval < 0 || cfg.PruneBatch < 0 {
+		return nil, fmt.Errorf("reconciler: negative maintenance setting (retention %s, delivery max age %s, interval %s, batch %d)",
+			cfg.Retention, cfg.DeliveryMaxAge, cfg.PruneInterval, cfg.PruneBatch)
+	}
+	cfg.Retention = cmp.Or(cfg.Retention, defaultRetention)
+	cfg.DeliveryMaxAge = cmp.Or(cfg.DeliveryMaxAge, defaultDeliveryMaxAge)
+	cfg.PruneInterval = cmp.Or(cfg.PruneInterval, defaultPruneInterval)
+	cfg.PruneBatch = cmp.Or(cfg.PruneBatch, defaultPruneBatch)
+	if cfg.Retention < minRetention {
+		return nil, fmt.Errorf("reconciler: retention %s is shorter than %s", cfg.Retention, minRetention)
+	}
+	return &Reconciler{cfg: cfg, wake: make(chan struct{}, 1), builds: make(chan struct{}, cfg.MaxConcurrentBuilds)}, nil
 }
 
 // Startup runs once, before the API and the workers serve. It fails closed:
@@ -315,18 +373,43 @@ func (r *Reconciler) deploy(ctx context.Context, l store.Lease, log *slog.Logger
 			log.Info("Environment deployed")
 			return
 		}
-		err = fmt.Errorf("commit deploy: %w", err)
+		err = failAt(store.FailureCommit, fmt.Errorf("commit deploy: %w", err))
 	}
 	// Roll back to absent: nothing of a deploy the database does not record
 	// as SUCCESS may stay on the host, the route document least of all.
-	log.Error("Deploy failed, rolling back", "error", err)
+	failure := store.FailureNone
+	var se *stepError
+	if errors.As(err, &se) {
+		failure = se.step
+	}
+	log.Error("Deploy failed, rolling back", "error", err, "failure", string(failure))
 	if rbErr := Teardown(cctx, r.cfg.Engine, r.cfg.Routes, r.cfg.Stager, l.EnvID); rbErr != nil {
 		log.Error("Rollback incomplete: the next startup sweep removes the rest", "error", rbErr)
 	}
-	if fErr := r.cfg.Queue.Finish(cctx, l, store.StatusFailed, r.cfg.Now()); fErr != nil {
+	var fErr error
+	if failure == store.FailureNone {
+		fErr = r.cfg.Queue.Finish(cctx, l, store.StatusFailed, r.cfg.Now())
+	} else {
+		fErr = r.cfg.Queue.Fail(cctx, l, failure, r.cfg.Now())
+	}
+	if fErr != nil {
 		log.Error("Could not record the failed deploy", "error", fErr)
 	}
 }
+
+// stepError tags a deploy failure with the step that failed, recorded as
+// jobs.failure (closed vocabulary). A failure outside the vocabulary
+// (removing the previous version, the build directory, the network) carries
+// no tag and is recorded FAILED with no step.
+type stepError struct {
+	step store.Failure
+	err  error
+}
+
+func (e *stepError) Error() string { return e.err.Error() }
+func (e *stepError) Unwrap() error { return e.err }
+
+func failAt(step store.Failure, err error) error { return &stepError{step: step, err: err} }
 
 func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, log *slog.Logger) (err error) {
 	env := l.EnvID
@@ -335,7 +418,7 @@ func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, l
 	// section.
 	section, err := r.cfg.Secrets.Section(l.Source.Repo, d.Trust != store.TrustTrusted, d.FullSecrets)
 	if err != nil {
-		return fmt.Errorf("secrets: %w", err)
+		return failAt(store.FailureStage, fmt.Errorf("secrets: %w", err))
 	}
 
 	// ExecuteDeploy: remove the previous version, fetch, pack the context
@@ -355,11 +438,11 @@ func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, l
 	}()
 	srcDir := filepath.Join(dir, "src")
 	if err := r.cfg.Fetch(ctx, l.Source.CloneURL, l.Source.CommitSHA, srcDir); err != nil {
-		return fmt.Errorf("fetch: %w", err)
+		return failAt(store.FailureFetch, fmt.Errorf("fetch: %w", err))
 	}
 	buildContext, err := PrepareBuildContext(srcDir, filepath.Join(dir, "context.tar"), r.cfg.MaxBuildContextBytes, r.cfg.AllowedBaseImages)
 	if err != nil {
-		return fmt.Errorf("preflight: %w", err)
+		return failAt(store.FailurePreflight, fmt.Errorf("preflight: %w", err))
 	}
 	defer func() {
 		if cErr := buildContext.Close(); cErr != nil {
@@ -370,12 +453,12 @@ func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, l
 		return fmt.Errorf("network: %w", err)
 	}
 	tag := env + ":latest"
-	if err := r.cfg.Engine.Build(ctx, BuildSpec{ContextTar: buildContext, Tag: tag, EnvID: env, JobID: l.JobID}); err != nil {
-		return fmt.Errorf("build: %w", err)
+	if err := r.build(ctx, BuildSpec{ContextTar: buildContext, Tag: tag, EnvID: env, JobID: l.JobID}, log); err != nil {
+		return failAt(store.FailureBuild, fmt.Errorf("build: %w", err))
 	}
 	secretsDir, err := r.cfg.Stager.Stage(env, section)
 	if err != nil {
-		return fmt.Errorf("stage secrets: %w", err)
+		return failAt(store.FailureStage, fmt.Errorf("stage secrets: %w", err))
 	}
 
 	// StartContainer.
@@ -383,14 +466,44 @@ func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, l
 		ID: env, Image: tag, Port: r.cfg.AppPort, Domain: r.cfg.Domain, JobID: l.JobID, SecretsDir: secretsDir,
 	})
 	if err != nil {
-		return fmt.Errorf("start container: %w", err)
+		return failAt(store.FailureStart, fmt.Errorf("start container: %w", err))
 	}
 
 	// PublishRoute.
 	if err := r.cfg.Routes.Publish(proxy.Route{EnvID: env, Domain: r.cfg.Domain, Backend: backend}); err != nil {
-		return fmt.Errorf("publish route: %w", err)
+		return failAt(store.FailureRoute, fmt.Errorf("publish route: %w", err))
 	}
 	return nil
+}
+
+// build runs one build within the build bounds (D-V1-4, V1-I12): it waits
+// for one of MaxConcurrentBuilds slots, shared by every worker because
+// every build shares the daemon-level BuildKit limits, and its request is
+// cancelled at BuildTimeout (E0: closing the request stops the solve and
+// its RUN processes). A build whose deadline passed fails even when the
+// engine reports success: a cancelled build is never read as one.
+func (r *Reconciler) build(ctx context.Context, spec BuildSpec, log *slog.Logger) error {
+	select {
+	case r.builds <- struct{}{}:
+	case <-ctx.Done():
+		return fmt.Errorf("wait for a build slot: %w", context.Cause(ctx))
+	}
+	defer func() { <-r.builds }()
+	bctx, cancel := context.WithTimeoutCause(ctx, r.cfg.BuildTimeout, ErrBuildTimeout)
+	defer cancel()
+	err := r.cfg.Engine.Build(bctx, spec)
+	cause := context.Cause(bctx)
+	switch {
+	case errors.Is(cause, ErrBuildTimeout):
+		log.Error("Build cancelled at the build timeout", "build_timeout", r.cfg.BuildTimeout, "error", err)
+		if err == nil {
+			return fmt.Errorf("%w (%s): the engine reported success after the deadline", ErrBuildTimeout, r.cfg.BuildTimeout)
+		}
+		return fmt.Errorf("%w (%s): %w", ErrBuildTimeout, r.cfg.BuildTimeout, err)
+	case cause != nil && err == nil:
+		return fmt.Errorf("build cancelled: %w", cause)
+	}
+	return err
 }
 
 func (r *Reconciler) teardown(ctx context.Context, l store.Lease, log *slog.Logger) {
@@ -644,4 +757,60 @@ func (r *Reconciler) revalidationTeardown(ctx context.Context, j store.Job, reas
 	}
 	log.Info("Re-validation teardown queued", "teardown_job_id", id)
 	r.Notify()
+}
+
+// Maintain runs the database maintenance loop (V1 F3, V1-I6) until ctx is
+// done: one Prune pass at once, then one every PruneInterval. Prune itself
+// ends with incremental_vacuum. It runs only after Startup: the store
+// refuses Prune before the sweep.
+func (r *Reconciler) Maintain(ctx context.Context) {
+	t := time.NewTicker(r.cfg.PruneInterval)
+	defer t.Stop()
+	for {
+		r.pruneOnce(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// pruneOnce runs one Prune pass and logs what it deleted.
+func (r *Reconciler) pruneOnce(ctx context.Context) {
+	stats, err := r.prune(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			r.cfg.Logger.Error("Prune pass failed: the next interval retries", "error", err)
+		}
+		return
+	}
+	r.cfg.Logger.Info("Prune pass complete", "jobs", stats.Jobs, "deliveries", stats.Deliveries,
+		"approvals", stats.Approvals, "boots", stats.Boots, "max_batch", stats.MaxBatch, "batch", r.cfg.PruneBatch)
+}
+
+// prune reads the builders of every environment on the host, then prunes.
+// It fails closed: without the host's view (Observe fails), nothing is
+// pruned, since Prune would then delete the builders the sweep reads
+// (V1-model.md A1-6).
+func (r *Reconciler) prune(ctx context.Context) (store.PruneStats, error) {
+	states, err := r.cfg.Engine.Observe(ctx)
+	if err != nil {
+		return store.PruneStats{}, fmt.Errorf("prune: observe engine: %w", err)
+	}
+	var builders []int64
+	for _, st := range states {
+		if st.JobID > 0 {
+			builders = append(builders, st.JobID)
+		}
+	}
+	slices.Sort(builders)
+	stats, err := r.cfg.Queue.Prune(ctx, store.PruneRequest{
+		Now: r.cfg.Now(), Retention: r.cfg.Retention, DeliveryMaxAge: r.cfg.DeliveryMaxAge,
+		Batch: r.cfg.PruneBatch, Builders: builders, Yield: pruneYield,
+	})
+	if err != nil {
+		return stats, fmt.Errorf("prune: %w", err)
+	}
+	return stats, nil
 }

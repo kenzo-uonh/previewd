@@ -463,6 +463,7 @@ type v1PruneRequest struct {
 	DeliveryMaxAge time.Duration
 	Batch          int
 	Builders       []int64 // builder job IDs of every environment that exists
+	Yield          time.Duration
 }
 
 // v1Backend is the store under test, driven in lockstep with the model.
@@ -1316,7 +1317,8 @@ func (x *v1Machine) Prune(t *rapid.T) {
 	for _, j := range m.sortedJobs() {
 		l, _ := m.latest(j.EnvID)
 		keepLatest := x.cfg.mutant != v1M14 && x.cfg.mutant != v1M15b
-		if !j.terminal() || j.FinishedAt >= jobCutoff || (keepLatest && j.ID == l.ID) || j.Seq == m.host[j.EnvID].Seq {
+		h := m.host[j.EnvID]
+		if !j.terminal() || j.FinishedAt >= jobCutoff || (keepLatest && j.ID == l.ID) || (h.exists() && h.JobID != 0 && j.Seq >= h.Seq) {
 			continue
 		}
 		if x.cfg.mutant != v1M15 && x.cfg.mutant != v1M15b {

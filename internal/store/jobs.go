@@ -12,7 +12,8 @@ package store
 //	Classify, Park   AuthorizeDeploy allow and park (approvals.go)
 //	Requeue          AuthorizeDeploy GHES unavailable, ExecuteTeardown
 //	                 transient failure (never FAILED)
-//	Finish           CommitDeploy, CommitTeardown, deploy failure rollback
+//	Finish, Fail     CommitDeploy, CommitTeardown, deploy failure rollback
+//	                 (Fail records the step that failed)
 //	EnqueueInternal  Revalidate, Expire (approvals.go)
 //	Prune            Prune (maintenance.go)
 //	StartupSweep     StartupSweep (D2, D3)
@@ -122,6 +123,7 @@ var (
 	ErrTeardownCannotFail = errors.New("a teardown never fails: requeue it")
 	ErrDeployCannotRetry  = errors.New("a classified deploy is never requeued: finish it as FAILED")
 	ErrNoJob              = errors.New("the environment has no job")
+	ErrInvalidFailure     = errors.New("invalid failure kind: not a deploy step of the closed vocabulary")
 )
 
 const (
@@ -437,34 +439,43 @@ func (s *Store) Enqueue(ctx context.Context, d Delivery) (Verdict, int64, error)
 	var verdict Verdict
 	var jobID int64
 	err := s.inTx(ctx, "enqueue", func(tx *sql.Tx) error {
-		if replay, err := seenDelivery(ctx, tx, d.ID, d.PayloadSHA256); err != nil || replay {
-			verdict = VerdictReplay
-			return err
-		}
-		top, err := maxSeq(ctx, tx, d.EnvID)
-		if err != nil {
-			return fmt.Errorf("enqueue: order check: %w", err)
-		}
-		verdict = VerdictAccepted
-		if d.Seq <= top {
-			verdict = VerdictStale
-		}
-		if err := recordDelivery(ctx, tx, d.ID, d.PayloadSHA256, d.EnvID, d.Seq, verdict, d.ReceivedAt); err != nil {
-			return fmt.Errorf("enqueue: %w", err)
-		}
-		if verdict == VerdictStale {
-			return nil
-		}
-		if jobID, err = insertJob(ctx, tx, newJob{EnvID: d.EnvID, Type: d.Type, Origin: OriginWebhook, Seq: d.Seq, CreatedAt: d.ReceivedAt, Source: d.Source}); err != nil {
-			return fmt.Errorf("enqueue: %w", err)
-		}
-		if d.Type == JobDeploy {
-			return recordNewHead(ctx, tx, d)
-		}
-		return nil
+		var err error
+		verdict, jobID, err = enqueueTx(ctx, tx, d)
+		return err
 	})
 	if err != nil {
 		return "", 0, err
+	}
+	return verdict, jobID, nil
+}
+
+// enqueueTx is Enqueue's transaction body, on a valid delivery.
+func enqueueTx(ctx context.Context, tx *sql.Tx, d Delivery) (Verdict, int64, error) {
+	if replay, err := seenDelivery(ctx, tx, d.ID, d.PayloadSHA256); err != nil || replay {
+		return VerdictReplay, 0, err
+	}
+	top, err := maxSeq(ctx, tx, d.EnvID)
+	if err != nil {
+		return "", 0, fmt.Errorf("enqueue: order check: %w", err)
+	}
+	verdict := VerdictAccepted
+	if d.Seq <= top {
+		verdict = VerdictStale
+	}
+	if err := recordDelivery(ctx, tx, d.ID, d.PayloadSHA256, d.EnvID, d.Seq, verdict, d.ReceivedAt); err != nil {
+		return "", 0, fmt.Errorf("enqueue: %w", err)
+	}
+	if verdict == VerdictStale {
+		return verdict, 0, nil
+	}
+	jobID, err := insertJob(ctx, tx, newJob{EnvID: d.EnvID, Type: d.Type, Origin: OriginWebhook, Seq: d.Seq, CreatedAt: d.ReceivedAt, Source: d.Source})
+	if err != nil {
+		return "", 0, fmt.Errorf("enqueue: %w", err)
+	}
+	if d.Type == JobDeploy {
+		if err := recordNewHead(ctx, tx, d); err != nil {
+			return "", 0, err
+		}
 	}
 	return verdict, jobID, nil
 }
@@ -551,19 +562,38 @@ func (s *Store) Finish(ctx context.Context, l Lease, status JobStatus, now time.
 	if status != StatusSuccess && status != StatusFailed {
 		return fmt.Errorf("finish job %d: status %q is not SUCCESS or FAILED", l.JobID, status)
 	}
+	return s.finish(ctx, "finish", l, status, FailureNone, now)
+}
+
+// failureSteps are the failures the reconciler records: FailureNone says
+// nothing, and FailureInterrupted is the sweep's own.
+var failureSteps = []Failure{FailureFetch, FailurePreflight, FailureBuild, FailureStage, FailureStart,
+	FailureRoute, FailureCommit, FailureUnauthorized, FailureDiskFloor}
+
+// Fail moves a leased deploy to FAILED at now and records the step that
+// failed, from the closed vocabulary (ErrInvalidFailure otherwise). A
+// teardown never fails (ErrTeardownCannotFail).
+func (s *Store) Fail(ctx context.Context, l Lease, failure Failure, now time.Time) error {
+	if !slices.Contains(failureSteps, failure) {
+		return fmt.Errorf("fail job %d: %w: %q", l.JobID, ErrInvalidFailure, failure)
+	}
+	return s.finish(ctx, "fail", l, StatusFailed, failure, now)
+}
+
+func (s *Store) finish(ctx context.Context, what string, l Lease, status JobStatus, failure Failure, now time.Time) error {
 	if l.Type == JobTeardown && status == StatusFailed {
 		return ErrTeardownCannotFail
 	}
 	if !validTime(now) {
-		return fmt.Errorf("finish job %d: %w", l.JobID, ErrInvalidTime)
+		return fmt.Errorf("%s job %d: %w", what, l.JobID, ErrInvalidTime)
 	}
 	if _, err := s.requireSwept(); err != nil {
 		return err
 	}
-	return s.inTx(ctx, "finish", func(tx *sql.Tx) error {
-		return updateLease(ctx, tx, "finish", l,
-			`UPDATE jobs SET status = ?, finished_at = ? WHERE id = ? AND status = 'IN_PROGRESS' AND lease_epoch = ?`,
-			string(status), now.UnixMilli(), l.JobID, l.Epoch)
+	return s.inTx(ctx, what, func(tx *sql.Tx) error {
+		return updateLease(ctx, tx, what, l,
+			`UPDATE jobs SET status = ?, finished_at = ?, failure = ? WHERE id = ? AND status = 'IN_PROGRESS' AND lease_epoch = ?`,
+			string(status), now.UnixMilli(), string(failure), l.JobID, l.Epoch)
 	})
 }
 

@@ -48,6 +48,9 @@ type hostEngine struct {
 	calls []string
 	// built is the Dockerfile of each build context received, in order.
 	built []string
+	// buildHook, when set, runs inside Build after the build step is
+	// recorded, without the lock: a slow or hanging build.
+	buildHook func(ctx context.Context) error
 }
 
 func newHostEngine() *hostEngine {
@@ -77,9 +80,14 @@ func (h *hostEngine) Close() error { return nil }
 
 // Build records the Dockerfile of the context it is streamed: the tar the
 // preflight validated, never a host path.
-func (h *hostEngine) Build(_ context.Context, spec BuildSpec) error {
+func (h *hostEngine) Build(ctx context.Context, spec BuildSpec) error {
 	if err := h.step("build"); err != nil {
 		return err
+	}
+	if h.buildHook != nil {
+		if err := h.buildHook(ctx); err != nil {
+			return err
+		}
 	}
 	if _, err := buildOptions(spec); err != nil {
 		return err
@@ -248,6 +256,10 @@ type rig struct {
 	// interval and grace of the Revalidator; 0 for the defaults.
 	interval, grace time.Duration
 	maxAttempts     int64
+	// Build bounds and maintenance; 0 for the defaults.
+	maxBuilds     int
+	buildTimeout  time.Duration
+	pruneInterval time.Duration
 }
 
 func newRig(t *testing.T) *rig {
@@ -299,6 +311,7 @@ func (r *rig) reconciler() *Reconciler {
 		Queue: r.queue, Engine: r.engine, Routes: r.routes, Stager: r.stager,
 		Secrets: sectionSecrets{}, Authorizer: r.auth,
 		RevalidateInterval: r.interval, RevalidateGrace: r.grace, AuthorizeMaxAttempts: r.maxAttempts,
+		MaxConcurrentBuilds: r.maxBuilds, BuildTimeout: r.buildTimeout, PruneInterval: r.pruneInterval, PruneBatch: 2,
 		Fetch: func(_ context.Context, _, _, dest string) error {
 			if r.fetchErr != nil {
 				return r.fetchErr
@@ -341,10 +354,16 @@ func (r *rig) enqueueCommit(typ store.JobType, commit string) {
 // drain runs one worker until no job is QUEUED or IN_PROGRESS.
 func (r *rig) drain(rec *Reconciler) []store.Job {
 	r.t.Helper()
+	return r.drainWith(rec, 1)
+}
+
+// drainWith runs workers until no job is QUEUED or IN_PROGRESS.
+func (r *rig) drainWith(rec *Reconciler, workers int) []store.Job {
+	r.t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		rec.Run(ctx, 1)
+		rec.Run(ctx, workers)
 		close(done)
 	}()
 	defer func() {
@@ -419,10 +438,14 @@ func TestReconcilerDeploysAndTearsDown(t *testing.T) {
 	}
 }
 
-// Any failing deploy step rolls back to absent and records FAILED: no route,
-// container, network or staging survives.
+// Any failing deploy step rolls back to absent and records FAILED with the
+// step that failed: no route, container, network or staging survives.
 func TestReconcilerDeployFailureRollsBack(t *testing.T) {
-	for _, step := range []string{"fetch", "preflight", "network", "build", "stage", "deploy", "publish"} {
+	failures := map[string]store.Failure{
+		"fetch": store.FailureFetch, "preflight": store.FailurePreflight, "network": store.FailureNone,
+		"build": store.FailureBuild, "stage": store.FailureStage, "deploy": store.FailureStart, "publish": store.FailureRoute,
+	}
+	for _, step := range slices.Sorted(maps.Keys(failures)) {
 		t.Run(step, func(t *testing.T) {
 			r := newRig(t)
 			boom := errors.New(step + " failed")
@@ -444,8 +467,8 @@ func TestReconcilerDeployFailureRollsBack(t *testing.T) {
 			}
 			r.enqueue(store.JobDeploy)
 			jobs := r.drain(rec)
-			if lastStatus(jobs) != store.StatusFailed {
-				t.Fatalf("job = %+v, want FAILED", jobs)
+			if lastStatus(jobs) != store.StatusFailed || jobs[len(jobs)-1].Failure != failures[step] {
+				t.Fatalf("job = %+v, want FAILED with failure %q", jobs, failures[step])
 			}
 			if len(r.engine.envs) != 0 || len(r.stager.staged) != 0 || len(r.routeFiles()) != 0 {
 				t.Fatalf("leftovers: engine %v staged %v routes %v", r.engine.envs, r.stager.staged, r.routeFiles())

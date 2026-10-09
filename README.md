@@ -21,7 +21,10 @@
 │       ├── audit.go               # `previewd audit verify|export`: read-only check and JSON Lines export of the audit trail.
 │       └── buildprobe.go          # `previewd build-probe`: the network check run inside the startup probe's BuildKit RUN step.
 ├── deployments/
-│   ├── docker-compose.yml         # Traefik: digest-pinned, read-only, no socket, routes dir mounted read-only.
+│   ├── docker-compose.yml         # Traefik: digest-pinned, read-only, no socket, routes dir mounted read-only, cgroup parent system.slice.
+│   ├── docker.service.d/
+│   │   └── previewd-builds.conf   # dockerd drop-in: default cgroup parent previewd-builds.slice (BuildKit RUN steps), egress filter (IPAddressDeny).
+│   ├── previewd-builds.slice      # Bounded subtree of every build: MemoryMax 4G, MemorySwapMax 0, CPUQuota 200%, TasksMax 2048 (D-V1-4).
 │   └── traefik.yml                # Traefik static configuration: file provider only, no API, no telemetry.
 ├── internal/
 │   ├── api/
@@ -38,7 +41,7 @@
 │   │   ├── engine.go              # Interface defining the Driver (Docker/Kubernetes).
 │   │   ├── environment.go         # EaaS lifecycle logic (Clone, Start, Stop, Destroy).
 │   │   ├── preflight.go           # Build preflight (V1 F2): validated context tar, Dockerfile checks on the pinned BuildKit parser.
-│   │   └── reconciler.go          # Startup sweep (inventory, destroy, route GC) and the deployment workers on the durable queue.
+│   │   └── reconciler.go          # Startup sweep (inventory, destroy, route GC), deployment workers (build slots, build timeout), prune loop.
 │   ├── proxy/
 │   │   ├── route.go               # Traefik file-provider route documents (validated, JSON-as-YAML), the only routing path.
 │   │   └── publish.go             # Atomic publish: temp file, fsync, rename, fsync dir.
@@ -51,7 +54,7 @@
 │   │   ├── jobs.go                # Durable job queue: replay protection, stale deliveries, leases, startup sweep (TLA+ model).
 │   │   ├── approvals.go           # Approval grants and revocations (order-independent), classification, park, internal teardowns.
 │   │   ├── audit.go               # Append-only, hash-chained audit trail.
-│   │   ├── maintenance.go         # Pruning behind the watermark, TTL expiry.
+│   │   ├── maintenance.go         # Batched pruning behind the watermark, incremental_vacuum, TTL expiry.
 │   │   └── schema.go              # Startup schema check: pinned columns, no BLOB affinity.
 │   ├── textutil/                  # Sanitize: map untrusted text onto [a-zA-Z0-9-] (leaf).
 │   ├── validate/                  # Identifier validators (base images: name:tag@sha256), webhook HMAC and payload schema, layering test (leaf).
@@ -174,7 +177,7 @@ Operational parameters enforce hardware boundaries and are managed exclusively v
 * `PREVIEWD_TRAEFIK_DOMAIN`: Base routing domain for PR environments (default: local.previewd).
 
 
-* `PREVIEWD_MAX_BUILDS`: Number of reconciler workers, i.e. jobs (deploys and teardowns) run at once; one job per environment at a time regardless (default: 2).
+* `PREVIEWD_MAX_BUILDS`: Number of reconciler workers, i.e. jobs (deploys and teardowns) run at once, 1..64; one job per environment at a time regardless (default: 2). A value outside the range, or not an integer, refuses to start. How many of those jobs build at once is `PREVIEWD_MAX_CONCURRENT_BUILDS`.
 
 
 * `PREVIEWD_WEBHOOK_SECRET_CREDENTIAL` (default `webhook_secret`): Name of the systemd credential holding the HMAC secret of the GitHub webhook. **Required credential.** The secret is never read from the environment or from a configured path: the daemon refuses to start while `PREVIEWD_WEBHOOK_SECRET` is set (whatever its value, which is never read), and when the credential is missing, empty, or only line breaks. Trailing CR/LF bytes are dropped; every other byte is the key. Every webhook must carry the exact `X-Hub-Signature-256` for its body (at most 1 MiB). Changing the secret takes a restart.
@@ -254,10 +257,16 @@ Credentials are read by name from `$CREDENTIALS_DIRECTORY`, never from a configu
 * `PREVIEWD_MAX_BUILD_CONTEXT_MIB`: Size cap of the build context tar, 1..16384 (default: 512). A larger checkout fails the deploy before any build request.
 
 
-* `PREVIEWD_BUILDKIT_CGROUP` (required unless the opt-in below): The cgroup v2 subtree, under `/sys/fs/cgroup`, where the engine runs BuildKit `RUN` steps, bounded by a systemd drop-in (D-V1-4). At every start previewd requires its `memory.max`, `pids.max` and `cpu.max` quota finite and `memory.swap.max` 0, the subtree idle, a process of the probe build in it while the probe runs, and none left after. Any failure refuses to start.
+* `PREVIEWD_BUILDKIT_CGROUP` (required unless the opt-in below): The cgroup v2 subtree, under `/sys/fs/cgroup`, where the engine runs BuildKit `RUN` steps, bounded by systemd (D-V1-4). At every start previewd requires its `memory.max`, `pids.max` and `cpu.max` quota finite and `memory.swap.max` 0, the subtree idle, a process of the probe build in it while the probe runs, and none left after. Any failure refuses to start. With the systemd cgroup driver, install `deployments/previewd-builds.slice` in `/etc/systemd/system/` and `deployments/docker.service.d/previewd-builds.conf` in `/etc/systemd/system/docker.service.d/`, then `systemctl daemon-reload && systemctl restart docker`, and set `/sys/fs/cgroup/previewd.slice/previewd-builds.slice`. The drop-in makes that slice dockerd's default cgroup parent, where BuildKit runs every `RUN` (`docker-<id>.scope`), and filters dockerd's own egress (D-V1-2): environment containers and Traefik name `system.slice` instead, and any other container on the host must too, or the subtree is busy and previewd refuses to start. Not yet verified on a cgroup v2 host (E0 `bound-*` cases pending).
 
 
 * `PREVIEWD_ALLOW_UNBOUNDED_BUILDS`: Set exactly `1` to skip the cgroup checks of the startup probe (dev hosts, cgroup v1); the network check still runs. Contradicts `PREVIEWD_BUILDKIT_CGROUP`. Logged as an error at every start.
+
+
+* `PREVIEWD_MAX_CONCURRENT_BUILDS`: Builds in flight at once across every worker, 1..16 (default: 1). Every build shares the BuildKit cgroup's limits (D-V1-4), so a value above 1 needs `previewd-builds.slice` scaled; it is logged at every start. A worker waits for a free slot before it builds.
+
+
+* `PREVIEWD_BUILD_TIMEOUT`: A build still running after this duration, 1m..2h, is cancelled (default: `20m`): previewd closes the build request, which stops the BuildKit solve and its `RUN` processes (`scripts/verify-buildkit.sh`, case `cancel`), and the deploy fails with `failure = 'build'`. A build the engine reports successful after its deadline fails too.
 
 
 * `PREVIEWD_BUILD_PROBE_ADDR`: The startup probe's TCP target, `IP:PORT` (default: the default bridge's IPv4 gateway, port 9). Only "network unreachable" or "host unreachable" passes; a connection, a refusal or a timeout refuses to start.
@@ -297,6 +306,11 @@ ramfs is never swapped. A reboot discards it, together with every staged secret.
 6. **Approvals:** an approver (`PREVIEWD_APPROVERS`, matched on the account ID) approves the exact head commit with a review, or, with `PREVIEWD_LABEL_APPROVAL=1`, by adding `PREVIEWD_APPROVAL_LABEL`. A change request by an approver, the dismissal of an approver's review, or the removal of the label (by anyone) revokes the approvals of that commit. Approvals and revocations are recorded with their delivery (replay-checked like any other) and an audit row, in any arrival order. Each is judged against GHES read in the same request: the environment is trusted when its head lives in the repository and its opener has write access (a trusted environment is not torn down by a revocation: it needed no approval), and an approval queues a deploy only when its commit is the open head now. When GHES cannot be read, an approval queues no deploy and a revocation is judged as for an untrusted environment.
 7. **Queue:** one SQLite transaction records the delivery (`internal/store/jobs.go`). A delivery whose GUID or whose body (SHA-256) was already recorded is a duplicate (200). The body check matters because the header is unsigned, so a captured body resent under a new GUID is still refused. A delivery not newer than every job of its environment, whatever that job's status, and than its watermark (the highest seq of pruned jobs), is stale (202, nothing queued). Otherwise a job is queued (202) and a worker woken. `opened`, `reopened` and `synchronize` queue a deploy, `closed` a teardown. An accepted deploy also revokes, in the same transaction, the approvals of every other commit of the pull request (V1 approval gating, `docs/specs/V1-previewd.md`).
 
+* `PREVIEWD_RETENTION`: Age past which finished jobs, approval grants no longer live and deliveries are pruned, at least `24h` (default: `720h`). Deliveries are kept at least `PREVIEWD_DELIVERY_MAX_AGE` + 5 minutes, so a captured body outside V1-I7's window is refused by the handler, never accepted for want of its row.
+
+
+* `PREVIEWD_PRUNE_INTERVAL`, `PREVIEWD_PRUNE_BATCH`: The maintenance loop runs a pass at start, then every interval, 1m..24h (default: `1h`), deleting at most a batch of rows per transaction, 10..10000 (default: 500), with a 150 ms pause between transactions so that webhooks waiting for the database lock get it, then returns up to 1,000 free pages to the file system (`PRAGMA incremental_vacuum`). A pass reads the host's environments first and never prunes the job that built one, nor any job newer than it; if the engine cannot be read the pass prunes nothing. Never pruned: a job not finished, the latest job of an environment, watermarks, revocations and new-head records, the newest 100 boot epochs, and the audit trail.
+
 The database is at schema version 3. The first start of this version migrates a version-2 file in one transaction, then converts it once to incremental `auto_vacuum` with a `VACUUM` (temporary disk space up to the database size); the daemon refuses to start if either fails.
 
 ## Audit Trail
@@ -315,7 +329,7 @@ Both open the database read-only (never migrated, this binary's schema version o
 Workers (`PREVIEWD_MAX_BUILDS`) take the newest queued job of an environment with no job in progress; older queued jobs of that environment are skipped.
 
 - **Authorize (before anything is fetched or built):** the pull request is read from GHES. Trusted (head in the repository, opener with admin, maintain or write) or untrusted with a live approval confirmed on GHES (the approver, by account ID, still listed, their latest review still `APPROVED` on the exact commit, still with write access). The verdict is recorded with the approval it confirmed; if a newer approval was recorded meanwhile, the deploy is requeued and authorized again. Not approved: the previous version is removed and the job waits in `PENDING_APPROVAL` until an approval of its exact commit or a newer push. GHES unavailable: requeued unclassified (30 s doubling to 10 min), after removing a running version whose approval was revoked; after 10 attempts the deploy is parked instead.
-- **Deploy:** remove the previous version, fetch the commit, pack the build context and run the preflight (a refusal fails the deploy before any engine request), create the internal network, build, stage the secret section of its trust, start the container, publish the route document, commit SUCCESS. Any failure removes everything and records FAILED.
+- **Deploy:** remove the previous version, fetch the commit, pack the build context and run the preflight (a refusal fails the deploy before any engine request), create the internal network, build (in one of `PREVIEWD_MAX_CONCURRENT_BUILDS` slots, cancelled at `PREVIEWD_BUILD_TIMEOUT`), stage the secret section of its trust, start the container, publish the route document, commit SUCCESS. Any failure removes everything and records FAILED with the step that failed (`failure`: `fetch`, `preflight`, `build`, `stage`, `start`, `route`, `commit`; empty when the previous version, the build directory or the network could not be handled).
 - **Re-validation:** every `PREVIEWD_APPROVAL_REVALIDATE_INTERVAL`, each environment whose latest job is a successful deploy is re-checked. A version built trusted needs its PR still trusted (an offboarded opener tears it down, whatever approval exists); one built on an approval needs that approval confirmed again. One no longer authorized gets a teardown at once, its approval revoked in the same transaction; one GHES cannot verify for `PREVIEWD_APPROVAL_REVALIDATE_GRACE` is torn down (fail closed). The grace count is kept in memory: a restart starts a new one.
 - **Teardown:** remove route, container, network, image and staging. A failure requeues it with backoff (1 s doubling to 5 min); a teardown never ends FAILED.
 
@@ -347,7 +361,9 @@ Any error refuses the start. A route document therefore exists only while the da
 | Job queue equals the TLA+ model after every command (enqueue, replay, out-of-order delivery, acquire, deploy and teardown steps with Docker failures, daemon crash, host reboot, stale leases); lock integrity, monotonicity, no orphaned resources; every job completes and the host converges | `internal/store`     | `rapid.StateMachine` (`TestJobStore_StateMachine`), scenario tests per deviation D1 to D3                       |
 | V1 store (schema 3) equals the V1 reference model after every command: approvals and revocations in any order, park, classification, revocation, re-validation and TTL teardowns, pruning, crashes; every V1 safety and liveness property of `docs/formal/V1-model.md` holds | `internal/store` | `rapid.StateMachine` (`TestV1Store_StateMachine`, at most 500 runs under `make verify`), V1 mutants on the reference model (`TestV1Model_Mutants`) |
 | The audit trail is append-only and any changed, deleted, relinked or forged row breaks the hash chain | `internal/store` | append-only triggers, tamper tests with the triggers dropped |
-| Overlapping read/write transactions never surface `SQLITE_BUSY`                                                                                                                                                                                                                                 | `internal/store`     | 16 writers and 4 long readers on two pools; controls prove the detector fires without the connection parameters |
+| Overlapping read/write transactions never surface `SQLITE_BUSY`, with `Prune` and its `incremental_vacuum` running in parallel                                                                                                                                                                                                                                 | `internal/store`     | 16 writers, 4 long readers on two pools and a pruner; controls prove the detector fires without the connection parameters |
+| Pruning keeps every verdict (V1-I6): a twin store that is never pruned gives every possible next delivery the same verdict, and every mirrored operation the same result; the latest job, unfinished jobs, host builders and the jobs newer than them survive; no transaction deletes more than the batch; freed pages go back to the file system | `internal/store` | `TestJobStore_StateMachine` with a pruned twin, scenario tests (`maintenance_test.go`), page count on a real file |
+| Builds are bounded: at most `PREVIEWD_MAX_CONCURRENT_BUILDS` in flight, a build past `PREVIEWD_BUILD_TIMEOUT` is cancelled and fails its deploy even if the engine then reports success; the prune loop prunes nothing without the host's view | `internal/orchestrator` | rig tests with a fake engine (overlap control, hanging and deadline-ignoring builds, observe failure) |
 
 `make check` runs all of these deterministically (fixed rapid seed, fuzz seed corpora). `make verify` runs rapid at 10,000 checks with random seeds, plus each fuzz target for `FUZZTIME`. Namespace tests skip where unprivileged user namespaces are unavailable. `PREVIEWD_REQUIRE_NS_TESTS=1` and `PREVIEWD_REQUIRE_MLOCK_TEST=1` turn those skips into failures, and CI sets both.
 

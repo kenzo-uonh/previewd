@@ -24,9 +24,10 @@ type Config struct {
 	TraefikContainer    string
 	AllowTmpfsSecrets   bool
 	AllowUnlockedMemory bool
-	MaxConcurrentBuilds int
-	ContainerMemoryMiB  int64
-	ContainerPids       int64
+	// Workers is PREVIEWD_MAX_BUILDS: reconciler workers, jobs run at once.
+	Workers            int
+	ContainerMemoryMiB int64
+	ContainerPids      int64
 
 	// Approval gating (V1 F1). Approvers maps owner/repo, as GitHub spells
 	// it, to the accounts whose review or label approves untrusted code.
@@ -54,6 +55,17 @@ type Config struct {
 	// BuildProbeAddr is the startup probe's TCP target; the zero value means
 	// the default bridge gateway, port 9.
 	BuildProbeAddr netip.AddrPort
+	// MaxConcurrentBuilds bounds the builds in flight across all workers:
+	// they share the daemon-level BuildKit limits (D-V1-4). BuildTimeout
+	// cancels a build request; the deploy then fails (failure = 'build').
+	MaxConcurrentBuilds int
+	BuildTimeout        time.Duration
+
+	// Database maintenance (V1 F3): Prune every PruneInterval, in
+	// transactions of at most PruneBatch rows, what is older than Retention.
+	Retention     time.Duration
+	PruneInterval time.Duration
+	PruneBatch    int
 
 	// WebhookSecretCredential names the systemd credential holding the
 	// webhook HMAC secret: read from $CREDENTIALS_DIRECTORY, never from the
@@ -88,6 +100,21 @@ const (
 	maxRevalidateGrace        = 24 * time.Hour
 	defaultMaxBuildContextMiB = 512
 	maxBuildContextMiB        = 16384
+	defaultWorkers            = 2
+	maxWorkers                = 64
+	defaultConcurrentBuilds   = 1
+	maxConcurrentBuilds       = 16
+	defaultBuildTimeout       = 20 * time.Minute
+	minBuildTimeout           = time.Minute
+	maxBuildTimeout           = 2 * time.Hour
+	defaultRetention          = 720 * time.Hour
+	minRetention              = 24 * time.Hour
+	maxRetention              = 10 * 8760 * time.Hour
+	defaultPruneInterval      = time.Hour
+	maxPruneInterval          = 24 * time.Hour
+	defaultPruneBatch         = 500
+	minPruneBatch             = 10
+	maxPruneBatch             = 10000
 )
 
 // defaultStagingDir mirrors secrets.DefaultStagingDir; config imports
@@ -167,11 +194,9 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
-	maxBuilds := 2
-	if mbStr := os.Getenv("PREVIEWD_MAX_BUILDS"); mbStr != "" {
-		if mb, err := strconv.Atoi(mbStr); err == nil && mb > 0 {
-			maxBuilds = mb
-		}
+	workers, err := boundedInt("PREVIEWD_MAX_BUILDS", defaultWorkers, 1, maxWorkers)
+	if err != nil {
+		return nil, err
 	}
 
 	memoryMiB, err := positiveInt("PREVIEWD_CONTAINER_MEMORY_MIB", 512)
@@ -245,6 +270,27 @@ func Load() (*Config, error) {
 		}
 	}
 
+	concurrentBuilds, err := boundedInt("PREVIEWD_MAX_CONCURRENT_BUILDS", defaultConcurrentBuilds, 1, maxConcurrentBuilds)
+	if err != nil {
+		return nil, err
+	}
+	buildTimeout, err := boundedDuration("PREVIEWD_BUILD_TIMEOUT", defaultBuildTimeout, minBuildTimeout, maxBuildTimeout)
+	if err != nil {
+		return nil, err
+	}
+	retention, err := boundedDuration("PREVIEWD_RETENTION", defaultRetention, minRetention, maxRetention)
+	if err != nil {
+		return nil, err
+	}
+	pruneInterval, err := boundedDuration("PREVIEWD_PRUNE_INTERVAL", defaultPruneInterval, time.Minute, maxPruneInterval)
+	if err != nil {
+		return nil, err
+	}
+	pruneBatch, err := boundedInt("PREVIEWD_PRUNE_BATCH", defaultPruneBatch, minPruneBatch, maxPruneBatch)
+	if err != nil {
+		return nil, err
+	}
+
 	ghesURL, err := validate.GHESURL(os.Getenv("PREVIEWD_GHES_URL"))
 	if err != nil {
 		return nil, fmt.Errorf("PREVIEWD_GHES_URL is required: %w", err)
@@ -288,7 +334,7 @@ func Load() (*Config, error) {
 		TraefikContainer:    traefikContainer,
 		AllowTmpfsSecrets:   allowTmpfs,
 		AllowUnlockedMemory: allowUnlocked,
-		MaxConcurrentBuilds: maxBuilds,
+		Workers:             int(workers),
 		ContainerMemoryMiB:  memoryMiB,
 		ContainerPids:       pids,
 		Approvers:           approvers,
@@ -304,6 +350,12 @@ func Load() (*Config, error) {
 		BuildKitCgroup:       buildkitCgroup,
 		AllowUnboundedBuilds: unbounded,
 		BuildProbeAddr:       probeAddr,
+		MaxConcurrentBuilds:  int(concurrentBuilds),
+		BuildTimeout:         buildTimeout,
+
+		Retention:     retention,
+		PruneInterval: pruneInterval,
+		PruneBatch:    int(pruneBatch),
 
 		WebhookSecretCredential: webhookSecretCred,
 		GHESURL:                 ghesURL,

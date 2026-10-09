@@ -25,6 +25,10 @@ services:
     dns:
       - 127.0.0.1
     read_only: true
+    # Never the daemon's default parent: with the BuildKit drop-in
+    # (docker.service.d/previewd-builds.conf) that is the build slice, which
+    # must hold build steps only (D-V1-4).
+    cgroup_parent: system.slice
     cap_drop:
       - ALL
     cap_add:

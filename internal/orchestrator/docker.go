@@ -412,9 +412,10 @@ func containerSpec(env Environment, limits Limits) (*container.Config, *containe
 		SecurityOpt:    []string{"no-new-privileges:true"},
 		ReadonlyRootfs: true,
 		Resources: container.Resources{
-			Memory:     limits.MemoryBytes,
-			MemorySwap: limits.MemoryBytes,
-			PidsLimit:  &pids,
+			CgroupParent: EnvCgroupParent,
+			Memory:       limits.MemoryBytes,
+			MemorySwap:   limits.MemoryBytes,
+			PidsLimit:    &pids,
 		},
 		Mounts: []mount.Mount{
 			{
@@ -432,6 +433,15 @@ func containerSpec(env Environment, limits Limits) (*container.Config, *containe
 	}
 	return cfg, hostCfg, nil
 }
+
+// EnvCgroupParent is the cgroup parent of every environment container,
+// named rather than left to the daemon: the BuildKit drop-in
+// (deployments/docker.service.d/previewd-builds.conf) makes the daemon's
+// default parent the build slice, and an environment there would share the
+// builds' limits and leave the subtree busy, which the startup build probe
+// refuses (D-V1-4). system.slice is the systemd driver's own default; with
+// the cgroupfs driver it is a plain directory.
+const EnvCgroupParent = "system.slice"
 
 // Deploy starts the environment's container on its internal network only,
 // joins the proxy to that network, and returns the address the route

@@ -232,8 +232,14 @@ func main() {
 		AppPort:              appPort,
 		AllowedBaseImages:    cfg.AllowedBaseImages,
 		MaxBuildContextBytes: cfg.MaxBuildContextBytes,
+		MaxConcurrentBuilds:  cfg.MaxConcurrentBuilds,
+		BuildTimeout:         cfg.BuildTimeout,
 		RevalidateInterval:   cfg.RevalidateInterval,
 		RevalidateGrace:      cfg.RevalidateGrace,
+		Retention:            cfg.Retention,
+		DeliveryMaxAge:       cfg.DeliveryMaxAge,
+		PruneInterval:        cfg.PruneInterval,
+		PruneBatch:           cfg.PruneBatch,
 	})
 	if err != nil {
 		logger.Error("Reconciler initialization failure", "error", err)
@@ -250,11 +256,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Build bounds (D-V1-4, V1-I12): builds share the daemon-level BuildKit
+	// limits, so more than one at a time needs those limits scaled.
+	if cfg.MaxConcurrentBuilds > 1 {
+		logger.Warn("More than one build at a time: the BuildKit cgroup limits must be scaled for them",
+			"max_concurrent_builds", cfg.MaxConcurrentBuilds, "build_cgroup", cfg.BuildKitCgroup)
+	}
+	logger.Info("Build bounds armed", "workers", cfg.Workers, "max_concurrent_builds", cfg.MaxConcurrentBuilds,
+		"build_timeout", cfg.BuildTimeout)
+
 	var background sync.WaitGroup
-	background.Go(func() { reconciler.Run(ctx, cfg.MaxConcurrentBuilds) })
+	background.Go(func() { reconciler.Run(ctx, cfg.Workers) })
 	// Re-validation of every running environment (D-V1-5, V1-I4).
 	background.Go(func() { reconciler.Revalidate(ctx) })
 	logger.Info("Re-validation loop running", "interval", cfg.RevalidateInterval, "grace", cfg.RevalidateGrace)
+	// Database maintenance (V1 F3): after the sweep, never before (the
+	// store refuses), and only with V1-I7 in the handler (D2), which keeps
+	// a pruned delivery from coming back as a new intent.
+	background.Go(func() { reconciler.Maintain(ctx) })
+	logger.Info("Maintenance loop running", "interval", cfg.PruneInterval, "retention", cfg.Retention, "batch", cfg.PruneBatch)
 	apiServer, err := api.NewServer(logger, cfg, webhookSecret, db, reconciler, ghes)
 	if err != nil {
 		logger.Error("API server refused", "error", err)

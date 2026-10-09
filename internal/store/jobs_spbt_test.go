@@ -14,6 +14,18 @@ package store
 // and that the model's invariants hold on the database and the host. After
 // the random sequence it drains the queue fault-free and checks the
 // liveness properties.
+//
+// F2 (V1 spec, phase F; V1-I6): a twin store receives every operation the
+// store receives, plus Prune at random points; the store itself is never
+// pruned. After each Prune, every possible next delivery (a fresh one at
+// each seq of each environment, and a redelivery of each delivery ever
+// recorded) gets the same verdict from both, the only difference allowed
+// being a forgotten delivery's redelivery: stale in the pruned twin where
+// the store says replay, and never accepted. Every mirrored operation
+// returns the same result from both, so pruning changes nothing the queue
+// does. A captured body resent under a fresh delivery ID reaches the store
+// only within V1-I7's window (the handler refuses it outside), which
+// pruning never reaches.
 
 import (
 	"context"
@@ -35,6 +47,9 @@ var spbtEnvs = []string{"pr-1-0a0a0a0a0a", "pr-2-0b0b0b0b0b", "pr-3-0c0c0c0c0c"}
 const (
 	spbtWorkers = 2
 	spbtMaxSeq  = 12
+	// spbtDeliveryMaxAge stands for PREVIEWD_DELIVERY_MAX_AGE: the V1-I7
+	// window of the handler and Prune's delivery horizon.
+	spbtDeliveryMaxAge = time.Minute
 )
 
 // isBusy reports SQLITE_BUSY (any extended code), the error the queue must
@@ -77,12 +92,13 @@ type worker struct {
 }
 
 type modelDelivery struct {
-	EnvID   string
-	Seq     int64
-	Verdict Verdict
-	Type    JobType
-	Payload string
-	Source  Source
+	EnvID      string
+	Seq        int64
+	Verdict    Verdict
+	Type       JobType
+	Payload    string
+	Source     Source
+	ReceivedAt time.Time // the signed time V1-I7 binds a resent body to
 }
 
 type previewdMachine struct {
@@ -92,6 +108,16 @@ type previewdMachine struct {
 
 	store *Store
 	now   time.Time
+
+	// F2: pruned is the twin that Prune runs on. rerecorded lists the
+	// deliveries it forgot and then recorded again, stale, on a GitHub
+	// redelivery; store still holds them with their first verdict.
+	pruned     *Store
+	rerecorded map[string]bool
+	pruneStats PruneStats // summed over the run's Prune commands
+	// forgottenProbes counts redeliveries of forgotten deliveries judged
+	// by checkNextVerdicts.
+	forgottenProbes int
 
 	// Reference model.
 	jobs       []Job // index = ID-1
@@ -129,6 +155,7 @@ func newPreviewdMachine(t *rapid.T, base string) *previewdMachine {
 		deliveries: map[string]modelDelivery{},
 		payloads:   map[string]bool{},
 		host:       map[string]fakeEnv{},
+		rerecorded: map[string]bool{},
 	}
 	// Init: each environment may hold a leftover from an earlier install
 	// that no job tracks.
@@ -141,9 +168,25 @@ func newPreviewdMachine(t *rapid.T, base string) *previewdMachine {
 	return m
 }
 
+// stores is the store and its pruned twin: every operation but Prune runs
+// on both.
+func (m *previewdMachine) stores() []*Store {
+	return []*Store{m.store, m.pruned}
+}
+
+// mustBoth runs fn on the store and on its twin; both must succeed.
+func (m *previewdMachine) mustBoth(t *rapid.T, what string, fn func(*Store) error) {
+	t.Helper()
+	m.must(t, fn(m.store), what)
+	m.must(t, fn(m.pruned), what+" (pruned twin)")
+}
+
 func (m *previewdMachine) cleanup(t *rapid.T) {
-	if m.store != nil {
-		if err := m.store.Close(); err != nil {
+	for _, s := range []*Store{m.store, m.pruned} {
+		if s == nil {
+			continue
+		}
+		if err := s.Close(); err != nil {
 			t.Errorf("close store: %v", err)
 		}
 	}
@@ -152,14 +195,20 @@ func (m *previewdMachine) cleanup(t *rapid.T) {
 	}
 }
 
-// boot opens the store and runs the startup sweep against the model's.
+// boot opens the store and its twin and runs the startup sweep against the
+// model's: both sweeps must return the same result.
 func (m *previewdMachine) boot(t *rapid.T) {
 	s, err := NewStore(m.ctx, m.path)
 	m.must(t, err, "open store")
 	m.store = s
+	p, err := NewStore(m.ctx, m.dir+"/pruned.sqlite")
+	m.must(t, err, "open pruned twin")
+	m.pruned = p
 
-	if _, _, err := s.Acquire(m.ctx, m.now); !errors.Is(err, ErrNotSwept) {
-		t.Fatalf("acquire before the sweep: got %v, want ErrNotSwept", err)
+	for _, s := range m.stores() {
+		if _, _, err := s.Acquire(m.ctx, m.now); !errors.Is(err, ErrNotSwept) {
+			t.Fatalf("acquire before the sweep: got %v, want ErrNotSwept", err)
+		}
 	}
 
 	var observed []Observation
@@ -169,6 +218,11 @@ func (m *previewdMachine) boot(t *rapid.T) {
 	}
 	got, err := s.StartupSweep(m.ctx, m.now, observed)
 	m.must(t, err, "startup sweep")
+	twin, err := p.StartupSweep(m.ctx, m.now, observed)
+	m.must(t, err, "startup sweep (pruned twin)")
+	if twin.Epoch != got.Epoch || !slices.Equal(twin.Destroy, got.Destroy) {
+		t.Fatalf("sweep of the pruned twin = %+v, store = %+v", twin, got)
+	}
 
 	want := m.modelSweep()
 	if got.Epoch != m.epoch {
@@ -255,13 +309,21 @@ func (m *previewdMachine) ReceiveWebhook(t *rapid.T) {
 }
 
 // ForgedRedelivery: a captured body resent under a new delivery ID and a
-// later timestamp (the header is unsigned). Replay protection by payload
-// drops it.
+// later timestamp (the header is unsigned). The handler refuses it once its
+// signed time is outside V1-I7's window; within it, replay protection by
+// payload drops it, in the pruned twin too: Prune keeps every delivery
+// longer than the window.
 func (m *previewdMachine) ForgedRedelivery(t *rapid.T) {
 	if len(m.deliveries) == 0 {
 		t.Skip("no delivery yet")
 	}
 	orig := m.deliveries[rapid.SampledFrom(slices.Sorted(maps.Keys(m.deliveries))).Draw(t, "captured")]
+	if m.now.Sub(orig.ReceivedAt) > spbtDeliveryMaxAge {
+		return // V1-I7: refused (400) before the store
+	}
+	if m.forgotten(t, "", orig.Payload) {
+		t.Fatalf("V1-I7 ordering: a body signed %s ago passes the window but the pruned twin forgot it", m.now.Sub(orig.ReceivedAt))
+	}
 	m.nextID++
 	m.receive(t, Delivery{
 		ID: fmt.Sprintf("d-%04d", m.nextID), PayloadSHA256: orig.Payload, EnvID: orig.EnvID,
@@ -269,9 +331,49 @@ func (m *previewdMachine) ForgedRedelivery(t *rapid.T) {
 	})
 }
 
-func (m *previewdMachine) receive(t *rapid.T, d Delivery) {
+// forgotten reports whether the pruned twin holds no delivery with this ID
+// or this payload.
+func (m *previewdMachine) forgotten(t *rapid.T, id, payload string) bool {
+	var n int
+	m.must(t, m.pruned.db.QueryRowContext(m.ctx, `SELECT count(*) FROM deliveries WHERE delivery_id = ? OR payload_sha256 = ?`, id, payload).Scan(&n),
+		"pruned twin: replay keys")
+	return n == 0
+}
+
+// enqueueBoth records d in the store and in its pruned twin and checks the
+// twin's verdict against the store's (twinVerdict).
+func (m *previewdMachine) enqueueBoth(t *rapid.T, d Delivery) (Verdict, int64) {
+	forgotten := m.forgotten(t, d.ID, d.PayloadSHA256)
 	verdict, jobID, err := m.store.Enqueue(m.ctx, d)
 	m.must(t, err, "enqueue")
+	pv, pid, err := m.pruned.Enqueue(m.ctx, d)
+	m.must(t, err, "enqueue (pruned twin)")
+	if m.twinVerdict(t, d, forgotten, verdict, jobID, pv, pid) {
+		m.rerecorded[d.ID] = true
+	}
+	return verdict, jobID
+}
+
+// twinVerdict checks the pruned twin's verdict pv/pid on d against the
+// store's v/id. They are equal, except for a redelivery of a delivery the
+// twin forgot: stale there, replay in the store, and no job in either. It
+// reports that exception.
+func (m *previewdMachine) twinVerdict(t *rapid.T, d Delivery, forgotten bool, v Verdict, id int64, pv Verdict, pid int64) bool {
+	t.Helper()
+	if v == VerdictReplay && forgotten {
+		if pv != VerdictStale || pid != 0 {
+			t.Fatalf("V1-I6: redelivery %s (env %s, seq %d) of a pruned delivery = %s/%d in the twin, want stale", d.ID, d.EnvID, d.Seq, pv, pid)
+		}
+		return true
+	}
+	if pv != v || pid != id {
+		t.Fatalf("V1-I6: delivery %s (env %s, seq %d) = %s/%d in the pruned twin, %s/%d in the store", d.ID, d.EnvID, d.Seq, pv, pid, v, id)
+	}
+	return false
+}
+
+func (m *previewdMachine) receive(t *rapid.T, d Delivery) {
+	verdict, jobID := m.enqueueBoth(t, d)
 
 	if _, seen := m.deliveries[d.ID]; seen || m.payloads[d.PayloadSHA256] {
 		if verdict != VerdictReplay || jobID != 0 {
@@ -291,7 +393,7 @@ func (m *previewdMachine) receive(t *rapid.T, d Delivery) {
 		m.jobs = append(m.jobs, Job{ID: wantID, EnvID: d.EnvID, Type: d.Type, Origin: OriginWebhook, Seq: d.Seq,
 			Status: StatusQueued, Trust: TrustUnclassified, CreatedAt: d.ReceivedAt.UnixMilli(), Source: d.Source})
 	}
-	m.deliveries[d.ID] = modelDelivery{EnvID: d.EnvID, Seq: d.Seq, Verdict: want, Type: d.Type, Payload: d.PayloadSHA256, Source: d.Source}
+	m.deliveries[d.ID] = modelDelivery{EnvID: d.EnvID, Seq: d.Seq, Verdict: want, Type: d.Type, Payload: d.PayloadSHA256, Source: d.Source, ReceivedAt: d.ReceivedAt}
 	m.payloads[d.PayloadSHA256] = true
 	if verdict != want || jobID != wantID {
 		t.Fatalf("enqueue %+v = %s/%d, model %s/%d", d, verdict, jobID, want, wantID)
@@ -305,8 +407,7 @@ func (m *previewdMachine) Redeliver(t *rapid.T) {
 	}
 	id := rapid.SampledFrom(slices.Sorted(maps.Keys(m.deliveries))).Draw(t, "delivery")
 	d := m.deliveries[id]
-	verdict, jobID, err := m.store.Enqueue(m.ctx, Delivery{ID: id, PayloadSHA256: d.Payload, EnvID: d.EnvID, Type: d.Type, Seq: d.Seq, Source: d.Source, ReceivedAt: m.now})
-	m.must(t, err, "redeliver")
+	verdict, jobID := m.enqueueBoth(t, Delivery{ID: id, PayloadSHA256: d.Payload, EnvID: d.EnvID, Type: d.Type, Seq: d.Seq, Source: d.Source, ReceivedAt: m.now})
 	if verdict != VerdictReplay || jobID != 0 {
 		t.Fatalf("redelivery of %s = %s/%d, want replay", id, verdict, jobID)
 	}
@@ -323,6 +424,11 @@ func (m *previewdMachine) acquire(t *rapid.T, w int) bool {
 	m.must(t, err, "list jobs")
 	lease, ok, err := m.store.Acquire(m.ctx, m.now)
 	m.must(t, err, "acquire")
+	twin, twinOK, err := m.pruned.Acquire(m.ctx, m.now)
+	m.must(t, err, "acquire (pruned twin)")
+	if twinOK != ok || twin != lease {
+		t.Fatalf("pruned twin leased %+v (%v), store %+v (%v)", twin, twinOK, lease, ok)
+	}
 
 	wantID := m.modelNext()
 	if !ok {
@@ -359,7 +465,7 @@ func (m *previewdMachine) acquire(t *rapid.T, w int) bool {
 	if lease.Type == JobDeploy {
 		// AuthorizeDeploy: the MVP has no approval gate, every PR is
 		// trusted. A classified deploy is never requeued (failDeploy).
-		m.must(t, m.store.Classify(m.ctx, lease, Classification{Trust: TrustTrusted}), "classify deploy")
+		m.mustBoth(t, "classify deploy", func(s *Store) error { return s.Classify(m.ctx, lease, Classification{Trust: TrustTrusted}) })
 		m.jobs[wantID-1].Trust = TrustTrusted
 		m.workers[w].next = stepExecuteDeploy
 	}
@@ -432,18 +538,20 @@ func (m *previewdMachine) step(t *rapid.T, w int, ok bool) {
 		m.host[l.EnvID] = h
 		wk.next = stepCommitDeploy
 	case stepCommitDeploy:
-		m.must(t, m.store.Finish(m.ctx, l, StatusSuccess, m.now), "commit deploy")
+		m.mustBoth(t, "commit deploy", func(s *Store) error { return s.Finish(m.ctx, l, StatusSuccess, m.now) })
 		m.jobs[l.JobID-1].Status, m.jobs[l.JobID-1].FinishedAt = StatusSuccess, m.now.UnixMilli()
 		*wk = worker{}
 	case stepExecuteTeardown:
 		if !ok {
 			// Transient failure: back to QUEUED with backoff, never FAILED.
-			if err := m.store.Finish(m.ctx, l, StatusFailed, m.now); !errors.Is(err, ErrTeardownCannotFail) {
-				t.Fatalf("finishing a teardown as FAILED: got %v, want ErrTeardownCannotFail", err)
+			for _, s := range m.stores() {
+				if err := s.Finish(m.ctx, l, StatusFailed, m.now); !errors.Is(err, ErrTeardownCannotFail) {
+					t.Fatalf("finishing a teardown as FAILED: got %v, want ErrTeardownCannotFail", err)
+				}
 			}
 			j := &m.jobs[l.JobID-1]
 			notBefore := m.now.Add(backoff(j.Attempts))
-			m.must(t, m.store.Requeue(m.ctx, l, notBefore), "requeue teardown")
+			m.mustBoth(t, "requeue teardown", func(s *Store) error { return s.Requeue(m.ctx, l, notBefore) })
 			j.Status, j.Attempts, j.NotBefore = StatusQueued, j.Attempts+1, notBefore.UnixMilli()
 			*wk = worker{}
 			return
@@ -451,7 +559,7 @@ func (m *previewdMachine) step(t *rapid.T, w int, ok bool) {
 		delete(m.host, l.EnvID)
 		wk.next = stepCommitTeardown
 	case stepCommitTeardown:
-		m.must(t, m.store.Finish(m.ctx, l, StatusSuccess, m.now), "commit teardown")
+		m.mustBoth(t, "commit teardown", func(s *Store) error { return s.Finish(m.ctx, l, StatusSuccess, m.now) })
 		m.jobs[l.JobID-1].Status, m.jobs[l.JobID-1].FinishedAt = StatusSuccess, m.now.UnixMilli()
 		*wk = worker{}
 	default:
@@ -466,11 +574,13 @@ func backoff(attempts int64) time.Duration {
 // failDeploy rolls the environment back to absent and fails the job.
 func (m *previewdMachine) failDeploy(t *rapid.T, w int) {
 	l := m.workers[w].lease
-	if err := m.store.Requeue(m.ctx, l, m.now); !errors.Is(err, ErrDeployCannotRetry) {
-		t.Fatalf("requeueing a deploy: got %v, want ErrDeployCannotRetry", err)
+	for _, s := range m.stores() {
+		if err := s.Requeue(m.ctx, l, m.now); !errors.Is(err, ErrDeployCannotRetry) {
+			t.Fatalf("requeueing a deploy: got %v, want ErrDeployCannotRetry", err)
+		}
 	}
 	delete(m.host, l.EnvID)
-	m.must(t, m.store.Finish(m.ctx, l, StatusFailed, m.now), "fail deploy")
+	m.mustBoth(t, "fail deploy", func(s *Store) error { return s.Finish(m.ctx, l, StatusFailed, m.now) })
 	m.jobs[l.JobID-1].Status, m.jobs[l.JobID-1].FinishedAt = StatusFailed, m.now.UnixMilli()
 	m.workers[w] = worker{}
 }
@@ -481,7 +591,8 @@ func (m *previewdMachine) failDeploy(t *rapid.T, w int) {
 func (m *previewdMachine) SimulateCrash(t *rapid.T) {
 	reboot := rapid.Bool().Draw(t, "host reboot")
 	m.must(t, m.store.Close(), "close store")
-	m.store = nil
+	m.must(t, m.pruned.Close(), "close pruned twin")
+	m.store, m.pruned = nil, nil
 	for w := range m.workers {
 		if m.workers[w].next != stepIdle {
 			m.stale = append(m.stale, m.workers[w].lease)
@@ -506,20 +617,96 @@ func (m *previewdMachine) StaleWorker(t *rapid.T) {
 	i := rapid.IntRange(0, len(m.stale)-1).Draw(t, "stale lease")
 	l := m.stale[i]
 	m.stale = slices.Delete(m.stale, i, i+1)
-	var err error
-	if l.Type == JobTeardown && rapid.Bool().Draw(t, "requeue") {
-		err = m.store.Requeue(m.ctx, l, m.now)
-	} else {
-		err = m.store.Finish(m.ctx, l, StatusSuccess, m.now)
-	}
-	if !errors.Is(err, ErrLeaseLost) {
-		t.Fatalf("stale lease %+v: got %v, want ErrLeaseLost", l, err)
+	requeue := l.Type == JobTeardown && rapid.Bool().Draw(t, "requeue")
+	for _, s := range m.stores() {
+		var err error
+		if requeue {
+			err = s.Requeue(m.ctx, l, m.now)
+		} else {
+			err = s.Finish(m.ctx, l, StatusSuccess, m.now)
+		}
+		if !errors.Is(err, ErrLeaseLost) {
+			t.Fatalf("stale lease %+v: got %v, want ErrLeaseLost", l, err)
+		}
 	}
 }
 
-// AdvanceClock lets backoffs expire.
+// AdvanceClock lets backoffs expire, or (long) jobs and deliveries age
+// past Prune's horizons.
 func (m *previewdMachine) AdvanceClock(t *rapid.T) {
-	m.now = m.now.Add(time.Duration(rapid.Int64Range(0, 70_000).Draw(t, "ms")) * time.Millisecond)
+	limit := int64(70_000)
+	if rapid.Bool().Draw(t, "long") {
+		limit = int64(20 * time.Minute / time.Millisecond)
+	}
+	m.now = m.now.Add(time.Duration(rapid.Int64Range(0, limit).Draw(t, "ms")) * time.Millisecond)
+}
+
+// Prune runs on the pruned twin only, with a drawn retention and batch and
+// the builders of what exists on the host, then checks the verdict of every
+// possible next delivery against the store's (V1-I6).
+func (m *previewdMachine) Prune(t *rapid.T) {
+	m.prune(t, time.Duration(rapid.Int64Range(0, 180_000).Draw(t, "retention ms"))*time.Millisecond)
+}
+
+func (m *previewdMachine) prune(t *rapid.T, retention time.Duration) {
+	req := PruneRequest{
+		Now:            m.now,
+		Retention:      retention,
+		DeliveryMaxAge: spbtDeliveryMaxAge,
+		Batch:          rapid.IntRange(1, 3).Draw(t, "batch"),
+	}
+	for _, e := range slices.Sorted(maps.Keys(m.host)) {
+		if h := m.host[e]; h.exists() && h.JobID != 0 {
+			req.Builders = append(req.Builders, h.JobID)
+		}
+	}
+	stats, err := m.pruned.Prune(m.ctx, req)
+	m.must(t, err, "prune")
+	if stats.MaxBatch > int64(req.Batch) {
+		t.Fatalf("prune deleted %d rows in one transaction, batch %d", stats.MaxBatch, req.Batch)
+	}
+	m.pruneStats.Jobs += stats.Jobs
+	m.pruneStats.Deliveries += stats.Deliveries
+	m.checkNextVerdicts(t)
+}
+
+// probe is the verdict s would give d, in a transaction rolled back.
+func (m *previewdMachine) probe(t *rapid.T, s *Store, d Delivery) (Verdict, int64) {
+	tx, err := s.db.BeginTx(m.ctx, nil)
+	m.must(t, err, "probe: begin")
+	v, id, err := enqueueTx(m.ctx, tx, d)
+	m.must(t, err, "probe")
+	m.must(t, tx.Rollback(), "probe: rollback")
+	return v, id
+}
+
+// checkNextVerdicts asks both stores for the verdict of every possible next
+// delivery: a fresh one at each seq of each environment (the stale rule),
+// and a redelivery of each delivery ever recorded (replay protection).
+func (m *previewdMachine) checkNextVerdicts(t *rapid.T) {
+	for _, e := range spbtEnvs {
+		for seq := int64(1); seq <= spbtMaxSeq+1; seq++ {
+			d := testDelivery("probe", e, JobDeploy, seq)
+			d.ReceivedAt = m.now
+			v, id := m.probe(t, m.store, d)
+			pv, pid := m.probe(t, m.pruned, d)
+			m.twinVerdict(t, d, false, v, id, pv, pid)
+		}
+	}
+	for _, id := range slices.Sorted(maps.Keys(m.deliveries)) {
+		r := m.deliveries[id]
+		d := Delivery{ID: id, PayloadSHA256: r.Payload, EnvID: r.EnvID, Type: r.Type, Seq: r.Seq, Source: r.Source, ReceivedAt: m.now}
+		forgotten := m.forgotten(t, d.ID, d.PayloadSHA256)
+		if forgotten {
+			m.forgottenProbes++
+		}
+		v, vid := m.probe(t, m.store, d)
+		if v != VerdictReplay {
+			t.Fatalf("redelivery of %s = %s in the store, want replay", id, v)
+		}
+		pv, pid := m.probe(t, m.pruned, d)
+		m.twinVerdict(t, d, forgotten, v, vid, pv, pid)
+	}
 }
 
 func (m *previewdMachine) pickWorker(t *rapid.T, busy bool) int {
@@ -545,6 +732,7 @@ func (m *previewdMachine) Check(t *rapid.T) {
 		t.Fatalf("jobs table diverged from the model\n db:    %+v\n model: %+v", jobs, m.jobs)
 	}
 	m.checkDeliveries(t)
+	m.checkPrunedTwin(t, jobs)
 
 	// 2. Lock integrity, asked of SQLite itself.
 	var maxInProgress int
@@ -619,6 +807,60 @@ func (m *previewdMachine) Check(t *rapid.T) {
 	}
 }
 
+// checkPrunedTwin: the pruned twin holds a subset of the store's rows,
+// unchanged, and every row V1-I6 protects: each non-terminal job, the
+// latest job of each environment, the builder of each environment on the
+// host and every job newer than it (the sweep's Keep reads them). MaxSeq
+// of each environment is the same in both.
+func (m *previewdMachine) checkPrunedTwin(t *rapid.T, jobs []Job) {
+	twin, err := m.pruned.Jobs(m.ctx)
+	m.must(t, err, "list jobs (pruned twin)")
+	kept := map[int64]bool{}
+	for _, j := range twin {
+		if j.ID < 1 || j.ID > int64(len(jobs)) || jobs[j.ID-1] != j {
+			t.Fatalf("pruned twin holds job %+v, the store does not", j)
+		}
+		kept[j.ID] = true
+	}
+	latest := m.modelLatest()
+	for _, j := range jobs {
+		terminal := j.Status == StatusSuccess || j.Status == StatusFailed || j.Status == StatusSkipped
+		h := m.host[j.EnvID]
+		readBySweep := h.exists() && h.JobID != 0 && h.JobID <= int64(len(jobs)) && j.Seq >= jobs[h.JobID-1].Seq
+		if !kept[j.ID] && (!terminal || latest[j.EnvID] == j.ID || readBySweep) {
+			t.Fatalf("V1-I6: Prune removed job %+v (latest of its environment %d, host builder %d)", j, latest[j.EnvID], h.JobID)
+		}
+	}
+	for _, e := range spbtEnvs {
+		var want, got int64
+		m.must(t, m.store.db.QueryRowContext(m.ctx, `SELECT coalesce(max(seq), 0) FROM jobs WHERE preview_id = ?`, e).Scan(&want), "max seq")
+		m.must(t, m.pruned.db.QueryRowContext(m.ctx, `
+			SELECT max(coalesce((SELECT max(seq) FROM jobs WHERE preview_id = ?1), 0),
+				coalesce((SELECT seq FROM watermarks WHERE preview_id = ?1), 0))`, e).Scan(&got), "max seq (pruned twin)")
+		if got != want {
+			t.Fatalf("V1-I6: MaxSeq(%s) = %d in the pruned twin, %d in the store", e, got, want)
+		}
+	}
+
+	rows, err := m.pruned.db.QueryContext(m.ctx, `SELECT delivery_id, preview_id, seq, verdict, payload_sha256 FROM deliveries`)
+	m.must(t, err, "list deliveries (pruned twin)")
+	for rows.Next() {
+		var id, env, verdict, payload string
+		var seq int64
+		m.must(t, rows.Scan(&id, &env, &seq, &verdict, &payload), "scan delivery (pruned twin)")
+		d, ok := m.deliveries[id]
+		want := d.Verdict
+		if m.rerecorded[id] {
+			want = VerdictStale
+		}
+		if !ok || env != d.EnvID || seq != d.Seq || payload != d.Payload || Verdict(verdict) != want {
+			t.Fatalf("pruned twin holds delivery %s (%s, %d, %s), model %+v", id, env, seq, verdict, d)
+		}
+	}
+	m.must(t, rows.Err(), "list deliveries (pruned twin)")
+	m.must(t, rows.Close(), "close deliveries (pruned twin)")
+}
+
 func (m *previewdMachine) checkDeliveries(t *rapid.T) {
 	rows, err := m.store.db.QueryContext(m.ctx, `SELECT delivery_id, preview_id, seq, verdict, payload_sha256 FROM deliveries ORDER BY delivery_id`)
 	m.must(t, err, "list deliveries")
@@ -664,6 +906,10 @@ func (m *previewdMachine) drain(t *rapid.T) {
 		}
 	}
 
+	// The drain aged everything past the horizons: a last Prune forgets all
+	// it may, and the verdicts are compared once more.
+	m.prune(t, 0)
+
 	latest := m.modelLatest()
 	for _, j := range m.jobs {
 		if j.Status == StatusQueued || j.Status == StatusInProgress {
@@ -695,15 +941,28 @@ func weightedActions(m *previewdMachine) map[string]func(*rapid.T) {
 	actions["AcquireJob#2"] = m.AcquireJob
 	actions["Step#4"] = m.Step
 	actions["ReceiveWebhook#2"] = m.ReceiveWebhook
+	actions["Prune#2"] = m.Prune
 	return actions
 }
 
 func TestJobStore_StateMachine(t *testing.T) {
 	base := t.TempDir()
+	var runs, prunedJobs, prunedDeliveries, rerecorded int
 	rapid.Check(t, func(t *rapid.T) {
 		m := newPreviewdMachine(t, base)
 		defer m.cleanup(t)
 		t.Repeat(weightedActions(m))
 		m.drain(t)
+		runs++
+		prunedJobs += int(m.pruneStats.Jobs)
+		prunedDeliveries += int(m.pruneStats.Deliveries)
+		rerecorded += len(m.rerecorded) + m.forgottenProbes
 	})
+	// F2 is not vacuous: over the default 100 runs, Prune deleted jobs and
+	// deliveries, and redeliveries of forgotten deliveries were judged.
+	if runs >= 100 && (prunedJobs == 0 || prunedDeliveries == 0 || rerecorded == 0) {
+		t.Fatalf("over %d runs Prune deleted %d jobs and %d deliveries, %d forgotten deliveries came back: the twin compared nothing",
+			runs, prunedJobs, prunedDeliveries, rerecorded)
+	}
+	t.Logf("%d runs: Prune deleted %d jobs and %d deliveries; %d forgotten deliveries redelivered", runs, prunedJobs, prunedDeliveries, rerecorded)
 }

@@ -225,10 +225,14 @@ define
 
     \* Terminal, not the latest of its environment, not the builder of what
     \* runs (the sweep and Safety 2 read it).
+    \* Neither the builder of what exists nor a job newer than it: the
+    \* sweep's Keep reads them all (A1-6; widened by F2, V1-model.md 11).
     PrunableJobs == {j \in DOMAIN db_jobs :
                         /\ db_jobs[j].status \in Terminal
                         /\ j # Latest(db_jobs[j].env_id)
-                        /\ db_jobs[j].ts # environments[db_jobs[j].env_id].deployed_ts}
+                        /\ ~ /\ Exists(db_jobs[j].env_id)
+                             /\ environments[db_jobs[j].env_id].deployed_ts # 0
+                             /\ db_jobs[j].ts >= environments[db_jobs[j].env_id].deployed_ts}
 
     (***********************************************************************)
     (* StartupSweep (MVP D2, D3), on the pre-sweep state.                  *)
@@ -904,10 +908,14 @@ Expirable(e) == /\ TTL > 0 /\ Intact(e) /\ BuilderSucceeded(e) /\ BuilderIsLates
 
 
 
+
+
 PrunableJobs == {j \in DOMAIN db_jobs :
                     /\ db_jobs[j].status \in Terminal
                     /\ j # Latest(db_jobs[j].env_id)
-                    /\ db_jobs[j].ts # environments[db_jobs[j].env_id].deployed_ts}
+                    /\ ~ /\ Exists(db_jobs[j].env_id)
+                         /\ environments[db_jobs[j].env_id].deployed_ts # 0
+                         /\ db_jobs[j].ts >= environments[db_jobs[j].env_id].deployed_ts}
 
 
 

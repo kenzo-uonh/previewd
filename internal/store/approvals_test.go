@@ -484,6 +484,7 @@ func TestPruneRefusesInvalidRequest(t *testing.T) {
 		"negative retention": {Now: t0, Retention: -time.Hour, Batch: 1},
 		"zero batch":         {Now: t0, Retention: time.Hour},
 		"bad builder":        {Now: t0, Retention: time.Hour, Batch: 1, Builders: []int64{0}},
+		"negative yield":     {Now: t0, Retention: time.Hour, Batch: 1, Yield: -time.Millisecond},
 	} {
 		if _, err := s.Prune(context.Background(), req); !errors.Is(err, ErrInvalidPrune) {
 			t.Errorf("%s: %v, want ErrInvalidPrune", name, err)
