@@ -202,6 +202,12 @@ func TestNewReconcilerRefusesInvalidBounds(t *testing.T) {
 		"negative max age":     func(c *ReconcilerConfig) { c.DeliveryMaxAge = -time.Minute },
 		"negative interval":    func(c *ReconcilerConfig) { c.PruneInterval = -time.Minute },
 		"negative prune batch": func(c *ReconcilerConfig) { c.PruneBatch = -1 },
+		"negative disk floor":  func(c *ReconcilerConfig) { c.MinFreeDiskBytes = -1 },
+		"small disk floor":     func(c *ReconcilerConfig) { c.MinFreeDiskBytes = 1<<30 - 1 },
+		"short TTL":            func(c *ReconcilerConfig) { c.EnvTTL = 59 * time.Minute },
+		"negative TTL":         func(c *ReconcilerConfig) { c.EnvTTL = -time.Hour },
+		"TTL set and disabled": func(c *ReconcilerConfig) { c.DisableTTL = true },
+		"relative build dir":   func(c *ReconcilerConfig) { c.BuildDir = "tmp" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			r := newRig(t)
@@ -214,7 +220,8 @@ func TestNewReconcilerRefusesInvalidBounds(t *testing.T) {
 	}
 	cfg := newRig(t).reconciler().cfg
 	if cfg.MaxConcurrentBuilds != 1 || cfg.BuildTimeout != 20*time.Minute || cfg.Retention != 720*time.Hour ||
-		cfg.DeliveryMaxAge != 15*time.Minute || cfg.PruneInterval != time.Hour {
+		cfg.DeliveryMaxAge != 15*time.Minute || cfg.PruneInterval != time.Hour ||
+		cfg.MinFreeDiskBytes != 10240<<20 || cfg.EnvTTL != 168*time.Hour || cfg.DisableTTL {
 		t.Fatalf("defaults = %+v", cfg)
 	}
 }

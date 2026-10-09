@@ -67,6 +67,13 @@ type Config struct {
 	PruneInterval time.Duration
 	PruneBatch    int
 
+	// Auto-cleanup (V1 F5). EnvTTL is 0 when PREVIEWD_ENV_TTL=0 disables
+	// the TTL. A build starts only with MinFreeDiskBytes free on the file
+	// system of DockerDataRoot ("" for the daemon's DockerRootDir).
+	EnvTTL           time.Duration
+	MinFreeDiskBytes int64
+	DockerDataRoot   string
+
 	// WebhookSecretCredential names the systemd credential holding the
 	// webhook HMAC secret: read from $CREDENTIALS_DIRECTORY, never from the
 	// environment or a configured path.
@@ -115,6 +122,11 @@ const (
 	defaultPruneBatch         = 500
 	minPruneBatch             = 10
 	maxPruneBatch             = 10000
+	defaultEnvTTL             = 168 * time.Hour
+	minEnvTTL                 = time.Hour
+	maxEnvTTL                 = 10 * 8760 * time.Hour
+	defaultMinFreeDiskMiB     = 10240
+	minMinFreeDiskMiB         = 1024
 )
 
 // defaultStagingDir mirrors secrets.DefaultStagingDir; config imports
@@ -290,6 +302,20 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	envTTL := time.Duration(0)
+	if os.Getenv("PREVIEWD_ENV_TTL") != "0" {
+		if envTTL, err = boundedDuration("PREVIEWD_ENV_TTL", defaultEnvTTL, minEnvTTL, maxEnvTTL); err != nil {
+			return nil, fmt.Errorf("%w (or 0 to disable)", err)
+		}
+	}
+	minFreeDiskMiB, err := boundedInt("PREVIEWD_MIN_FREE_DISK_MIB", defaultMinFreeDiskMiB, minMinFreeDiskMiB, maxPositiveInt)
+	if err != nil {
+		return nil, err
+	}
+	dataRoot := os.Getenv("PREVIEWD_DOCKER_DATA_ROOT")
+	if dataRoot != "" && (!filepath.IsAbs(dataRoot) || dataRoot != filepath.Clean(dataRoot)) {
+		return nil, fmt.Errorf("invalid PREVIEWD_DOCKER_DATA_ROOT %q: want a clean absolute path", dataRoot)
+	}
 
 	ghesURL, err := validate.GHESURL(os.Getenv("PREVIEWD_GHES_URL"))
 	if err != nil {
@@ -356,6 +382,10 @@ func Load() (*Config, error) {
 		Retention:     retention,
 		PruneInterval: pruneInterval,
 		PruneBatch:    int(pruneBatch),
+
+		EnvTTL:           envTTL,
+		MinFreeDiskBytes: minFreeDiskMiB << 20,
+		DockerDataRoot:   dataRoot,
 
 		WebhookSecretCredential: webhookSecretCred,
 		GHESURL:                 ghesURL,

@@ -25,6 +25,16 @@ type Engine interface {
 	// owns, including leftovers no job tracks.
 	Observe(ctx context.Context) (map[string]EngineState, error)
 	Logs(ctx context.Context, id string) (io.ReadCloser, error)
+	// PruneImages removes every image previewd built (ownership labels)
+	// whose environment is not in keep, and reports the bytes reclaimed. An
+	// image a container still uses is kept (V1-I9).
+	PruneImages(ctx context.Context, keep []string) (reclaimed int64, err error)
+	// PruneBuildCache removes the daemon's unused build cache: no BuildKit
+	// state of a build survives into another PR's (V1-I9, section 2.3).
+	PruneBuildCache(ctx context.Context) (reclaimed int64, err error)
+	// FreeDisk is the space left for unprivileged writers on the file
+	// system of the engine's data root (the deploy's free-disk floor).
+	FreeDisk(ctx context.Context) (int64, error)
 	Close() error
 }
 

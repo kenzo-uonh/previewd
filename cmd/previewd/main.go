@@ -37,6 +37,8 @@ const (
 	// listen, and nothing may answer).
 	buildProbeTimeout = 3 * time.Minute
 	defaultProbePort  = 9
+	// freeDiskTimeout bounds the startup read of the free-disk floor.
+	freeDiskTimeout = 10 * time.Second
 )
 
 func main() {
@@ -120,7 +122,7 @@ func main() {
 	engine, err := orchestrator.NewDockerEngine(cfg.TraefikContainer, orchestrator.Limits{
 		MemoryBytes: cfg.ContainerMemoryMiB << 20,
 		Pids:        cfg.ContainerPids,
-	})
+	}, cfg.DockerDataRoot, hardening.FreeDiskBytes)
 	if err != nil {
 		logger.Error("Docker engine initialization failure", "error", err)
 		os.Exit(1)
@@ -156,6 +158,22 @@ func main() {
 	logger.Info("Build preflight armed",
 		"allowed_base_images", slices.Sorted(maps.Keys(cfg.AllowedBaseImages)),
 		"max_build_context_bytes", cfg.MaxBuildContextBytes)
+
+	// Free-disk floor (V1 F5, V1-I9): the data root must be measurable, or
+	// no deploy could ever start. Below the floor the daemon still starts,
+	// so teardowns and the prune loop can free space; builds are refused.
+	diskCtx, diskCancel := context.WithTimeout(ctx, freeDiskTimeout)
+	free, err := engine.FreeDisk(diskCtx)
+	diskCancel()
+	if err != nil {
+		logger.Error("Free disk of the Docker data root unknown: refusing to start", "data_root", cfg.DockerDataRoot, "error", err)
+		os.Exit(1)
+	}
+	if free < cfg.MinFreeDiskBytes {
+		logger.Error("Free disk below the floor: builds are refused until space is freed",
+			"free_bytes", free, "min_free_bytes", cfg.MinFreeDiskBytes)
+	}
+	logger.Info("Free-disk floor armed", "free_bytes", free, "min_free_bytes", cfg.MinFreeDiskBytes, "data_root", cfg.DockerDataRoot)
 
 	// Startup build probe (V1 F2, E2b, D-V1-4), before the sweep and before
 	// any worker: the request PR builds get must give its RUN step no
@@ -240,6 +258,9 @@ func main() {
 		DeliveryMaxAge:       cfg.DeliveryMaxAge,
 		PruneInterval:        cfg.PruneInterval,
 		PruneBatch:           cfg.PruneBatch,
+		MinFreeDiskBytes:     cfg.MinFreeDiskBytes,
+		EnvTTL:               cfg.EnvTTL,
+		DisableTTL:           cfg.EnvTTL == 0,
 	})
 	if err != nil {
 		logger.Error("Reconciler initialization failure", "error", err)
@@ -274,7 +295,11 @@ func main() {
 	// store refuses), and only with V1-I7 in the handler (D2), which keeps
 	// a pruned delivery from coming back as a new intent.
 	background.Go(func() { reconciler.Maintain(ctx) })
-	logger.Info("Maintenance loop running", "interval", cfg.PruneInterval, "retention", cfg.Retention, "batch", cfg.PruneBatch)
+	if cfg.EnvTTL == 0 {
+		logger.Error("Opt-out active: environments never expire, PREVIEWD_ENV_TTL=0", "opt_out", "PREVIEWD_ENV_TTL")
+	}
+	logger.Info("Maintenance loop running", "interval", cfg.PruneInterval, "retention", cfg.Retention, "batch", cfg.PruneBatch,
+		"env_ttl", cfg.EnvTTL)
 	apiServer, err := api.NewServer(logger, cfg, webhookSecret, db, reconciler, ghes)
 	if err != nil {
 		logger.Error("API server refused", "error", err)

@@ -572,7 +572,9 @@ var failureSteps = []Failure{FailureFetch, FailurePreflight, FailureBuild, Failu
 
 // Fail moves a leased deploy to FAILED at now and records the step that
 // failed, from the closed vocabulary (ErrInvalidFailure otherwise). A
-// teardown never fails (ErrTeardownCannotFail).
+// teardown never fails (ErrTeardownCannotFail). A disk_floor failure is a
+// refusal (V1-I9): its deploy_refused audit row (previewd as actor, at now)
+// is written in the same transaction.
 func (s *Store) Fail(ctx context.Context, l Lease, failure Failure, now time.Time) error {
 	if !slices.Contains(failureSteps, failure) {
 		return fmt.Errorf("fail job %d: %w: %q", l.JobID, ErrInvalidFailure, failure)
@@ -591,9 +593,21 @@ func (s *Store) finish(ctx context.Context, what string, l Lease, status JobStat
 		return err
 	}
 	return s.inTx(ctx, what, func(tx *sql.Tx) error {
-		return updateLease(ctx, tx, what, l,
+		if err := updateLease(ctx, tx, what, l,
 			`UPDATE jobs SET status = ?, finished_at = ?, failure = ? WHERE id = ? AND status = 'IN_PROGRESS' AND lease_epoch = ?`,
-			string(status), now.UnixMilli(), string(failure), l.JobID, l.Epoch)
+			string(status), now.UnixMilli(), string(failure), l.JobID, l.Epoch); err != nil {
+			return err
+		}
+		if failure != FailureDiskFloor {
+			return nil
+		}
+		j, err := scanJob(tx.QueryRowContext(ctx, queryJobByID, l.JobID))
+		if err != nil {
+			return fmt.Errorf("%s job %d: read: %w", what, l.JobID, err)
+		}
+		src := j.Source
+		return appendAudit(ctx, tx, AuditEvent{Kind: AuditDeployRefused, EnvID: j.EnvID, Repo: src.Repo,
+			PRNumber: src.PRNumber, CommitSHA: src.CommitSHA, Detail: string(FailureDiskFloor)}, now)
 	})
 }
 

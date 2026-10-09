@@ -318,6 +318,48 @@ func TestFailRecordsTheFailedStep(t *testing.T) {
 	}
 }
 
+// A disk_floor failure is a refusal (V1-I9): FAILED and its deploy_refused
+// row are one transaction, and a lost lease records neither. Other steps
+// write no audit row.
+func TestFailDiskFloorIsAudited(t *testing.T) {
+	s, _ := sweptStore(t)
+	ctx := context.Background()
+	deliver(t, s, testDelivery("d1", envA, JobDeploy, 1))
+	if err := s.Fail(ctx, acquire(t, s), FailureBuild, t0); err != nil {
+		t.Fatal(err)
+	}
+	if got := auditKinds(t, s); len(got) != 0 {
+		t.Fatalf("a build failure wrote audit rows %v", got)
+	}
+
+	deliver(t, s, testDelivery("d2", envA, JobDeploy, 2))
+	l := acquire(t, s)
+	stale := l
+	stale.Epoch++
+	if err := s.Fail(ctx, stale, FailureDiskFloor, t0); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("Fail with a lost lease = %v, want ErrLeaseLost", err)
+	}
+	if got := auditKinds(t, s); len(got) != 0 {
+		t.Fatalf("a refused Fail wrote audit rows %v", got)
+	}
+	if err := s.Fail(ctx, l, FailureDiskFloor, t0); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := s.Jobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j := jobs[1]; j.Status != StatusFailed || j.Failure != FailureDiskFloor {
+		t.Fatalf("job %+v, want FAILED with failure disk_floor", j)
+	}
+	if got := auditKinds(t, s); !slices.Equal(got, []string{"deploy_refused/disk_floor"}) {
+		t.Fatalf("audit rows %v, want deploy_refused/disk_floor", got)
+	}
+	if err := s.VerifyAudit(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // F2 finding: the sweep's Keep reads the builder of an environment and
 // every newer job. Builder 1 runs, deploy 2 was skipped by teardown 3,
 // which failed and waits requeued: the sweep destroys the environment

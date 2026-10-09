@@ -13,28 +13,34 @@ package orchestrator
 //	               requeue it unclassified (GHES unavailable: remove a revoked
 //	               version first, A2-6; park at the attempt ceiling); then
 //	               ExecuteDeploy (remove previous version, fetch, network,
-//	               build within the build bounds, stage the secret section of
-//	               its trust), StartContainer, PublishRoute, CommitDeploy; any
-//	               failure rolls back and records FAILED with the step that
-//	               failed
-//	  teardown     ExecuteTeardown, CommitTeardown; a failure requeues with
+//	               build within the build bounds and above the free-disk
+//	               floor, the build cache pruned after it, stage the secret
+//	               section of its trust), StartContainer, PublishRoute,
+//	               CommitDeploy; any failure rolls back and records FAILED
+//	               with the step that failed
+//	  teardown     ExecuteTeardown, CommitTeardown, then the images of
+//	               environments gone are pruned; a failure requeues with
 //	               backoff, never FAILED
 //	Revalidator    every interval, each running environment is re-checked
 //	               (D-V1-5); one no longer authorized, or unverifiable past
 //	               the grace period, gets an internal teardown
-//	Maintain       every prune interval, Prune with the builders of what
-//	               exists on the host (V1 F3, V1-I6), then incremental_vacuum
+//	Maintain       every prune interval, the TTL teardowns (V1 G3), Prune
+//	               with the builders of what exists on the host (V1 F3,
+//	               V1-I6), then incremental_vacuum, then the image prune
+//	               (V1 G2, V1-I9)
 
 import (
 	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -58,8 +64,9 @@ type Queue interface {
 	// Revalidator (D-V1-5).
 	Running(ctx context.Context) ([]store.Job, error)
 	EnqueueInternal(ctx context.Context, envID string, origin store.Origin, reason store.RevocationReason, now time.Time, audit store.AuditEvent) (int64, error)
-	// Maintain (V1 F3).
+	// Maintain (V1 F3, G3).
 	Prune(ctx context.Context, req store.PruneRequest) (store.PruneStats, error)
+	Expired(ctx context.Context, ttl time.Duration, now time.Time) ([]string, error)
 }
 
 // Authorizer is the deploy gate (GHESAuthorizer).
@@ -113,6 +120,18 @@ type ReconcilerConfig struct {
 	DeliveryMaxAge time.Duration
 	PruneInterval  time.Duration
 	PruneBatch     int
+	// MinFreeDiskBytes is PREVIEWD_MIN_FREE_DISK_MIB (default 10 GiB, at
+	// least 1 GiB): a build starts only with that much free on the engine's
+	// data root (V1-I9).
+	MinFreeDiskBytes int64
+	// EnvTTL is PREVIEWD_ENV_TTL (default 168 h, at least 1 h): Maintain
+	// queues the teardown of an environment whose running version is older
+	// (V1 G3). DisableTTL is PREVIEWD_ENV_TTL=0; EnvTTL is then 0.
+	EnvTTL     time.Duration
+	DisableTTL bool
+	// BuildDir holds the build directory of each deploy (previewd-build-*);
+	// default os.TempDir(). Startup removes those a crash left behind.
+	BuildDir string
 	// RevalidateInterval and RevalidateGrace are
 	// PREVIEWD_APPROVAL_REVALIDATE_INTERVAL and _GRACE (default 10 m, 1 h);
 	// the grace is never shorter than the interval.
@@ -148,10 +167,27 @@ const (
 	// waiting for the lock retries in each gap instead of timing out behind
 	// a long run of batches (a 500 GitHub does not redeliver).
 	pruneYield = 150 * time.Millisecond
+	// Free-disk floor and TTL (V1 F5).
+	defaultMinFreeDisk = 10240 << 20
+	minFreeDisk        = 1024 << 20
+	defaultEnvTTL      = 168 * time.Hour
+	minEnvTTL          = time.Hour
+	// buildDirPrefix names the build directory of a deploy.
+	buildDirPrefix = "previewd-build-"
+	// pruneTimeout bounds an image prune, which holds deployMu (every
+	// deploy waits on it to start), and a build cache prune before a build,
+	// which holds cacheMu and the build slot: a hung daemon must not hold
+	// them forever.
+	pruneTimeout = 5 * time.Minute
 )
 
 // ErrBuildTimeout fails a build still running at PREVIEWD_BUILD_TIMEOUT.
 var ErrBuildTimeout = errors.New("build cancelled at PREVIEWD_BUILD_TIMEOUT")
+
+// ErrDiskFloor refuses a build below PREVIEWD_MIN_FREE_DISK_MIB, or when
+// the free space cannot be read: the deploy fails with failure =
+// 'disk_floor', audited (V1-I9).
+var ErrDiskFloor = errors.New("free disk below PREVIEWD_MIN_FREE_DISK_MIB")
 
 // Reconciler runs the startup sweep, the deployment workers, the
 // re-validation loop and the maintenance loop.
@@ -160,6 +196,17 @@ type Reconciler struct {
 	wake chan struct{}
 	// builds holds one token per build in flight (MaxConcurrentBuilds).
 	builds chan struct{}
+	// cacheMu serializes build cache prunes and cacheDirty, which is true
+	// from the start (a crash may have left BuildKit state) and after a
+	// failed prune, until a prune succeeds: the next build prunes first, or
+	// does not run.
+	cacheMu    sync.Mutex
+	cacheDirty bool
+	// deployMu guards deploying, the environments with a deploy in flight,
+	// and is held across an image prune: an image built after the prune
+	// read the host is never removed by it.
+	deployMu  sync.Mutex
+	deploying map[string]int
 }
 
 // NewReconciler validates cfg.
@@ -209,7 +256,25 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 	if cfg.Retention < minRetention {
 		return nil, fmt.Errorf("reconciler: retention %s is shorter than %s", cfg.Retention, minRetention)
 	}
-	return &Reconciler{cfg: cfg, wake: make(chan struct{}, 1), builds: make(chan struct{}, cfg.MaxConcurrentBuilds)}, nil
+	cfg.MinFreeDiskBytes = cmp.Or(cfg.MinFreeDiskBytes, defaultMinFreeDisk)
+	if cfg.MinFreeDiskBytes < minFreeDisk {
+		return nil, fmt.Errorf("reconciler: free-disk floor %d bytes is below %d", cfg.MinFreeDiskBytes, int64(minFreeDisk))
+	}
+	switch {
+	case cfg.DisableTTL && cfg.EnvTTL != 0:
+		return nil, fmt.Errorf("reconciler: TTL %s set and disabled", cfg.EnvTTL)
+	case !cfg.DisableTTL:
+		cfg.EnvTTL = cmp.Or(cfg.EnvTTL, defaultEnvTTL)
+		if cfg.EnvTTL < minEnvTTL {
+			return nil, fmt.Errorf("reconciler: TTL %s is shorter than %s", cfg.EnvTTL, minEnvTTL)
+		}
+	}
+	cfg.BuildDir = cmp.Or(cfg.BuildDir, os.TempDir())
+	if !filepath.IsAbs(cfg.BuildDir) {
+		return nil, fmt.Errorf("reconciler: build directory %q is not absolute", cfg.BuildDir)
+	}
+	return &Reconciler{cfg: cfg, wake: make(chan struct{}, 1), builds: make(chan struct{}, cfg.MaxConcurrentBuilds),
+		cacheDirty: true, deploying: map[string]int{}}, nil
 }
 
 // Startup runs once, before the API and the workers serve. It fails closed:
@@ -217,6 +282,10 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 // the daemon must not start.
 func (r *Reconciler) Startup(ctx context.Context) error {
 	log := r.cfg.Logger
+	dirs, err := r.removeStaleBuildDirs()
+	if err != nil {
+		return fmt.Errorf("startup sweep: %w", err)
+	}
 	routes, removed, err := r.cfg.Routes.Inventory()
 	if err != nil {
 		return fmt.Errorf("startup sweep: %w", err)
@@ -261,8 +330,53 @@ func (r *Reconciler) Startup(ctx context.Context) error {
 		}
 	}
 	log.Info("Startup sweep complete", "epoch", res.Epoch, "observed", len(observed),
-		"destroyed", len(res.Destroy), "routes_kept", len(left), "files_removed", len(removed))
+		"destroyed", len(res.Destroy), "routes_kept", len(left), "files_removed", len(removed),
+		"build_dirs_removed", dirs)
 	return nil
+}
+
+// removeStaleBuildDirs removes the build directories a crash left in
+// BuildDir (V1 G2): the directories named previewd-build-* that the
+// daemon's user owns. A file or a link of that name is never one
+// (os.MkdirTemp makes directories) and one another user owns is not this
+// daemon's; both are left. It runs before any worker, so no build is using
+// one.
+func (r *Reconciler) removeStaleBuildDirs() (int, error) {
+	dir := r.cfg.BuildDir
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, fmt.Errorf("read build directory %s: %w", dir, err)
+	}
+	removed := 0
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), buildDirPrefix) {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		fi, err := os.Lstat(path)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			continue
+		case err != nil:
+			return removed, fmt.Errorf("stale build directory %s: %w", path, err)
+		case !fi.IsDir():
+			continue
+		}
+		own, err := ownedByProcess(fi)
+		if err != nil {
+			return removed, fmt.Errorf("stale build directory %s: owner: %w", path, err)
+		}
+		if !own {
+			r.cfg.Logger.Warn("Left a build directory another user owns", "dir", path)
+			continue
+		}
+		if err := os.RemoveAll(path); err != nil {
+			return removed, fmt.Errorf("remove stale build directory: %w", err)
+		}
+		r.cfg.Logger.Info("Removed a build directory a crash left behind", "dir", path)
+		removed++
+	}
+	return removed, nil
 }
 
 // observations merges the engine's, the stager's and the proxy's views into
@@ -413,6 +527,8 @@ func failAt(step store.Failure, err error) error { return &stepError{step: step,
 
 func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, log *slog.Logger) (err error) {
 	env := l.EnvID
+	r.beginDeploy(env)
+	defer r.endDeploy(env)
 	// The secret section of the deploy's trust (V1-I2), read before anything
 	// changes on the host. Only an explicit trusted verdict gets the trusted
 	// section.
@@ -427,7 +543,7 @@ func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, l
 	if err := Teardown(ctx, r.cfg.Engine, r.cfg.Routes, r.cfg.Stager, env); err != nil {
 		return fmt.Errorf("remove previous version: %w", err)
 	}
-	dir, err := os.MkdirTemp("", "previewd-build-")
+	dir, err := os.MkdirTemp(r.cfg.BuildDir, buildDirPrefix)
 	if err != nil {
 		return fmt.Errorf("create build dir: %w", err)
 	}
@@ -454,6 +570,9 @@ func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, l
 	}
 	tag := env + ":latest"
 	if err := r.build(ctx, BuildSpec{ContextTar: buildContext, Tag: tag, EnvID: env, JobID: l.JobID}, log); err != nil {
+		if errors.Is(err, ErrDiskFloor) {
+			return failAt(store.FailureDiskFloor, err)
+		}
 		return failAt(store.FailureBuild, fmt.Errorf("build: %w", err))
 	}
 	secretsDir, err := r.cfg.Stager.Stage(env, section)
@@ -482,6 +601,11 @@ func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, l
 // cancelled at BuildTimeout (E0: closing the request stops the solve and
 // its RUN processes). A build whose deadline passed fails even when the
 // engine reports success: a cancelled build is never read as one.
+//
+// Within the slot (V1 G2, V1-I9): build cache a crash or a failed prune
+// left is pruned first, or nothing is built; the build starts only above
+// the free-disk floor (ErrDiskFloor); the build cache is pruned after the
+// build, whatever its outcome, before the slot is released.
 func (r *Reconciler) build(ctx context.Context, spec BuildSpec, log *slog.Logger) error {
 	select {
 	case r.builds <- struct{}{}:
@@ -489,6 +613,13 @@ func (r *Reconciler) build(ctx context.Context, spec BuildSpec, log *slog.Logger
 		return fmt.Errorf("wait for a build slot: %w", context.Cause(ctx))
 	}
 	defer func() { <-r.builds }()
+	if err := r.cleanBuildCache(ctx, log); err != nil {
+		return err
+	}
+	if err := r.checkDiskFloor(ctx, log); err != nil {
+		return err
+	}
+	defer r.pruneBuildCache(ctx, log)
 	bctx, cancel := context.WithTimeoutCause(ctx, r.cfg.BuildTimeout, ErrBuildTimeout)
 	defer cancel()
 	err := r.cfg.Engine.Build(bctx, spec)
@@ -506,6 +637,111 @@ func (r *Reconciler) build(ctx context.Context, spec BuildSpec, log *slog.Logger
 	return err
 }
 
+// cleanBuildCache prunes the build cache when the last prune failed, or
+// none ran since the start: no BuildKit state of an earlier build reaches
+// this one. A failure refuses the build.
+func (r *Reconciler) cleanBuildCache(ctx context.Context, log *slog.Logger) error {
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	if !r.cacheDirty {
+		return nil
+	}
+	pctx, cancel := context.WithTimeout(ctx, pruneTimeout)
+	defer cancel()
+	reclaimed, err := r.cfg.Engine.PruneBuildCache(pctx)
+	if err != nil {
+		return fmt.Errorf("prune the build cache before the build: %w", err)
+	}
+	r.cacheDirty = false
+	log.Info("Build cache pruned before the build", "reclaimed_bytes", reclaimed)
+	return nil
+}
+
+// pruneBuildCache prunes the build cache after a build, on a context that
+// outlives a cancelled job. A failure marks the cache dirty: the next
+// build prunes first, or does not run.
+func (r *Reconciler) pruneBuildCache(ctx context.Context, log *slog.Logger) {
+	cctx, cancel := cleanupContext(ctx)
+	defer cancel()
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	reclaimed, err := r.cfg.Engine.PruneBuildCache(cctx)
+	if err != nil {
+		r.cacheDirty = true
+		log.Error("Could not prune the build cache after the build: the next build prunes it first", "error", err)
+		return
+	}
+	log.Info("Build cache pruned", "reclaimed_bytes", reclaimed)
+}
+
+// checkDiskFloor fails closed with ErrDiskFloor unless the engine's data
+// root has at least MinFreeDiskBytes free.
+func (r *Reconciler) checkDiskFloor(ctx context.Context, log *slog.Logger) error {
+	free, err := r.cfg.Engine.FreeDisk(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: free space unknown: %w", ErrDiskFloor, err)
+	}
+	if free < r.cfg.MinFreeDiskBytes {
+		log.Error("Build refused below the free-disk floor", "free_bytes", free, "min_free_bytes", r.cfg.MinFreeDiskBytes)
+		return fmt.Errorf("%w: %d bytes free, floor %d", ErrDiskFloor, free, r.cfg.MinFreeDiskBytes)
+	}
+	return nil
+}
+
+// beginDeploy and endDeploy bracket a deploy in flight: its environment
+// keeps its image through any image prune.
+func (r *Reconciler) beginDeploy(env string) {
+	r.deployMu.Lock()
+	defer r.deployMu.Unlock()
+	r.deploying[env]++
+}
+
+func (r *Reconciler) endDeploy(env string) {
+	r.deployMu.Lock()
+	defer r.deployMu.Unlock()
+	if r.deploying[env]--; r.deploying[env] <= 0 {
+		delete(r.deploying, env)
+	}
+}
+
+// pruneImages removes the images of every environment neither on the host
+// (Engine.Observe) nor deploying (V1 G2, V1-I9). It fails closed: without
+// the host's view nothing is pruned.
+func (r *Reconciler) pruneImages(ctx context.Context) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, pruneTimeout)
+	defer cancel()
+	r.deployMu.Lock()
+	defer r.deployMu.Unlock()
+	states, err := r.cfg.Engine.Observe(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("prune images: observe engine: %w", err)
+	}
+	keep := slices.Collect(maps.Keys(states))
+	for env := range r.deploying {
+		if _, ok := states[env]; !ok {
+			keep = append(keep, env)
+		}
+	}
+	slices.Sort(keep)
+	reclaimed, err := r.cfg.Engine.PruneImages(ctx, keep)
+	if err != nil {
+		return reclaimed, fmt.Errorf("prune images: %w", err)
+	}
+	return reclaimed, nil
+}
+
+// cleanImages runs pruneImages and logs its outcome; a failure waits for
+// the next teardown or maintenance pass.
+func (r *Reconciler) cleanImages(ctx context.Context, log *slog.Logger) {
+	reclaimed, err := r.pruneImages(ctx)
+	switch {
+	case err != nil && ctx.Err() == nil:
+		log.Error("Image prune failed: the next maintenance pass retries", "error", err)
+	case err == nil:
+		log.Info("Images pruned", "reclaimed_bytes", reclaimed)
+	}
+}
+
 func (r *Reconciler) teardown(ctx context.Context, l store.Lease, log *slog.Logger) {
 	log.Info("Tearing down environment")
 	err := Teardown(ctx, r.cfg.Engine, r.cfg.Routes, r.cfg.Stager, l.EnvID)
@@ -521,9 +757,10 @@ func (r *Reconciler) teardown(ctx context.Context, l store.Lease, log *slog.Logg
 	}
 	if err := r.cfg.Queue.Finish(cctx, l, store.StatusSuccess, r.cfg.Now()); err != nil {
 		log.Error("Could not record the teardown: the next startup sweep requeues it", "error", err)
-		return
+	} else {
+		log.Info("Environment torn down")
 	}
-	log.Info("Environment torn down")
+	r.cleanImages(ctx, log)
 }
 
 // authorizeDeploy is AuthorizeDeploy: the lease is classified from GHES and
@@ -759,21 +996,81 @@ func (r *Reconciler) revalidationTeardown(ctx context.Context, j store.Job, reas
 	r.Notify()
 }
 
-// Maintain runs the database maintenance loop (V1 F3, V1-I6) until ctx is
-// done: one Prune pass at once, then one every PruneInterval. Prune itself
-// ends with incremental_vacuum. It runs only after Startup: the store
-// refuses Prune before the sweep.
+// Maintain runs the maintenance loop until ctx is done: one pass at once,
+// then one every PruneInterval. A pass queues the TTL teardowns (V1 G3),
+// runs Prune (V1 F3, V1-I6), which ends with incremental_vacuum, then
+// prunes the images of environments gone (V1 G2, V1-I9). It runs only
+// after Startup: the store refuses Prune and internal jobs before the
+// sweep.
 func (r *Reconciler) Maintain(ctx context.Context) {
 	t := time.NewTicker(r.cfg.PruneInterval)
 	defer t.Stop()
 	for {
+		r.expireOnce(ctx)
 		r.pruneOnce(ctx)
+		r.cleanImages(ctx, r.cfg.Logger)
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 		}
 	}
+}
+
+// expireOnce queues an internal teardown (origin ttl, audited ttl_expired)
+// for every environment whose running version finished deploying at least
+// EnvTTL ago and nothing newer is recorded (Store.Expired). The teardown is
+// pinned to that version's commit: when a newer intent for another commit
+// was recorded since, the store refuses it. A later push deploys again.
+func (r *Reconciler) expireOnce(ctx context.Context) {
+	if r.cfg.DisableTTL {
+		return
+	}
+	now := r.cfg.Now()
+	envs, err := r.cfg.Queue.Expired(ctx, r.cfg.EnvTTL, now)
+	if err != nil {
+		if ctx.Err() == nil {
+			r.cfg.Logger.Error("TTL: could not list the expired environments: the next pass retries", "error", err)
+		}
+		return
+	}
+	queued := 0
+	for _, env := range envs {
+		if ctx.Err() != nil {
+			break
+		}
+		log := r.cfg.Logger.With("environment_id", env, "ttl", r.cfg.EnvTTL)
+		v, ok, err := r.cfg.Queue.RunningVersion(ctx, env)
+		switch {
+		case err != nil:
+			log.Error("TTL: could not read the running version: the next pass retries", "error", err)
+			continue
+		case !ok:
+			continue
+		}
+		if id, err := r.ttlTeardown(ctx, v, now); err != nil {
+			log.Error("Could not queue the TTL teardown: the next pass retries", "builder_job_id", v.ID, "error", err)
+		} else {
+			log.Info("Environment past its TTL: teardown queued", "builder_job_id", v.ID, "teardown_job_id", id,
+				"repository", v.Source.Repo, "pr_number", v.Source.PRNumber, "commit_sha", v.Source.CommitSHA,
+				"deployed_at", time.UnixMilli(v.FinishedAt).UTC())
+			queued++
+		}
+	}
+	if queued > 0 {
+		r.Notify()
+	}
+}
+
+// ttlTeardown queues the TTL teardown of v's environment, pinned to v.
+func (r *Reconciler) ttlTeardown(ctx context.Context, v store.Job, now time.Time) (int64, error) {
+	cctx, cancel := cleanupContext(ctx)
+	defer cancel()
+	src := v.Source
+	return r.cfg.Queue.EnqueueInternal(cctx, v.EnvID, store.OriginTTL, "", now, store.AuditEvent{
+		Kind: store.AuditTTLExpired, EnvID: v.EnvID, Repo: src.Repo, PRNumber: src.PRNumber, CommitSHA: src.CommitSHA,
+		Detail: string(store.OriginTTL),
+	})
 }
 
 // pruneOnce runs one Prune pass and logs what it deleted.

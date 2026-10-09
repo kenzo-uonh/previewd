@@ -51,10 +51,20 @@ type hostEngine struct {
 	// buildHook, when set, runs inside Build after the build step is
 	// recorded, without the lock: a slow or hanging build.
 	buildHook func(ctx context.Context) error
+	// images is the size of each environment's image: a successful build
+	// adds it, Destroy and PruneImages remove it. keeps is the keep list of
+	// each PruneImages call.
+	images map[string]int64
+	keeps  [][]string
+	// cache counts build cache records since the last PruneBuildCache:
+	// every build adds one, whatever its outcome.
+	cache int
+	// free is what FreeDisk reports.
+	free int64
 }
 
 func newHostEngine() *hostEngine {
-	return &hostEngine{envs: map[string]EngineState{}, fail: map[string]error{}}
+	return &hostEngine{envs: map[string]EngineState{}, fail: map[string]error{}, images: map[string]int64{}, free: 1 << 40}
 }
 
 func (h *hostEngine) step(name string) error {
@@ -84,6 +94,9 @@ func (h *hostEngine) Build(ctx context.Context, spec BuildSpec) error {
 	if err := h.step("build"); err != nil {
 		return err
 	}
+	h.mu.Lock()
+	h.cache++
+	h.mu.Unlock()
 	if h.buildHook != nil {
 		if err := h.buildHook(ctx); err != nil {
 			return err
@@ -99,7 +112,45 @@ func (h *hostEngine) Build(ctx context.Context, spec BuildSpec) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.built = append(h.built, dockerfile)
+	h.images[spec.EnvID] = 100 << 20
 	return nil
+}
+
+func (h *hostEngine) PruneImages(_ context.Context, keep []string) (int64, error) {
+	if err := h.step("prune-images"); err != nil {
+		return 0, err
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.keeps = append(h.keeps, slices.Clone(keep))
+	var reclaimed int64
+	for env, size := range h.images {
+		if !slices.Contains(keep, env) {
+			reclaimed += size
+			delete(h.images, env)
+		}
+	}
+	return reclaimed, nil
+}
+
+func (h *hostEngine) PruneBuildCache(context.Context) (int64, error) {
+	if err := h.step("prune-cache"); err != nil {
+		return 0, err
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := h.cache
+	h.cache = 0
+	return int64(n) << 20, nil
+}
+
+func (h *hostEngine) FreeDisk(context.Context) (int64, error) {
+	if err := h.step("free-disk"); err != nil {
+		return 0, err
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.free, nil
 }
 
 // tarFile reads the content of name from a tar stream.
@@ -142,6 +193,7 @@ func (h *hostEngine) Destroy(_ context.Context, env string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.envs, env)
+	delete(h.images, env)
 	return nil
 }
 
@@ -260,6 +312,11 @@ type rig struct {
 	maxBuilds     int
 	buildTimeout  time.Duration
 	pruneInterval time.Duration
+	// Auto-cleanup (V1 F5); 0 for the defaults. buildDir is the rig's own.
+	minFreeDisk int64
+	envTTL      time.Duration
+	disableTTL  bool
+	buildDir    string
 }
 
 func newRig(t *testing.T) *rig {
@@ -273,8 +330,12 @@ func newRig(t *testing.T) *rig {
 	if err != nil {
 		t.Fatal(err)
 	}
+	buildDir := filepath.Join(dir, "tmp")
+	if err := os.Mkdir(buildDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	r := &rig{
-		t: t, dbPath: filepath.Join(dir, "previewd.sqlite"),
+		t: t, dbPath: filepath.Join(dir, "previewd.sqlite"), buildDir: buildDir,
 		engine: newHostEngine(), stager: &memStager{staged: map[string]bool{}},
 		routes: pub, routeDir: routeDir, now: time.UnixMilli(1_800_000_000_000), auth: &fakeAuthorizer{},
 	}
@@ -312,6 +373,7 @@ func (r *rig) reconciler() *Reconciler {
 		Secrets: sectionSecrets{}, Authorizer: r.auth,
 		RevalidateInterval: r.interval, RevalidateGrace: r.grace, AuthorizeMaxAttempts: r.maxAttempts,
 		MaxConcurrentBuilds: r.maxBuilds, BuildTimeout: r.buildTimeout, PruneInterval: r.pruneInterval, PruneBatch: 2,
+		MinFreeDiskBytes: r.minFreeDisk, EnvTTL: r.envTTL, DisableTTL: r.disableTTL, BuildDir: r.buildDir,
 		Fetch: func(_ context.Context, _, _, dest string) error {
 			if r.fetchErr != nil {
 				return r.fetchErr
@@ -423,8 +485,10 @@ func TestReconcilerDeploysAndTearsDown(t *testing.T) {
 	if got := r.routeFiles(); !slices.Equal(got, []string{testEnv + ".yml"}) {
 		t.Fatalf("route files = %v", got)
 	}
-	// ExecuteDeploy removes the previous version before building.
-	if want := []string{"observe", "destroy", "network", "build", "deploy"}; !slices.Equal(r.engine.calls, want) {
+	// ExecuteDeploy removes the previous version before building; the
+	// first build after the start prunes the build cache first, every build
+	// checks the free-disk floor and prunes the build cache after it.
+	if want := []string{"observe", "destroy", "network", "prune-cache", "free-disk", "build", "prune-cache", "deploy"}; !slices.Equal(r.engine.calls, want) {
 		t.Fatalf("engine calls = %v, want %v", r.engine.calls, want)
 	}
 

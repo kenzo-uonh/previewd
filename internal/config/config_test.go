@@ -203,6 +203,47 @@ func TestLoadBuildBoundsAndPruneKeys(t *testing.T) {
 	}
 }
 
+// The auto-cleanup keys (F5) fail closed: a value outside its range, or
+// not a number, refuses to start. PREVIEWD_ENV_TTL=0, exactly, disables the
+// TTL.
+func TestLoadAutoCleanupKeys(t *testing.T) {
+	minimalEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.EnvTTL != 168*time.Hour || cfg.MinFreeDiskBytes != 10240<<20 || cfg.DockerDataRoot != "" {
+		t.Fatalf("defaults = TTL %s, floor %d, data root %q", cfg.EnvTTL, cfg.MinFreeDiskBytes, cfg.DockerDataRoot)
+	}
+	t.Setenv("PREVIEWD_ENV_TTL", "1h")
+	t.Setenv("PREVIEWD_MIN_FREE_DISK_MIB", "1024")
+	t.Setenv("PREVIEWD_DOCKER_DATA_ROOT", "/var/lib/docker")
+	if cfg, err = Load(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.EnvTTL != time.Hour || cfg.MinFreeDiskBytes != 1<<30 || cfg.DockerDataRoot != "/var/lib/docker" {
+		t.Fatalf("bounds = TTL %s, floor %d, data root %q", cfg.EnvTTL, cfg.MinFreeDiskBytes, cfg.DockerDataRoot)
+	}
+	t.Setenv("PREVIEWD_ENV_TTL", "0")
+	if cfg, err = Load(); err != nil || cfg.EnvTTL != 0 {
+		t.Fatalf("PREVIEWD_ENV_TTL=0: TTL %v, %v; want disabled", cfg, err)
+	}
+	for key, bads := range map[string][]string{
+		"PREVIEWD_ENV_TTL":           {"59m", "0s", "00", "-168h", "168", "87601h", "never"},
+		"PREVIEWD_MIN_FREE_DISK_MIB": {"1023", "0", "-1", "10GiB", "1.5", "1099511627777"},
+		"PREVIEWD_DOCKER_DATA_ROOT":  {"var/lib/docker", "/var/lib/docker/", "/var/lib/../lib/docker", "."},
+	} {
+		for _, bad := range bads {
+			t.Run(key+"="+bad, func(t *testing.T) {
+				t.Setenv(key, bad)
+				if _, err := Load(); err == nil {
+					t.Fatalf("%s=%q accepted", key, bad)
+				}
+			})
+		}
+	}
+}
+
 // The approval keys fail closed: a malformed value refuses to start.
 func TestLoadApprovalKeys(t *testing.T) {
 	minimalEnv(t)

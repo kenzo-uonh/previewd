@@ -94,17 +94,20 @@ func TestMaintainRunsPassesUntilCancelled(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	// Later passes keep running: they observe the engine each time.
-	r.engine.mu.Lock()
-	before := len(r.engine.calls)
-	r.engine.mu.Unlock()
-	for {
+	// Later passes keep running: each ends with one image prune.
+	imagePrunes := func() int {
 		r.engine.mu.Lock()
-		n := len(r.engine.calls)
-		r.engine.mu.Unlock()
-		if n > before+1 {
-			break
+		defer r.engine.mu.Unlock()
+		n := 0
+		for _, c := range r.engine.calls {
+			if c == "prune-images" {
+				n++
+			}
 		}
+		return n
+	}
+	before := imagePrunes()
+	for imagePrunes() <= before+1 {
 		if time.Now().After(deadline) {
 			cancel()
 			t.Fatal("Maintain stopped after its first passes")

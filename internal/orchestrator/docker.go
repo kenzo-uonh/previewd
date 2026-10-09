@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"net/netip"
 	"path/filepath"
 	"slices"
@@ -61,23 +62,39 @@ type DockerEngine struct {
 	// internal network so that it, and only it, reaches the environment.
 	proxyContainer string
 	limits         Limits
+	// dataRoot is PREVIEWD_DOCKER_DATA_ROOT, whose file system FreeDisk
+	// measures with statDisk; "" reads the daemon's DockerRootDir at each
+	// call.
+	dataRoot string
+	statDisk DiskStat
 }
+
+// DiskStat is the free space, in bytes, of the file system holding a clean
+// absolute path (hardening.FreeDiskBytes, injected by main).
+type DiskStat func(path string) (int64, error)
 
 // NewDockerEngine initializes a connection to the local host's Docker daemon.
 // proxyContainer names the Traefik container that serves the routes; limits
-// bound every PR container.
-func NewDockerEngine(proxyContainer string, limits Limits) (*DockerEngine, error) {
+// bound every PR container; dataRoot is the daemon's data root ("" to ask
+// the daemon), a clean absolute path otherwise, measured by statDisk.
+func NewDockerEngine(proxyContainer string, limits Limits, dataRoot string, statDisk DiskStat) (*DockerEngine, error) {
 	if proxyContainer == "" {
 		return nil, errors.New("proxy container name is required")
 	}
 	if err := limits.validate(); err != nil {
 		return nil, err
 	}
+	if dataRoot != "" && (!filepath.IsAbs(dataRoot) || dataRoot != filepath.Clean(dataRoot)) {
+		return nil, fmt.Errorf("docker data root %q is not a clean absolute path", dataRoot)
+	}
+	if statDisk == nil {
+		return nil, errors.New("a free-disk probe is required")
+	}
 	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize docker client: %w", err)
 	}
-	return &DockerEngine{client: cli, proxyContainer: proxyContainer, limits: limits}, nil
+	return &DockerEngine{client: cli, proxyContainer: proxyContainer, limits: limits, dataRoot: dataRoot, statDisk: statDisk}, nil
 }
 
 // networkName is the internal bridge network of envID.
@@ -638,6 +655,89 @@ func ownerOf(labels map[string]string, name string) string {
 		return name
 	}
 	return ""
+}
+
+// PruneImages removes, one by one and never forced, every image
+// prunableImages selects: built by previewd for an environment not in keep.
+// An image gone meanwhile is skipped, and so is one a container still uses
+// (conflict): the container is the environment's, which Observe reports
+// and the sweep or a teardown removes with its image. reclaimed sums the
+// sizes of the images removed (layers shared with a kept image included).
+func (d *DockerEngine) PruneImages(ctx context.Context, keep []string) (int64, error) {
+	res, err := d.client.ImageList(ctx, client.ImageListOptions{Filters: make(client.Filters).Add("label", LabelEnv)})
+	if err != nil {
+		return 0, fmt.Errorf("prune images: list: %w", err)
+	}
+	var reclaimed int64
+	var errs []error
+	for _, img := range prunableImages(res.Items, keep) {
+		_, err := d.client.ImageRemove(ctx, img.ID, client.ImageRemoveOptions{PruneChildren: true})
+		switch {
+		case err == nil:
+			reclaimed += max(img.Size, 0)
+		case errdefs.IsNotFound(err) || errdefs.IsConflict(err):
+		default:
+			errs = append(errs, fmt.Errorf("prune image %s of %s: %w", img.ID, img.Labels[LabelEnv], err))
+		}
+	}
+	return reclaimed, errors.Join(errs...)
+}
+
+// prunableImages selects the images previewd built (BuildSpec labels: a
+// valid environment ID and a positive job ID; at most the tag
+// <env>:latest, so an operator's image is never selected for carrying the
+// labels) whose environment is not in keep.
+func prunableImages(images []image.Summary, keep []string) []image.Summary {
+	var out []image.Summary
+	for _, img := range images {
+		env := img.Labels[LabelEnv]
+		job, err := strconv.ParseInt(img.Labels[LabelJob], 10, 64)
+		if !envid.Valid(env) || err != nil || job <= 0 || slices.Contains(keep, env) {
+			continue
+		}
+		ownTag := true
+		for _, tag := range img.RepoTags {
+			ownTag = ownTag && (tag == env+":latest" || tag == "<none>:<none>")
+		}
+		if ownTag {
+			out = append(out, img)
+		}
+	}
+	return out
+}
+
+// PruneBuildCache removes all of the daemon's unused build cache.
+func (d *DockerEngine) PruneBuildCache(ctx context.Context) (int64, error) {
+	res, err := d.client.BuildCachePrune(ctx, client.BuildCachePruneOptions{All: true})
+	if err != nil {
+		return 0, fmt.Errorf("prune build cache: %w", err)
+	}
+	return int64(min(res.Report.SpaceReclaimed, math.MaxInt64)), nil // #nosec G115 -- bounded by MaxInt64
+}
+
+// FreeDisk measures the file system of the data root: PREVIEWD_DOCKER_DATA_ROOT,
+// or the DockerRootDir the daemon reports, which must be a clean absolute
+// path. Any failure is an error: the floor is never assumed met.
+func (d *DockerEngine) FreeDisk(ctx context.Context) (int64, error) {
+	root := d.dataRoot
+	if root == "" {
+		res, err := d.client.Info(ctx, client.InfoOptions{})
+		if err != nil {
+			return 0, fmt.Errorf("free disk: docker info: %w", err)
+		}
+		root = res.Info.DockerRootDir
+		if !filepath.IsAbs(root) || root != filepath.Clean(root) {
+			return 0, fmt.Errorf("free disk: the daemon's data root %q is not a clean absolute path", textutil.Truncate(root, 256))
+		}
+	}
+	if d.statDisk == nil {
+		return 0, errors.New("free disk: no free-disk probe")
+	}
+	free, err := d.statDisk(root)
+	if err != nil {
+		return 0, fmt.Errorf("free disk of the docker data root (set PREVIEWD_DOCKER_DATA_ROOT to a path previewd can statfs): %w", err)
+	}
+	return free, nil
 }
 
 // Logs returns the standard output and error streams.
