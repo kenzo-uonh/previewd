@@ -29,6 +29,7 @@ import (
 	"log/slog"
 	"maps"
 	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"time"
@@ -86,6 +87,11 @@ type ReconcilerConfig struct {
 	Logger     *slog.Logger
 	Domain     string
 	AppPort    int
+	// AllowedBaseImages (PREVIEWD_ALLOWED_BASE_IMAGES, canonical references)
+	// and MaxBuildContextBytes (PREVIEWD_MAX_BUILD_CONTEXT_MIB) bound what the
+	// preflight lets reach the engine (V1 F2). Both are required.
+	AllowedBaseImages    map[string]bool
+	MaxBuildContextBytes int64
 	// RevalidateInterval and RevalidateGrace are
 	// PREVIEWD_APPROVAL_REVALIDATE_INTERVAL and _GRACE (default 10 m, 1 h);
 	// the grace is never shorter than the interval.
@@ -131,6 +137,10 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 	}
 	if cfg.AuthorizeMaxAttempts <= 0 {
 		cfg.AuthorizeMaxAttempts = defaultAuthorizeMaxAttempts
+	}
+	if len(cfg.AllowedBaseImages) == 0 || cfg.MaxBuildContextBytes <= 0 {
+		return nil, fmt.Errorf("reconciler: the build preflight needs allowed base images and a positive context cap (got %d images, %d bytes)",
+			len(cfg.AllowedBaseImages), cfg.MaxBuildContextBytes)
 	}
 	if cfg.Domain == "" || cfg.AppPort <= 0 || cfg.AppPort > 65535 {
 		return nil, fmt.Errorf("reconciler: invalid domain %q or application port %d", cfg.Domain, cfg.AppPort)
@@ -328,8 +338,9 @@ func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, l
 		return fmt.Errorf("secrets: %w", err)
 	}
 
-	// ExecuteDeploy: remove the previous version, fetch, create the internal
-	// network, build, stage the secrets on ramfs.
+	// ExecuteDeploy: remove the previous version, fetch, pack the context
+	// and run the preflight (nothing reaches the engine before it passes),
+	// create the internal network, build, stage the secrets on ramfs.
 	if err := Teardown(ctx, r.cfg.Engine, r.cfg.Routes, r.cfg.Stager, env); err != nil {
 		return fmt.Errorf("remove previous version: %w", err)
 	}
@@ -342,14 +353,24 @@ func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, l
 			log.Error("Could not remove the build directory", "dir", dir, "error", rmErr)
 		}
 	}()
-	if err := r.cfg.Fetch(ctx, l.Source.CloneURL, l.Source.CommitSHA, dir); err != nil {
+	srcDir := filepath.Join(dir, "src")
+	if err := r.cfg.Fetch(ctx, l.Source.CloneURL, l.Source.CommitSHA, srcDir); err != nil {
 		return fmt.Errorf("fetch: %w", err)
 	}
+	buildContext, err := PrepareBuildContext(srcDir, filepath.Join(dir, "context.tar"), r.cfg.MaxBuildContextBytes, r.cfg.AllowedBaseImages)
+	if err != nil {
+		return fmt.Errorf("preflight: %w", err)
+	}
+	defer func() {
+		if cErr := buildContext.Close(); cErr != nil {
+			log.Error("Could not close the build context", "error", cErr)
+		}
+	}()
 	if err := r.cfg.Engine.ProvisionNetwork(ctx, env); err != nil {
 		return fmt.Errorf("network: %w", err)
 	}
 	tag := env + ":latest"
-	if err := r.cfg.Engine.Build(ctx, dir, tag); err != nil {
+	if err := r.cfg.Engine.Build(ctx, BuildSpec{ContextTar: buildContext, Tag: tag, EnvID: env, JobID: l.JobID}); err != nil {
 		return fmt.Errorf("build: %w", err)
 	}
 	secretsDir, err := r.cfg.Stager.Stage(env, section)

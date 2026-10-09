@@ -7,6 +7,7 @@
 *   **Core Daemon:** Statically compiled Go 1.27+ binary (`CGO_ENABLED=0`) requiring zero external OS dependencies.
 *   **Orchestration:** Docker API (`github.com/moby/moby/client`). Each environment runs on its own internal bridge network (no default route, no egress), shared only with the Traefik container. PR containers run with every capability dropped, `no-new-privileges`, a read-only root file system with no writable mount (no tmpfs), a memory limit without swap and a task limit. An application that must write at run time is not supported yet.
 *   **Ingress & Routing:** Traefik with the file provider only. previewd writes one route document per environment into `PREVIEWD_ROUTES_DIR` and removes it at teardown. Traefik has no Docker socket and reads no container label, so nothing in a PR image can add or change a route. Its entry point listens only on its fixed `previewd-proxy` address, never on the environment networks it joins, so a PR container cannot reach other environments through it. previewd refuses to start if the Traefik container mounts a socket, enables the Docker provider, is privileged or is not running.
+*   **Build isolation (V1 F2):** before any request reaches the engine, previewd packs the checkout into a tar (at most `PREVIEWD_MAX_BUILD_CONTEXT_MIB`; files, directories and symlinks that resolve inside the context only) and runs a Dockerfile preflight on the daemon's own parser (BuildKit v0.33.1, the version Docker 29.8.2 embeds). It refuses a `FROM` not in `PREVIEWD_ALLOWED_BASE_IMAGES` after `ARG` substitution, `FROM --platform`, `ADD` of a URL, git source or variable, `# syntax=`, every `RUN` flag (`--network`, `--mount`, `--security`, `--device`), `COPY --from` an image, `ONBUILD`, and anything it does not recognize. The build itself is BuildKit with `networkmode=none` (forced on every `RUN`), no cache, intermediate containers removed even on failure, no build argument, session or per-build limit, and its outcome is read from the response stream (an HTTP 200 carrying an error is a failed build). Secrets are never part of a build: they are staged after it.
 *   **Persistence:** CGO-free SQLite (`modernc.org/sqlite`) storing minimal environment metadata to ensure crash recovery.
 *   **Security Context:** Secrets are loaded into memory from a local secrets file, split per repository and per trust level (`[owner/repo]`, `[owner/repo:untrusted]`). For each environment, the section of its trust is staged on a host ramfs directory (`/run/previewd/secrets/<env-id>/`, one file per key) and bind-mounted read-only into the container at `/run/secrets`. They never pass through container environment variables, the Docker API, `docker inspect`, image layers or disk.
 
@@ -31,9 +32,10 @@
 │   ├── hardening/                 # mlockall with RLIMIT_MEMLOCK and VmLck checks (leaf, _linux/_other).
 │   ├── orchestrator/
 │   │   ├── authorizer.go          # D4 deploy gate: trusted/untrusted from GHES, approvals re-read (review, approver ID and write access).
-│   │   ├── docker.go              # Docker Driver implementation for the MVP.
+│   │   ├── docker.go              # Docker engine: locked-down BuildKit /build request, build stream parsing, base-image check, containers, networks.
 │   │   ├── engine.go              # Interface defining the Driver (Docker/Kubernetes).
 │   │   ├── environment.go         # EaaS lifecycle logic (Clone, Start, Stop, Destroy).
+│   │   ├── preflight.go           # Build preflight (V1 F2): validated context tar, Dockerfile checks on the pinned BuildKit parser.
 │   │   └── reconciler.go          # Startup sweep (inventory, destroy, route GC) and the deployment workers on the durable queue.
 │   ├── proxy/
 │   │   ├── route.go               # Traefik file-provider route documents (validated, JSON-as-YAML), the only routing path.
@@ -50,12 +52,13 @@
 │   │   ├── maintenance.go         # Pruning behind the watermark, TTL expiry.
 │   │   └── schema.go              # Startup schema check: pinned columns, no BLOB affinity.
 │   ├── textutil/                  # Sanitize: map untrusted text onto [a-zA-Z0-9-] (leaf).
-│   ├── validate/                  # Identifier validators, webhook HMAC and payload schema, layering test (leaf).
+│   ├── validate/                  # Identifier validators (base images: name:tag@sha256), webhook HMAC and payload schema, layering test (leaf).
 │   └── vcs/
 │       ├── clone.go               # Secure repository cloning execution.
 │       └── github.go              # GitHub webhook event names.
 ├── scripts/
 │   ├── build.sh                   # Static binary compilation script.
+│   ├── verify-buildkit.sh         # E0 engine probe: BuildKit network isolation, stream errors, cache, pulls, cgroup placement and bounds, cancellation.
 │   └── verify-e2e.sh              # Local, air-gapped end-to-end integration validation.
 ├── Makefile                       # Build, test, and infrastructure automation targets.
 ├── go.mod                         # Go module dependencies.
@@ -93,7 +96,15 @@ make run
 ```
 
 
-* **Execute End-to-End Tests:** Run the air-gapped validation suite using a locally generated bare Git repository to verify the complete environment lifecycle against a fake GHES (`test/e2e/fakegithub`, build tag `e2e`, its own test PKI, never part of the daemon): the TLS listener, approvals judged from GHES with every token scoped and revoked, signature check, secrets only through the read-only mount, routing through the route document (no label, no socket), the internal network shared only with Traefik, Traefik unreachable from the PR container, teardown of container, network, route and staged secrets, the approval gating flow on a fork PR (parked without a build, still parked on an approval of another commit, deployed with the `:untrusted` secret section only on an approval of its head, torn down by a push, by a dismissal, and by GHES down past the re-validation grace), and `previewd audit verify|export` on the live database. Re-validation runs at its minimum interval and grace (1m each), so the suite takes a few minutes. It mounts a ramfs with sudo; `E2E_STAGING=tmpfs make e2e` uses `/dev/shm` with `PREVIEWD_ALLOW_TMPFS_SECRETS=1` instead. Needs `busybox:latest` loaded locally.
+* **Probe the engine (E0):** `scripts/verify-buildkit.sh` sends the exact `/build` request previewd sends and checks the engine's BuildKit behavior: the four network cases (`networkmode=none`, a control build that must reach a listener on the host bridge, `RUN --network=host`, `RUN --network=default`), the session-less tar context, errors in a 200 stream, `nocache`, registry access for present, missing and swapped base images (against "registries" that are host-bridge ports: nothing leaves the host), per-build limits ignored, the host cgroup of a `RUN`, the drop-in bounds under `PREVIEWD_BUILDKIT_CGROUP` (cgroup v2), and the end of the `RUN` when the request is closed. Evidence goes to `build/reports/<version>/buildkit/<engine>/`; it exits 0 only if every case passes. It needs `busybox` loaded locally (or `PROBE_BASE=name@sha256:<digest>`).
+
+
+```bash
+make verify-buildkit
+```
+
+
+* **Execute End-to-End Tests:** Run the air-gapped validation suite using a locally generated bare Git repository to verify the complete environment lifecycle against a fake GHES (`test/e2e/fakegithub`, build tag `e2e`, its own test PKI, never part of the daemon): the TLS listener, approvals judged from GHES with every token scoped and revoked, signature check, secrets only through the read-only mount, routing through the route document (no label, no socket), the internal network shared only with Traefik, Traefik unreachable from the PR container, teardown of container, network, route and staged secrets, the approval gating flow on a fork PR (parked without a build, still parked on an approval of another commit, deployed with the `:untrusted` secret section only on an approval of its head, torn down by a push, by a dismissal, and by GHES down past the re-validation grace), and `previewd audit verify|export` on the live database. Re-validation runs at its minimum interval and grace (1m each), so the suite takes a few minutes. It mounts a ramfs with sudo; `E2E_STAGING=tmpfs make e2e` uses `/dev/shm` with `PREVIEWD_ALLOW_TMPFS_SECRETS=1` instead. Needs `busybox:latest` loaded locally: the PR Dockerfiles use it pinned to its local digest (`busybox:latest@sha256:…`), the only allowlisted base.
 
 
 ```bash
@@ -232,6 +243,12 @@ Operational parameters enforce hardware boundaries and are managed exclusively v
 Credentials are read by name from `$CREDENTIALS_DIRECTORY`, never from a configured path: pass them with `LoadCredentialEncrypted=github-app-key:/etc/credstore.encrypted/github-app-key` and `LoadCredentialEncrypted=webhook_secret:/etc/credstore.encrypted/webhook_secret` (or `LoadCredential=`) in the unit; `systemd-creds encrypt --name=webhook_secret - /etc/credstore.encrypted/webhook_secret` seals the secret from standard input. In GHES, enable SSL verification on the webhook and make the listener certificate chain to a CA GHES trusts.
 
 
+* `PREVIEWD_ALLOWED_BASE_IMAGES` (required): Comma-separated base images a PR may build `FROM`, each `name:tag@sha256:<64 hex>` (tag **and** digest; `docker.io/library` defaults apply). Load each on the host under that `name:tag` (`docker load`): previewd never pulls, and refuses to start unless every entry's local `name:tag` is the pinned digest and carries no `ONBUILD` trigger. A `FROM` must spell the same image, tag included: the engine contacts the image's registry before every build whatever the pull flag, and falls back to the local image only by its `name:tag`, refusing it unless it is the pinned digest; a digest-only `FROM` cannot build offline (`scripts/verify-buildkit.sh`, cases `no-pull`, `offline-base`, `digest-enforced`). Block the registries in the host egress filter. Any malformed entry, or an image listed twice, refuses to start.
+
+
+* `PREVIEWD_MAX_BUILD_CONTEXT_MIB`: Size cap of the build context tar, 1..16384 (default: 512). A larger checkout fails the deploy before any build request.
+
+
 * `PREVIEWD_ROUTES_DIR`: Directory of the route documents, watched by Traefik's file provider (default: `/var/lib/previewd/routes`). Must exist (absolute path, not a symlink); the daemon refuses to start otherwise. Mounted read-only into Traefik.
 
 
@@ -284,7 +301,7 @@ Both open the database read-only (never migrated, this binary's schema version o
 Workers (`PREVIEWD_MAX_BUILDS`) take the newest queued job of an environment with no job in progress; older queued jobs of that environment are skipped.
 
 - **Authorize (before anything is fetched or built):** the pull request is read from GHES. Trusted (head in the repository, opener with admin, maintain or write) or untrusted with a live approval confirmed on GHES (the approver, by account ID, still listed, their latest review still `APPROVED` on the exact commit, still with write access). The verdict is recorded with the approval it confirmed; if a newer approval was recorded meanwhile, the deploy is requeued and authorized again. Not approved: the previous version is removed and the job waits in `PENDING_APPROVAL` until an approval of its exact commit or a newer push. GHES unavailable: requeued unclassified (30 s doubling to 10 min), after removing a running version whose approval was revoked; after 10 attempts the deploy is parked instead.
-- **Deploy:** remove the previous version, fetch the commit, create the internal network, build, stage the secret section of its trust, start the container, publish the route document, commit SUCCESS. Any failure removes everything and records FAILED.
+- **Deploy:** remove the previous version, fetch the commit, pack the build context and run the preflight (a refusal fails the deploy before any engine request), create the internal network, build, stage the secret section of its trust, start the container, publish the route document, commit SUCCESS. Any failure removes everything and records FAILED.
 - **Re-validation:** every `PREVIEWD_APPROVAL_REVALIDATE_INTERVAL`, each environment whose latest job is a successful deploy is re-checked. A version built trusted needs its PR still trusted (an offboarded opener tears it down, whatever approval exists); one built on an approval needs that approval confirmed again. One no longer authorized gets a teardown at once, its approval revoked in the same transaction; one GHES cannot verify for `PREVIEWD_APPROVAL_REVALIDATE_GRACE` is torn down (fail closed). The grace count is kept in memory: a restart starts a new one.
 - **Teardown:** remove route, container, network, image and staging. A failure requeues it with backoff (1 s doubling to 5 min); a teardown never ends FAILED.
 
@@ -310,6 +327,7 @@ Any error refuses the start. A route document therefore exists only while the da
 | Schema holds no BLOB column and no unreviewed column                                                                                                                                                                                                                                            | `internal/store`     | startup check plus drift tests on modernc                                                                       |
 | Staging root is really ramfs                                                                                                                                                                                                                                                                    | `internal/secrets`   | real ramfs and tmpfs mounts inside an unprivileged user and mount namespace                                     |
 | `mlockall` locks current and future pages, and is refused under a finite limit                                                                                                                                                                                                                  | `internal/hardening` | subprocess tests (the success path needs `RLIMIT_MEMLOCK` unlimited; CI raises it with `prlimit`)               |
+| The build preflight never panics; an accepted Dockerfile has only allowed instructions, no syntax directive, no `RUN` flag, no `FROM --platform`, no remote `ADD` source; every refusal of the table tests (one per control) fails closed before any engine request | `internal/orchestrator` | native fuzzing (`FuzzPreflight`), table tests, rig test with a fake engine |
 | Leaves import no internal package; layering edges are explicit                                                                                                                                                                                                                                  | `internal/validate`  | `TestPackageLayering`                                                                                           |
 | Job queue equals the TLA+ model after every command (enqueue, replay, out-of-order delivery, acquire, deploy and teardown steps with Docker failures, daemon crash, host reboot, stale leases); lock integrity, monotonicity, no orphaned resources; every job completes and the host converges | `internal/store`     | `rapid.StateMachine` (`TestJobStore_StateMachine`), scenario tests per deviation D1 to D3                       |
 | V1 store (schema 3) equals the V1 reference model after every command: approvals and revocations in any order, park, classification, revocation, re-validation and TTL teardowns, pruning, crashes; every V1 safety and liveness property of `docs/formal/V1-model.md` holds | `internal/store` | `rapid.StateMachine` (`TestV1Store_StateMachine`, at most 500 runs under `make verify`), V1 mutants on the reference model (`TestV1Model_Mutants`) |

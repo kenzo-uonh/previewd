@@ -112,10 +112,15 @@ git init -q --bare "$MOCK_DIR/mock.git"
 git clone -q "$MOCK_DIR/mock.git" "$MOCK_DIR/src"
 
 cd "$MOCK_DIR/src"
+# The PR base image (V1 F2): the busybox loaded on this host, pinned as
+# name:tag@digest. The preflight refuses any other FROM; previewd never pulls.
+BASE_DIGEST=$(docker image inspect busybox:latest --format '{{index .RepoDigests 0}}' 2>/dev/null) ||
+  fail "busybox:latest is not loaded on this host (the E2E never pulls)"
+E2E_BASE="busybox:latest@${BASE_DIGEST#*@}"
 # Prints its secret once, then serves a page written at build time: the
 # container runs on a read-only root with no writable mount.
-cat > Dockerfile <<'DOCKERFILE'
-FROM busybox:latest
+cat > Dockerfile <<DOCKERFILE
+FROM $E2E_BASE
 RUN mkdir /www && echo previewd-e2e-ok > /www/index.html
 CMD ["sh", "-c", "cat /run/secrets/E2E_TOKEN && echo && exec httpd -f -p 8080 -h /www"]
 DOCKERFILE
@@ -130,7 +135,7 @@ MOCK_SHA=$(git rev-parse HEAD)
 # A second branch whose build fails in a RUN step: the daemon still answers
 # the build request with HTTP 200 and reports the failure in the stream.
 git checkout -q -b e2e/broken
-printf 'FROM busybox:latest\nRUN echo about-to-fail && exit 3\n' > Dockerfile
+printf 'FROM %s\nRUN echo about-to-fail && exit 3\n' "$E2E_BASE" > Dockerfile
 git commit -q -am "broken build"
 git push -q origin e2e/broken
 BROKEN_SHA=$(git rev-parse HEAD)
@@ -227,6 +232,7 @@ start_agent() {
     PREVIEWD_TLS_KEY_CREDENTIAL=listener-key \
     PREVIEWD_WEBHOOK_ALLOWED_CIDRS=127.0.0.0/8,::1/128 \
     PREVIEWD_APPROVERS=e2e/mock:e2e-approver#7 \
+    PREVIEWD_ALLOWED_BASE_IMAGES="$E2E_BASE" \
     PREVIEWD_APPROVAL_REVALIDATE_INTERVAL=1m \
     PREVIEWD_APPROVAL_REVALIDATE_GRACE=1m \
     CREDENTIALS_DIRECTORY="$CREDS_DIR" \

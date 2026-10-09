@@ -1,7 +1,6 @@
 package orchestrator
 
 import (
-	"archive/tar"
 	"bufio"
 	"bytes"
 	"context"
@@ -9,17 +8,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
+	"maps"
 	"net/netip"
-	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/containerd/errdefs"
+	"github.com/distribution/reference"
 	"github.com/kenzo-uonh/previewd/internal/envid"
 	"github.com/kenzo-uonh/previewd/internal/textutil"
+	"github.com/kenzo-uonh/previewd/internal/validate"
+	"github.com/moby/moby/api/types/build"
 	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/image"
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
@@ -135,89 +138,117 @@ func (d *DockerEngine) Ping(ctx context.Context) error {
 	return nil
 }
 
-// Build creates an in-memory tarball of the context directory and streams it to the Docker daemon.
-func (d *DockerEngine) Build(ctx context.Context, buildDir, tag string) error {
-	tarBuffer := new(bytes.Buffer)
-	tw := tar.NewWriter(tarBuffer)
-	defer func() {
-		_ = tw.Close()
-	}()
+// buildOptions is the only /build request previewd sends (V1 F2, D-V1-2):
+// BuildKit, which forces NetworkMode "none" on every RUN of the build; no
+// pull of the parent; no cache, so no state of another PR's build is reused;
+// intermediate containers removed, on failure too; the ownership labels,
+// which override any label the Dockerfile sets. It carries no build
+// argument (BUILDKIT_SYNTAX would select a frontend image), no session, no
+// remote context, no registry credential, and no per-build memory, CPU or
+// cgroup parent: BuildKit ignores them (D-V1-4).
+func buildOptions(spec BuildSpec) (client.ImageBuildOptions, error) {
+	if !envid.Valid(spec.EnvID) {
+		return client.ImageBuildOptions{}, fmt.Errorf("build: invalid environment ID %q", textutil.Truncate(spec.EnvID, maxBuildErrorBytes))
+	}
+	if spec.Tag != spec.EnvID+":latest" {
+		return client.ImageBuildOptions{}, fmt.Errorf("build %s: tag %q is not %s:latest", spec.EnvID, textutil.Truncate(spec.Tag, maxBuildErrorBytes), spec.EnvID)
+	}
+	if spec.JobID <= 0 {
+		return client.ImageBuildOptions{}, fmt.Errorf("build %s: job ID %d is not positive", spec.EnvID, spec.JobID)
+	}
+	if spec.ContextTar == nil {
+		return client.ImageBuildOptions{}, fmt.Errorf("build %s: no build context", spec.EnvID)
+	}
+	return client.ImageBuildOptions{
+		Version:     build.BuilderBuildKit,
+		Dockerfile:  dockerfileName,
+		Tags:        []string{spec.Tag},
+		NetworkMode: string(network.NetworkNone),
+		PullParent:  false,
+		NoCache:     true,
+		Remove:      true,
+		ForceRemove: true,
+		Labels: map[string]string{
+			LabelEnv: spec.EnvID,
+			LabelJob: strconv.FormatInt(spec.JobID, 10),
+		},
+	}, nil
+}
 
-	root, err := os.OpenRoot(buildDir)
+// Build streams spec.ContextTar to the daemon as the /build request body
+// and reads the response stream to its end. The daemon answers 200 before
+// building: the outcome is in the stream (readBuildStream).
+func (d *DockerEngine) Build(ctx context.Context, spec BuildSpec) error {
+	opts, err := buildOptions(spec)
 	if err != nil {
-		return fmt.Errorf("failed to open secure root for build directory: %w", err)
+		return err
 	}
-	defer func() {
-		_ = root.Close()
-	}()
-
-	err = fs.WalkDir(root.FS(), ".", func(path string, dEntry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if path == "." {
-			return nil
-		}
-
-		info, err := dEntry.Info()
-		if err != nil {
-			return fmt.Errorf("failed to retrieve file info: %w", err)
-		}
-
-		header, err := tar.FileInfoHeader(info, info.Name())
-		if err != nil {
-			return fmt.Errorf("failed to create tar header: %w", err)
-		}
-		header.Name = filepath.ToSlash(path)
-
-		if err := tw.WriteHeader(header); err != nil {
-			return fmt.Errorf("failed to write tar header: %w", err)
-		}
-
-		if dEntry.IsDir() {
-			return nil
-		}
-
-		file, err := root.Open(path)
-		if err != nil {
-			return fmt.Errorf("failed to securely open file for tar: %w", err)
-		}
-		defer func() {
-			_ = file.Close()
-		}()
-
-		if _, err := io.Copy(tw, file); err != nil {
-			return fmt.Errorf("failed to copy file contents to tar: %w", err)
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return fmt.Errorf("tar context creation failed: %w", err)
-	}
-
-	if err := tw.Close(); err != nil {
-		return fmt.Errorf("tar writer close failure: %w", err)
-	}
-
-	opts := client.ImageBuildOptions{
-		Dockerfile: "Dockerfile",
-		Tags:       []string{tag},
-		Remove:     true,
-	}
-
-	res, err := d.client.ImageBuild(ctx, bytes.NewReader(tarBuffer.Bytes()), opts)
+	res, err := d.client.ImageBuild(ctx, spec.ContextTar, opts)
 	if err != nil {
 		return fmt.Errorf("docker image build failed: %w", err)
 	}
 	defer func() {
 		_ = res.Body.Close()
 	}()
-
-	// The daemon answers 200 before building: the outcome is in the stream.
 	if _, err := readBuildStream(res.Body); err != nil {
 		return fmt.Errorf("docker image build: %w", err)
+	}
+	return nil
+}
+
+// VerifyBaseImages refuses every allowlisted base image (canonical
+// name:tag@sha256:<digest> references, validate.AllowedBaseImages) whose
+// local name:tag record is missing or is not the pinned digest, or that
+// carries ONBUILD triggers: the daemon would run them in the PR's build,
+// where the preflight cannot see them. The daemon builds an allowlisted
+// base offline only from that local record (validate.BaseImage); previewd
+// never pulls, base images are loaded by the operator.
+func (d *DockerEngine) VerifyBaseImages(ctx context.Context, allowed map[string]bool) error {
+	if len(allowed) == 0 {
+		return errors.New("no base image allowed")
+	}
+	for _, ref := range slices.Sorted(maps.Keys(allowed)) {
+		nameTag, _, err := validate.SplitBaseImage(ref)
+		if err != nil {
+			return fmt.Errorf("base image %s: %w", ref, err)
+		}
+		res, err := d.client.ImageInspect(ctx, nameTag)
+		if err != nil {
+			return fmt.Errorf("base image %s is not loaded on the host as %s (previewd never pulls): %w", ref, nameTag, err)
+		}
+		if err := checkBaseImage(ref, res.InspectResponse); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkBaseImage fails closed unless img, the local record of ref's
+// name:tag, is ref's digest (its ID or a repository digest of the same
+// name) and has no ONBUILD trigger.
+func checkBaseImage(ref string, img image.InspectResponse) error {
+	nameTag, dgst, err := validate.SplitBaseImage(ref)
+	if err != nil {
+		return fmt.Errorf("base image %s: %w", ref, err)
+	}
+	named, err := reference.ParseNormalizedNamed(nameTag)
+	if err != nil {
+		return fmt.Errorf("base image %s: %w", ref, err)
+	}
+	name := named.Name()
+	pinned := img.ID == dgst
+	for _, rd := range img.RepoDigests {
+		if n, err := reference.ParseNormalizedNamed(rd); err == nil {
+			if c, ok := n.(reference.Canonical); ok && c.Name() == name && c.Digest().String() == dgst {
+				pinned = true
+			}
+		}
+	}
+	if !pinned {
+		return fmt.Errorf("base image %s: the local %s is another image (ID %s)", ref, nameTag, textutil.Truncate(img.ID, 80))
+	}
+	if img.Config != nil && len(img.Config.OnBuild) > 0 {
+		return fmt.Errorf("base image %s carries %d ONBUILD trigger(s): refused, they would run in every PR build", ref, len(img.Config.OnBuild))
 	}
 	return nil
 }

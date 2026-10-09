@@ -140,6 +140,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Build isolation (V1 F2): every allowlisted base image is on the host
+	// as its name:tag with the pinned digest, without ONBUILD triggers.
+	// previewd never pulls.
+	if err := engine.VerifyBaseImages(pingCtx, cfg.AllowedBaseImages); err != nil {
+		logger.Error("Base images refused", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("Build preflight armed",
+		"allowed_base_images", slices.Sorted(maps.Keys(cfg.AllowedBaseImages)),
+		"max_build_context_bytes", cfg.MaxBuildContextBytes)
+
 	// Approval gating (V1 F1): GHES truth through the GitHub App (C3),
 	// judged by the deploy gate (D4) before any build.
 	ghes, err := newGHESClient(cfg, logger)
@@ -170,18 +181,20 @@ func main() {
 	}
 
 	reconciler, err := orchestrator.NewReconciler(orchestrator.ReconcilerConfig{
-		Queue:              db,
-		Engine:             engine,
-		Routes:             routes,
-		Stager:             stager,
-		Secrets:            injector,
-		Authorizer:         authorizer,
-		Fetch:              vcs.FetchRepository,
-		Logger:             logger,
-		Domain:             cfg.TraefikDomain,
-		AppPort:            appPort,
-		RevalidateInterval: cfg.RevalidateInterval,
-		RevalidateGrace:    cfg.RevalidateGrace,
+		Queue:                db,
+		Engine:               engine,
+		Routes:               routes,
+		Stager:               stager,
+		Secrets:              injector,
+		Authorizer:           authorizer,
+		Fetch:                vcs.FetchRepository,
+		Logger:               logger,
+		Domain:               cfg.TraefikDomain,
+		AppPort:              appPort,
+		AllowedBaseImages:    cfg.AllowedBaseImages,
+		MaxBuildContextBytes: cfg.MaxBuildContextBytes,
+		RevalidateInterval:   cfg.RevalidateInterval,
+		RevalidateGrace:      cfg.RevalidateGrace,
 	})
 	if err != nil {
 		logger.Error("Reconciler initialization failure", "error", err)

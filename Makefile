@@ -1,4 +1,4 @@
-.PHONY: all build run dev clean fmt vet lint test sec deps deps-check vendor-check check verify airgap-check fmt-check repomix vuln docker-up docker-down help e2e airgap-scan store-fixture-v2
+.PHONY: all build run dev clean fmt vet lint test sec deps deps-check vendor-check check verify airgap-check fmt-check repomix vuln docker-up docker-down help e2e verify-buildkit airgap-scan store-fixture-v2
 
 APP_NAME    := previewd
 BIN_DIR     := bin
@@ -43,6 +43,10 @@ e2e: ## Run end-to-end operational verification
 	@echo "Executing air-gapped E2E test suite..."
 	@chmod +x scripts/verify-e2e.sh
 	@./scripts/verify-e2e.sh
+
+verify-buildkit: ## Probe the local engine's BuildKit isolation with previewd's exact /build request (E0; evidence in build/reports)
+	@chmod +x scripts/verify-buildkit.sh
+	@./scripts/verify-buildkit.sh
 
 run: build ## Compile and start the previewd daemon
 	@echo "Starting daemon..."

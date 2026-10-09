@@ -54,6 +54,53 @@ func minimalEnv(t *testing.T) {
 	t.Setenv("PREVIEWD_GITHUB_APP_ID", "31337")
 	t.Setenv("PREVIEWD_TLS_CERT_FILE", "/etc/previewd/tls.pem")
 	t.Setenv("PREVIEWD_TLS_KEY_CREDENTIAL", "tls-key")
+	t.Setenv("PREVIEWD_ALLOWED_BASE_IMAGES", testBase)
+}
+
+const testBase = "busybox:latest@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e"
+
+// The build keys (V1 F2) fail closed: no allowlist, an image without its
+// tag or its digest, a context cap out of 1..16384 MiB refuse to start.
+func TestLoadBuildKeys(t *testing.T) {
+	minimalEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.AllowedBaseImages["docker.io/library/"+testBase] || len(cfg.AllowedBaseImages) != 1 || cfg.MaxBuildContextBytes != 512<<20 {
+		t.Fatalf("defaults = %v, %d", cfg.AllowedBaseImages, cfg.MaxBuildContextBytes)
+	}
+	t.Setenv("PREVIEWD_MAX_BUILD_CONTEXT_MIB", "16384")
+	if cfg, err = Load(); err != nil || cfg.MaxBuildContextBytes != 16384<<20 {
+		t.Fatalf("16384 MiB = %v, %v", cfg, err)
+	}
+	for key, bad := range map[string]string{
+		"PREVIEWD_ALLOWED_BASE_IMAGES":   "",
+		"PREVIEWD_MAX_BUILD_CONTEXT_MIB": "0",
+	} {
+		t.Run(key+"="+bad, func(t *testing.T) {
+			t.Setenv(key, bad)
+			if _, err := Load(); err == nil {
+				t.Fatalf("%s=%q accepted", key, bad)
+			}
+		})
+	}
+	for _, bad := range []string{"busybox:latest", "busybox@" + strings.TrimPrefix(testBase, "busybox:latest@"), testBase + ",", testBase + "," + testBase} {
+		t.Run("image "+bad, func(t *testing.T) {
+			t.Setenv("PREVIEWD_ALLOWED_BASE_IMAGES", bad)
+			if _, err := Load(); err == nil {
+				t.Fatalf("PREVIEWD_ALLOWED_BASE_IMAGES=%q accepted", bad)
+			}
+		})
+	}
+	for _, bad := range []string{"16385", "-1", "512MiB", "1.5"} {
+		t.Run("cap "+bad, func(t *testing.T) {
+			t.Setenv("PREVIEWD_MAX_BUILD_CONTEXT_MIB", bad)
+			if _, err := Load(); err == nil {
+				t.Fatalf("PREVIEWD_MAX_BUILD_CONTEXT_MIB=%q accepted", bad)
+			}
+		})
+	}
 }
 
 // The approval keys fail closed: a malformed value refuses to start.

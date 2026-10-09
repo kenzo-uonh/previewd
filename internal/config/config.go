@@ -40,6 +40,12 @@ type Config struct {
 	RevalidateInterval time.Duration
 	RevalidateGrace    time.Duration
 
+	// Build isolation (V1 F2). AllowedBaseImages holds canonical
+	// name@sha256:<hex> references (validate.AllowedBaseImages); a FROM
+	// outside it is refused before any build request.
+	AllowedBaseImages    map[string]bool
+	MaxBuildContextBytes int64
+
 	// WebhookSecretCredential names the systemd credential holding the
 	// webhook HMAC secret: read from $CREDENTIALS_DIRECTORY, never from the
 	// environment or a configured path.
@@ -71,6 +77,8 @@ const (
 	defaultRevalidateInterval = 10 * time.Minute
 	defaultRevalidateGrace    = time.Hour
 	maxRevalidateGrace        = 24 * time.Hour
+	defaultMaxBuildContextMiB = 512
+	maxBuildContextMiB        = 16384
 )
 
 // defaultStagingDir mirrors secrets.DefaultStagingDir; config imports
@@ -199,6 +207,15 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	allowedBases, err := validate.AllowedBaseImages(os.Getenv("PREVIEWD_ALLOWED_BASE_IMAGES"))
+	if err != nil {
+		return nil, fmt.Errorf("PREVIEWD_ALLOWED_BASE_IMAGES is required: %w", err)
+	}
+	contextMiB, err := boundedInt("PREVIEWD_MAX_BUILD_CONTEXT_MIB", defaultMaxBuildContextMiB, 1, maxBuildContextMiB)
+	if err != nil {
+		return nil, err
+	}
+
 	ghesURL, err := validate.GHESURL(os.Getenv("PREVIEWD_GHES_URL"))
 	if err != nil {
 		return nil, fmt.Errorf("PREVIEWD_GHES_URL is required: %w", err)
@@ -252,6 +269,9 @@ func Load() (*Config, error) {
 		FullSecretsRepos:    fullSecrets,
 		RevalidateInterval:  revalInterval,
 		RevalidateGrace:     revalGrace,
+
+		AllowedBaseImages:    allowedBases,
+		MaxBuildContextBytes: contextMiB << 20,
 
 		WebhookSecretCredential: webhookSecretCred,
 		GHESURL:                 ghesURL,
@@ -334,6 +354,20 @@ func positiveInt(name string, def int64) (int64, error) {
 	n, err := strconv.ParseInt(v, 10, 64)
 	if err != nil || n <= 0 || n > maxPositiveInt {
 		return 0, fmt.Errorf("invalid %s %q: want an integer in 1..%d", name, v, int64(maxPositiveInt))
+	}
+	return n, nil
+}
+
+// boundedInt reads an integer. Unset means def; anything but an integer in
+// [lo, hi] is a configuration error.
+func boundedInt(name string, def, lo, hi int64) (int64, error) {
+	v := os.Getenv(name)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < lo || n > hi {
+		return 0, fmt.Errorf("invalid %s %q: want an integer in %d..%d", name, v, lo, hi)
 	}
 	return n, nil
 }

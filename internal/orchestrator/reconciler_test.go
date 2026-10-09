@@ -1,6 +1,8 @@
 package orchestrator
 
 import (
+	"archive/tar"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -23,12 +25,29 @@ import (
 
 const testEnv = "pr-7-0a0a0a0a0a"
 
+// testBase is the allowlisted base image of the tests, in canonical form.
+const testBase = "docker.io/library/busybox:latest@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e"
+
+var testBases = map[string]bool{testBase: true}
+
+const testDockerfile = "FROM busybox:latest@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e\nRUN true\n"
+
+// writeCheckout is a checkout holding only a Dockerfile.
+func writeCheckout(dest, dockerfile string) error {
+	if err := os.MkdirAll(dest, 0o750); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dest, dockerfileName), []byte(dockerfile), 0o600)
+}
+
 // hostEngine is a fake Docker host.
 type hostEngine struct {
 	mu    sync.Mutex
 	envs  map[string]EngineState
 	fail  map[string]error // step -> error
 	calls []string
+	// built is the Dockerfile of each build context received, in order.
+	built []string
 }
 
 func newHostEngine() *hostEngine {
@@ -56,7 +75,39 @@ func (h *hostEngine) Logs(context.Context, string) (io.ReadCloser, error) {
 }
 func (h *hostEngine) Close() error { return nil }
 
-func (h *hostEngine) Build(context.Context, string, string) error { return h.step("build") }
+// Build records the Dockerfile of the context it is streamed: the tar the
+// preflight validated, never a host path.
+func (h *hostEngine) Build(_ context.Context, spec BuildSpec) error {
+	if err := h.step("build"); err != nil {
+		return err
+	}
+	if _, err := buildOptions(spec); err != nil {
+		return err
+	}
+	dockerfile, err := tarFile(spec.ContextTar, dockerfileName)
+	if err != nil {
+		return err
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.built = append(h.built, dockerfile)
+	return nil
+}
+
+// tarFile reads the content of name from a tar stream.
+func tarFile(r io.Reader, name string) (string, error) {
+	tr := tar.NewReader(r)
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			return "", fmt.Errorf("%s not in the build context: %w", name, err)
+		}
+		if hdr.Name == name {
+			b, err := io.ReadAll(tr)
+			return string(b), err
+		}
+	}
+}
 
 func (h *hostEngine) ProvisionNetwork(_ context.Context, env string) error {
 	if err := h.step("network"); err != nil {
@@ -187,9 +238,11 @@ type rig struct {
 	routes   RoutePublisher
 	routeDir string
 	fetchErr error
-	now      time.Time
-	seq      int64
-	auth     *fakeAuthorizer
+	// dockerfile is what the fake fetch checks out (testDockerfile when "").
+	dockerfile string
+	now        time.Time
+	seq        int64
+	auth       *fakeAuthorizer
 	// interval and grace of the Revalidator; 0 for the defaults.
 	interval, grace time.Duration
 	maxAttempts     int64
@@ -244,9 +297,13 @@ func (r *rig) reconciler() *Reconciler {
 		Queue: r.queue, Engine: r.engine, Routes: r.routes, Stager: r.stager,
 		Secrets: sectionSecrets{}, Authorizer: r.auth,
 		RevalidateInterval: r.interval, RevalidateGrace: r.grace, AuthorizeMaxAttempts: r.maxAttempts,
-		Fetch: func(context.Context, string, string, string) error {
-			return r.fetchErr
+		Fetch: func(_ context.Context, _, _, dest string) error {
+			if r.fetchErr != nil {
+				return r.fetchErr
+			}
+			return writeCheckout(dest, cmp.Or(r.dockerfile, testDockerfile))
 		},
+		AllowedBaseImages: testBases, MaxBuildContextBytes: 1 << 20,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Domain: "local.previewd", AppPort: 8080,
 		Now: func() time.Time { return r.now }, PollInterval: 5 * time.Millisecond,
 	})
@@ -363,13 +420,15 @@ func TestReconcilerDeploysAndTearsDown(t *testing.T) {
 // Any failing deploy step rolls back to absent and records FAILED: no route,
 // container, network or staging survives.
 func TestReconcilerDeployFailureRollsBack(t *testing.T) {
-	for _, step := range []string{"fetch", "network", "build", "stage", "deploy", "publish"} {
+	for _, step := range []string{"fetch", "preflight", "network", "build", "stage", "deploy", "publish"} {
 		t.Run(step, func(t *testing.T) {
 			r := newRig(t)
 			boom := errors.New(step + " failed")
 			switch step {
 			case "fetch":
 				r.fetchErr = boom
+			case "preflight":
+				r.dockerfile = "FROM busybox:latest\n"
 			case "stage":
 				r.stager.failErr = boom
 			case "publish":
@@ -536,6 +595,77 @@ func TestNewReconcilerRequiresDependencies(t *testing.T) {
 	if _, err := NewReconciler(ReconcilerConfig{}); err == nil {
 		t.Fatal("empty config accepted")
 	}
+}
+
+// The build preflight cannot be configured away: no allowlist or no
+// context cap refuses the reconciler.
+func TestNewReconcilerRequiresThePreflight(t *testing.T) {
+	r := newRig(t)
+	for name, mutate := range map[string]func(*ReconcilerConfig){
+		"no base image":   func(c *ReconcilerConfig) { c.AllowedBaseImages = nil },
+		"empty allowlist": func(c *ReconcilerConfig) { c.AllowedBaseImages = map[string]bool{} },
+		"no context cap":  func(c *ReconcilerConfig) { c.MaxBuildContextBytes = 0 },
+		"negative cap":    func(c *ReconcilerConfig) { c.MaxBuildContextBytes = -1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ReconcilerConfig{
+				Queue: r.queue, Engine: r.engine, Routes: r.routes, Stager: r.stager, Secrets: sectionSecrets{},
+				Authorizer: r.auth, Fetch: func(context.Context, string, string, string) error { return nil },
+				Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Domain: "local.previewd", AppPort: 8080,
+				AllowedBaseImages: testBases, MaxBuildContextBytes: 1 << 20,
+			}
+			mutate(&cfg)
+			if _, err := NewReconciler(cfg); err == nil {
+				t.Fatal("reconciler without the build preflight accepted")
+			}
+		})
+	}
+}
+
+// V1-I5: a Dockerfile the preflight refuses fails the deploy before any
+// request reaches the engine: no network, no build. An accepted one is
+// streamed as the tar the preflight validated.
+func TestPreflightRunsBeforeTheEngine(t *testing.T) {
+	for name, df := range map[string]string{
+		"RUN --network=host": "FROM " + pinned + "\nRUN --network=host curl http://10.0.0.1\n",
+		"ADD URL":            "FROM " + pinned + "\nADD https://example.invalid/x /x\n",
+		"unpinned FROM":      "FROM busybox:latest\n",
+		"syntax directive":   "# syntax=docker/dockerfile:1\nFROM " + pinned + "\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newRig(t)
+			r.dockerfile = df
+			rec := r.reconciler()
+			if err := rec.Startup(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			r.enqueue(store.JobDeploy)
+			if jobs := r.drain(rec); lastStatus(jobs) != store.StatusFailed {
+				t.Fatalf("jobs = %+v, want FAILED", jobs)
+			}
+			r.engine.mu.Lock()
+			defer r.engine.mu.Unlock()
+			if slices.Contains(r.engine.calls, "network") || slices.Contains(r.engine.calls, "build") || len(r.engine.built) != 0 {
+				t.Fatalf("engine calls %q: a refused Dockerfile reached the engine", r.engine.calls)
+			}
+		})
+	}
+	t.Run("accepted", func(t *testing.T) {
+		r := newRig(t)
+		rec := r.reconciler()
+		if err := rec.Startup(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		r.enqueue(store.JobDeploy)
+		if jobs := r.drain(rec); lastStatus(jobs) != store.StatusSuccess {
+			t.Fatalf("jobs = %+v, want SUCCESS", jobs)
+		}
+		r.engine.mu.Lock()
+		defer r.engine.mu.Unlock()
+		if len(r.engine.built) != 1 || r.engine.built[0] != testDockerfile {
+			t.Fatalf("built %q, want the validated Dockerfile", r.engine.built)
+		}
+	})
 }
 
 func TestObservationsMergeSources(t *testing.T) {
