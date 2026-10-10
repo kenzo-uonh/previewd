@@ -58,10 +58,18 @@ func TestHelperProcess(t *testing.T) {
 			os.Exit(2)
 		}
 		// MCL_FUTURE: a fresh 32 MiB allocation must be locked too.
-		buf := make([]byte, 32<<20)
+		// Use unix.Mmap to guarantee new pages from the OS, avoiding Go's allocator
+		// reusing memory that was already locked under MCL_CURRENT.
+		size := 32 << 20
+		buf, err := unix.Mmap(-1, 0, size, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANON)
+		if err != nil {
+			fmt.Println("HELPER-ERR mmap:", err)
+			os.Exit(2)
+		}
 		for i := range buf {
 			buf[i] = byte(i)
 		}
+
 		after, err := LockedMemoryKB()
 		if err != nil {
 			fmt.Println("HELPER-ERR VmLck:", err)
