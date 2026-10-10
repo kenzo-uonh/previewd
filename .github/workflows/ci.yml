@@ -19,6 +19,8 @@ on:
   push:
     branches: [master]
   pull_request:
+  schedule:
+    - cron: '0 2 * * *'
 
 permissions:
   contents: read
@@ -132,7 +134,7 @@ jobs:
   # ---------------- Stage 2: air-gapped verification ----------------
   airgapped:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 360
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
@@ -220,10 +222,10 @@ jobs:
           GOSUMDB: "off"
           GOMODCACHE: ${{ runner.temp }}/empty-modcache
           PREVIEWD_REQUIRE_NS_TESTS: "1"
-          # Pull requests get a smoke budget; a push to master runs the full
+          # PRs and master pushes get a smoke budget; the nightly schedule runs the full
           # one (the Makefile's defaults).
-          RAPID_CHECKS: ${{ github.event_name == 'pull_request' && '100' || '10000' }}
-          FUZZTIME: ${{ github.event_name == 'pull_request' && '10s' || '60s' }}
+          RAPID_CHECKS: ${{ github.event_name == 'schedule' && '10000' || '100' }}
+          FUZZTIME: ${{ github.event_name == 'schedule' && '60s' || '10s' }}
         run: ./scripts/airgap-exec.sh make verify
 
       - name: "Phase 2 (air-gapped): mlockall success path"
