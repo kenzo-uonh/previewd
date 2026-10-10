@@ -43,6 +43,7 @@ On this page: [Codebase Structure](#codebase-structure) · [Development & Execut
 │   ├── docker-compose.yml         # Traefik: digest-pinned, read-only, no socket, routes dir mounted read-only, cgroup parent system.slice.
 │   ├── docker.service.d/
 │   │   └── previewd-builds.conf   # dockerd drop-in: default cgroup parent previewd-builds.slice (BuildKit RUN steps), egress filter (IPAddressDeny).
+│   ├── previewd.service           # Daemon unit (packages): User previewd, Group docker, LimitMEMLOCK, credentials, IPAddressDeny.
 │   ├── previewd-builds.slice      # Bounded subtree of every build: MemoryMax 4G, MemorySwapMax 0, CPUQuota 200%, TasksMax 2048 (D-V1-4).
 │   └── traefik.yml                # Traefik static configuration: file provider only, no API, no telemetry.
 ├── docs/
@@ -92,9 +93,12 @@ On this page: [Codebase Structure](#codebase-structure) · [Development & Execut
 ├── test/e2e/                      # E2E tools, e2e build tag: fakegithub (fake GHES, tarballs), exfil (E3 listener), dockerapi (G1 on the real engine).
 ├── scripts/
 │   ├── build.sh                   # Static binary compilation script.
+│   ├── check-package-install.sh   # `make test-packages`: user, group and installed files after a package install.
+│   ├── postinstall.sh             # Package post-install: previewd system user (no shell, no home) in group docker.
 │   ├── verify-buildkit.sh         # E0 engine probe: BuildKit network isolation, stream errors, cache, pulls, cgroup placement and bounds, cancellation.
 │   └── verify-e2e.sh              # Local, air-gapped end-to-end integration validation.
 ├── Makefile                       # Build, test, and infrastructure automation targets.
+├── nfpm.yaml                      # deb and rpm package definition (`make release`).
 ├── go.mod                         # Go module dependencies.
 └── go.sum                         # Go module checksums.
 
@@ -116,6 +120,8 @@ The project uses a strict `Makefile` for all build and verification pipelines to
 | `make check` | Deterministic gate (deps, format, vet, lint, gosec, govulncheck, air-gap checks, unit tests) |
 | `make airgap-check` | Dependency denylist on the linked binary |
 | `make verify` | Deep verification: property-based tests at volume, then every fuzz target |
+| `make release` | Build the binary, then the deb and rpm packages into `dist/` (nfpm, digest-pinned image, no network) |
+| `make test-packages` | Install, then reinstall, the packages in Ubuntu 24.04 and Fedora 40 containers without network and check the user and files |
 
 #### Initialize Infrastructure
 

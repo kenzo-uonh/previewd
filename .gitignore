@@ -24,6 +24,8 @@ go.work.sum
 
 # Build directories
 bin/
+# Packages (make release)
+dist/
 
 # Air live-reload temporary artifacts
 tmp/

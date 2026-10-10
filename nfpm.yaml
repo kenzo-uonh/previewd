@@ -1,0 +1,39 @@
+# nfpm package definition for previewd (deb and rpm): `make release`.
+# VERSION is passed by the Makefile (PKG_VERSION). The binary is the static
+# one from `make build`; the package declares no dependency, Docker Engine
+# is installed by the site (docs/deployment.md).
+name: previewd
+arch: amd64
+platform: linux
+version: ${VERSION}
+section: admin
+priority: optional
+maintainer: kenzo-uonh <kenzo.uonh@gmail.com>
+description: |-
+  Sovereign single-node preview environments for GitHub Enterprise Server
+  pull requests, on Docker and Traefik, on premises and air-gapped.
+
+contents:
+  - src: ./bin/previewd
+    dst: /usr/local/bin/previewd
+    file_info:
+      mode: 0755
+  - src: deployments/previewd.service
+    dst: /lib/systemd/system/previewd.service
+    file_info:
+      mode: 0644
+  # Under /etc: sites tune the slice limits and the drop-in's ExecStart and
+  # egress allow-list, so upgrades keep their edits.
+  - src: deployments/previewd-builds.slice
+    dst: /etc/systemd/system/previewd-builds.slice
+    type: config|noreplace
+    file_info:
+      mode: 0644
+  - src: deployments/docker.service.d/previewd-builds.conf
+    dst: /etc/systemd/system/docker.service.d/previewd-builds.conf
+    type: config|noreplace
+    file_info:
+      mode: 0644
+
+scripts:
+  postinstall: scripts/postinstall.sh

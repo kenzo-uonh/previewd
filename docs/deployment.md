@@ -5,6 +5,7 @@ Host setup for running previewd on premises, without network access. Every step 
 ## Contents
 
 1. [Host prerequisites](#1-host-prerequisites)
+   - [Install the package](#install-the-package)
 2. [Load images offline](#2-load-images-offline)
 3. [Start Traefik](#3-start-traefik)
 4. [Mount the secrets staging root (ramfs)](#4-mount-the-secrets-staging-root-ramfs)
@@ -18,6 +19,30 @@ Host setup for running previewd on premises, without network access. Every step 
 - Linux with systemd, the systemd cgroup driver and cgroup v2 (bounded builds need it; on cgroup v1 previewd starts only with `PREVIEWD_ALLOW_UNBOUNDED_BUILDS=1`, meant for dev hosts).
 - Docker Engine. The build preflight uses BuildKit v0.33.1, the version Docker 29.8.2 embeds.
 - The GitHub Enterprise Server and the previewd host on NTP: webhook ordering relies on the clock of the GHES that minted the delivery IDs ([Webhook Ingestion](architecture.md#webhook-ingestion), step 4).
+
+### Install the package
+
+`make release` builds `dist/previewd_<version>_amd64.deb` and `dist/previewd-<version>-1.x86_64.rpm` (`nfpm.yaml`). Copy one to the host and install it from the file, with no repository:
+
+```bash
+sudo apt-get install ./previewd_<version>_amd64.deb
+sudo dnf install --disablerepo='*' ./previewd-<version>-1.x86_64.rpm
+```
+
+| Installed file | From |
+|----------------|------|
+| `/usr/local/bin/previewd` | `bin/previewd` |
+| `/lib/systemd/system/previewd.service` | `deployments/previewd.service` |
+| `/etc/systemd/system/previewd-builds.slice` | `deployments/previewd-builds.slice` (configuration file: upgrades keep site edits) |
+| `/etc/systemd/system/docker.service.d/previewd-builds.conf` | `deployments/docker.service.d/previewd-builds.conf` (configuration file) |
+
+- The post-install script creates the `docker` group if missing (Docker's packages keep an existing one) and the `previewd` system user (shell `/bin/false`, no home directory), adds it to `docker` and reloads systemd. It enables, starts and restarts nothing: finish the steps below, then `systemctl restart docker` (section 5) and `systemctl enable --now previewd` (section 8).
+- The package declares no dependency: install Docker Engine separately.
+- Membership of `docker` is root on the host (Engine API socket). Keep that group to previewd and the administrators.
+- Site settings go in `/etc/previewd/previewd.conf` (`PREVIEWD_*` keys, [configuration.md](configuration.md)), read by the unit as `EnvironmentFile=`: paths and identifiers only, never a secret value.
+- The unit keeps its state in `/var/lib/previewd` (`PREVIEWD_DB_PATH=/var/lib/previewd/previewd.sqlite`) and creates the default `PREVIEWD_ROUTES_DIR`, `/var/lib/previewd/routes`.
+- The unit filters its sockets to loopback (`IPAddressDeny=any`, cgroup v2). Allow the GHES address, which delivers the webhooks and serves the API and git, in a drop-in (`systemctl edit previewd`): `[Service]` then `IPAddressAllow=<GHES IP>/32`.
+- `make test-packages` installs then reinstalls both packages in throwaway Ubuntu 24.04 and Fedora 40 containers without network and checks the user, its groups and the installed files. It does not start the unit (no systemd in those containers).
 
 ## 2. Load images offline
 
@@ -63,7 +88,7 @@ A BuildKit `RUN` step is the PR author's code. Two files bound the engine that r
 | `deployments/previewd-builds.slice` | `/etc/systemd/system/` | Bounded subtree of every build: MemoryMax 4G, MemorySwapMax 0, CPUQuota 200%, TasksMax 2048 |
 | `deployments/docker.service.d/previewd-builds.conf` | `/etc/systemd/system/docker.service.d/` | Makes the slice dockerd's default cgroup parent and filters dockerd's own egress (`IPAddressDeny`) |
 
-With the systemd cgroup driver:
+The packages install both files. From a source checkout, with the systemd cgroup driver:
 
 ```bash
 sudo cp deployments/previewd-builds.slice /etc/systemd/system/
@@ -87,8 +112,8 @@ PREVIEWD_BUILDKIT_CGROUP=/sys/fs/cgroup/previewd.slice/previewd-builds.slice
 
 ## 6. Credentials and memory locking
 
-- Seal the webhook secret, the GitHub App key and the listener's TLS key as systemd credentials and pass them to the unit by name: see [Credentials](configuration.md#credentials). None of them is ever read from the environment or a configured path.
-- Set `LimitMEMLOCK=infinity` in the unit. The daemon locks all current and future memory before reading any secret and refuses to start unless `RLIMIT_MEMLOCK` is unlimited ([`PREVIEWD_ALLOW_UNLOCKED_MEMORY`](configuration.md#previewd_allow_unlocked_memory)).
+- Seal the webhook secret, the GitHub App key and the listener's TLS key as systemd credentials and pass them to the unit by name: see [Credentials](configuration.md#credentials). None of them is ever read from the environment or a configured path. `deployments/previewd.service` loads `webhook_secret` and `github-app-key` from `/etc/credstore.encrypted/`, and systemd refuses to start it while either file is missing; add the TLS key credential in the drop-in, it has no default name.
+- Set `LimitMEMLOCK=infinity` in the unit (`deployments/previewd.service` does). The daemon locks all current and future memory before reading any secret and refuses to start unless `RLIMIT_MEMLOCK` is unlimited ([`PREVIEWD_ALLOW_UNLOCKED_MEMORY`](configuration.md#previewd_allow_unlocked_memory)).
 
 ## 7. GitHub Enterprise Server
 

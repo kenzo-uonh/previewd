@@ -1,4 +1,4 @@
-.PHONY: all build run dev clean fmt vet lint test sec deps deps-check vendor-check check verify airgap-check fmt-check repomix vuln docker-up docker-down help e2e verify-buildkit airgap-scan store-fixture-v2 semgrep
+.PHONY: all build run dev clean fmt vet lint test sec deps deps-check vendor-check check verify airgap-check fmt-check repomix vuln docker-up docker-down help e2e verify-buildkit airgap-scan store-fixture-v2 semgrep release test-packages
 
 APP_NAME    := previewd
 BIN_DIR     := bin
@@ -18,6 +18,10 @@ RAPID_SEED  ?= 1
 # Deep verification budgets (make verify, random rapid seed)
 RAPID_CHECKS ?= 10000
 FUZZTIME    ?= 60s
+# Package version: VERSION without its leading v when it starts with a
+# digit (a release tag), 1.0.0 otherwise (an untagged commit hash or "dev").
+PKG_VERSION ?= $(or $(shell echo '$(VERSION)' | sed -n 's/^v\{0,1\}\([0-9][0-9A-Za-z.+~-]*\)$$/\1/p'),1.0.0)
+DIST_DIR    := dist
 
 # Default target
 .DEFAULT_GOAL := help
@@ -107,6 +111,33 @@ semgrep: ## Semgrep rule self-tests, then the scan, in the pinned image without 
 	@docker run --rm --pull never --network none -v "$(CURDIR):/src:ro" -w /src "$(SEMGREP_IMAGE)" \
 		semgrep scan --metrics=off --disable-version-check --error --strict --timeout 0 $(foreach r,$(SEMGREP_RULES),--config .semgrep/$(r).yaml) .
 
+# Packaging images, pinned by digest. Each runs with --network none: on an
+# air-gapped builder, docker load them first.
+NFPM_IMAGE         ?= goreleaser/nfpm:v2.43.0@sha256:929e1056ba69bf1da57791e851d210e9d6d4f528fede53a55bd43cf85674450c
+PKG_TEST_DEB_IMAGE ?= ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+PKG_TEST_RPM_IMAGE ?= fedora:40@sha256:3c86d25fef9d2001712bc3d9b091fc40cf04be4767e48f1aa3b785bf58d300ed
+
+release: build ## Package bin/previewd as deb and rpm into dist/ (nfpm.yaml, PKG_VERSION)
+	@echo "Packaging previewd $(PKG_VERSION) (deb, rpm)..."
+	@mkdir -p $(DIST_DIR)
+	@rm -f $(DIST_DIR)/previewd*.deb $(DIST_DIR)/previewd*.rpm
+	docker run --rm --network none -u "$$(id -u):$$(id -g)" -e VERSION=$(PKG_VERSION) \
+		-v "$(CURDIR):/src:ro" -v "$(CURDIR)/$(DIST_DIR):/src/$(DIST_DIR)" -w /src "$(NFPM_IMAGE)" \
+		package --config nfpm.yaml --packager deb --target $(DIST_DIR)/
+	docker run --rm --network none -u "$$(id -u):$$(id -g)" -e VERSION=$(PKG_VERSION) \
+		-v "$(CURDIR):/src:ro" -v "$(CURDIR)/$(DIST_DIR):/src/$(DIST_DIR)" -w /src "$(NFPM_IMAGE)" \
+		package --config nfpm.yaml --packager rpm --target $(DIST_DIR)/
+
+test-packages: release ## Install the deb (Ubuntu 24.04) and rpm (Fedora 40) in throwaway containers without network (install, reinstall), check user and files
+	@echo "Installing the deb on $(PKG_TEST_DEB_IMAGE)..."
+	docker run --rm --network none -v "$(CURDIR)/$(DIST_DIR):/dist:ro" \
+		-v "$(CURDIR)/scripts/check-package-install.sh:/check.sh:ro" "$(PKG_TEST_DEB_IMAGE)" \
+		sh -euc 'apt-get install -y -q /dist/previewd*.deb && apt-get install -y -q --reinstall /dist/previewd*.deb && sh /check.sh' # airgap:allow installs the local package file, --network none
+	@echo "Installing the rpm on $(PKG_TEST_RPM_IMAGE)..."
+	docker run --rm --network none -v "$(CURDIR)/$(DIST_DIR):/dist:ro" \
+		-v "$(CURDIR)/scripts/check-package-install.sh:/check.sh:ro" "$(PKG_TEST_RPM_IMAGE)" \
+		sh -euc 'dnf install -y -q --disablerepo="*" /dist/previewd*.rpm && dnf reinstall -y -q --disablerepo="*" /dist/previewd*.rpm && sh /check.sh' # airgap:allow installs the local package file, --network none
+
 sec: ## Run gosec AST security scanner
 	@echo "Running AST security scanner..."
 	@which gosec > /dev/null 2>&1 && gosec -quiet -exclude-dir=.semgrep ./... || $(GOPATH_BIN)/gosec -quiet -exclude-dir=.semgrep ./...
@@ -147,5 +178,5 @@ docker-down: ## Stop local docker compose services
 
 clean: ## Clean build artifacts, logs, and caches
 	@echo "Cleaning workspace..."
-	rm -rf $(BIN_DIR) tmp build-errors.log repomix-output.* vuln-report.txt coverage.out
+	rm -rf $(BIN_DIR) $(DIST_DIR) tmp build-errors.log repomix-output.* vuln-report.txt coverage.out
 	go clean -testcache
