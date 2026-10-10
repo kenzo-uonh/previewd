@@ -43,11 +43,11 @@ func ParseDeliveryID(s string) (DeliveryID, error) {
 		switch i {
 		case 8, 13, 18, 23:
 			if c != '-' {
-				return DeliveryID{}, fmt.Errorf("%w: %s", ErrDelivery, quote(s))
+				return DeliveryID{}, fmt.Errorf("%w: %s", ErrDelivery, Quote(s))
 			}
 		default:
 			if !isHex(c) {
-				return DeliveryID{}, fmt.Errorf("%w: %s", ErrDelivery, quote(s))
+				return DeliveryID{}, fmt.Errorf("%w: %s", ErrDelivery, Quote(s))
 			}
 		}
 	}

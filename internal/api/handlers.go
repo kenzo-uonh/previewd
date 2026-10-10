@@ -133,7 +133,8 @@ func (s *Server) handleGitHubWebhook() http.HandlerFunc {
 		}
 
 		if event != vcs.EventPullRequest && event != vcs.EventPullRequestReview {
-			s.logger.Debug("Ignoring webhook event", "event", event)
+			// The header is unvalidated: quoted and bounded.
+			s.logger.Debug("Ignoring webhook event", "event", validate.Quote(event))
 			s.respond(w, http.StatusAccepted, reply{Status: "ignored"})
 			return
 		}

@@ -28,19 +28,19 @@ var ErrImageNotPinned = errors.New("image reference is not pinned as name:tag@sh
 // a tag-only one is not pinned.
 func BaseImage(s string) (string, error) {
 	if s == "" || len(s) > maxImageRefLen {
-		return "", fmt.Errorf("invalid image reference %s", quote(s))
+		return "", fmt.Errorf("invalid image reference %s", Quote(s))
 	}
 	ref, err := reference.ParseNormalizedNamed(s)
 	if err != nil {
-		return "", fmt.Errorf("invalid image reference %s: %w", quote(s), err)
+		return "", fmt.Errorf("invalid image reference %s: %w", Quote(s), err)
 	}
 	canonical, digested := ref.(reference.Canonical)
 	_, tagged := ref.(reference.Tagged)
 	if !digested || !tagged {
-		return "", fmt.Errorf("%w: %s", ErrImageNotPinned, quote(s))
+		return "", fmt.Errorf("%w: %s", ErrImageNotPinned, Quote(s))
 	}
 	if d := canonical.Digest(); d.Algorithm() != digest.SHA256 || d.Validate() != nil {
-		return "", fmt.Errorf("%w: %s", ErrImageNotPinned, quote(s))
+		return "", fmt.Errorf("%w: %s", ErrImageNotPinned, Quote(s))
 	}
 	return ref.String(), nil
 }
@@ -60,7 +60,7 @@ func AllowedBaseImages(s string) (map[string]bool, error) {
 			return nil, fmt.Errorf("entry %d: %w", i+1, err)
 		}
 		if out[canonical] {
-			return nil, fmt.Errorf("entry %d: %s listed twice", i+1, quote(entry))
+			return nil, fmt.Errorf("entry %d: %s listed twice", i+1, Quote(entry))
 		}
 		out[canonical] = true
 	}

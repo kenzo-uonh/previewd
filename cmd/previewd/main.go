@@ -45,7 +45,7 @@ func main() {
 	if code, ran := subcommand(); ran {
 		os.Exit(code)
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	logger := newLogger(os.Stdout)
 	slog.SetDefault(logger)
 
 	cfg, err := config.Load()
@@ -383,6 +383,14 @@ const maxCABundleBytes = 1 << 20
 
 // newGHESClient builds the GitHub App client: the key from its systemd
 // credential, held in memory only, the site CA when one is configured.
+// newLogger is the daemon's logger: one JSON record per line. The JSON
+// handler escapes every control character in keys and values, so a value
+// from a webhook (a login, a label, an error quoting a payload) cannot end
+// its record or forge another (CodeQL go/log-injection).
+func newLogger(w io.Writer) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(w, nil))
+}
+
 func newGHESClient(cfg *config.Config, logger *slog.Logger) (*vcs.Client, error) {
 	key, err := secrets.Credential(cfg.GitHubAppKeyCredential)
 	if err != nil {

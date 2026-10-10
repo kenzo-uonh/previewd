@@ -33,11 +33,11 @@ func ParseApprovers(s string) (map[string][]Approver, error) {
 	for i, entry := range strings.Split(s, ",") {
 		repo, who, ok := strings.Cut(entry, ":")
 		if !ok {
-			return nil, fmt.Errorf("approver entry %d %s: want owner/repo:login#id", i+1, quote(entry))
+			return nil, fmt.Errorf("approver entry %d %s: want owner/repo:login#id", i+1, Quote(entry))
 		}
 		login, idText, ok := strings.Cut(who, "#")
 		if !ok {
-			return nil, fmt.Errorf("approver entry %d %s: the numeric account ID (#id) is mandatory", i+1, quote(entry))
+			return nil, fmt.Errorf("approver entry %d %s: the numeric account ID (#id) is mandatory", i+1, Quote(entry))
 		}
 		if err := RepoFullName(repo); err != nil {
 			return nil, fmt.Errorf("approver entry %d: %w", i+1, err)
@@ -47,7 +47,7 @@ func ParseApprovers(s string) (map[string][]Approver, error) {
 		}
 		id, err := strconv.ParseInt(idText, 10, 64)
 		if err != nil || id <= 0 || strconv.FormatInt(id, 10) != idText {
-			return nil, fmt.Errorf("approver entry %d: account id %s is not a positive decimal integer", i+1, quote(idText))
+			return nil, fmt.Errorf("approver entry %d: account id %s is not a positive decimal integer", i+1, Quote(idText))
 		}
 		for _, a := range out[repo] {
 			if a.ID == id {

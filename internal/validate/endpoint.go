@@ -13,7 +13,7 @@ func GHESURL(s string) (string, error) {
 	u, err := url.Parse(s)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.Hostname() == "" || u.User != nil ||
 		(u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Opaque != "" {
-		return "", fmt.Errorf("GHES URL %s must be https://host[:port] with no user info, path, query or fragment", quote(s))
+		return "", fmt.Errorf("GHES URL %s must be https://host[:port] with no user info, path, query or fragment", Quote(s))
 	}
 	return "https://" + u.Host, nil
 }
@@ -23,12 +23,12 @@ func GHESURL(s string) (string, error) {
 // $CREDENTIALS_DIRECTORY, never a path.
 func CredentialName(s string) error {
 	if s == "" || len(s) > 64 || s == "." || s == ".." {
-		return fmt.Errorf("invalid credential name %s", quote(s))
+		return fmt.Errorf("invalid credential name %s", Quote(s))
 	}
 	for i := range len(s) {
 		c := s[i]
 		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '.' && c != '_' && c != '-' {
-			return fmt.Errorf("invalid credential name %s", quote(s))
+			return fmt.Errorf("invalid credential name %s", Quote(s))
 		}
 	}
 	return nil
@@ -46,10 +46,10 @@ func CIDRs(s string) ([]netip.Prefix, error) {
 	for i, entry := range strings.Split(s, ",") {
 		p, err := netip.ParsePrefix(entry)
 		if err != nil {
-			return nil, fmt.Errorf("CIDR entry %d %s: want a prefix such as 10.0.0.0/8", i+1, quote(entry))
+			return nil, fmt.Errorf("CIDR entry %d %s: want a prefix such as 10.0.0.0/8", i+1, Quote(entry))
 		}
 		if p != p.Masked() {
-			return nil, fmt.Errorf("CIDR entry %d %s has host bits set: did you mean %s?", i+1, quote(entry), p.Masked())
+			return nil, fmt.Errorf("CIDR entry %d %s has host bits set: did you mean %s?", i+1, Quote(entry), p.Masked())
 		}
 		out = append(out, p)
 	}

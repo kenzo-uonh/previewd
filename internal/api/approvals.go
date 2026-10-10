@@ -52,7 +52,9 @@ func (s *Server) truth(r *http.Request, log *slog.Logger, repo string, number ui
 func (s *Server) handleReview(w http.ResponseWriter, r *http.Request, in inbound, body []byte) {
 	rv, err := validate.ParseReview(body)
 	if errors.Is(err, validate.ErrIgnoredAction) {
-		s.logger.Debug("Review ignored", "pr_number", rv.Number, "repository", rv.Repo, "action", rv.Action, "state", rv.State)
+		// An ignored action is any string GHES sent: quoted and bounded.
+		s.logger.Debug("Review ignored", "pr_number", rv.Number, "repository", rv.Repo,
+			"action", validate.Quote(rv.Action), "state", rv.State)
 		s.respond(w, http.StatusAccepted, reply{Status: "action_ignored"})
 		return
 	}

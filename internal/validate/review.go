@@ -113,11 +113,11 @@ func ParseReview(body []byte) (Review, error) {
 // pending) may grow, and an unknown state is ignored, never acted on.
 func reviewState(s string) error {
 	if s == "" || len(s) > 32 {
-		return fmt.Errorf("invalid review state %s", quote(s))
+		return fmt.Errorf("invalid review state %s", Quote(s))
 	}
 	for i := range len(s) {
 		if c := s[i]; (c < 'a' || c > 'z') && c != '_' {
-			return fmt.Errorf("invalid review state %s", quote(s))
+			return fmt.Errorf("invalid review state %s", Quote(s))
 		}
 	}
 	return nil

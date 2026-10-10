@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -102,6 +103,9 @@ type harness struct {
 	gh  GitHub
 	cfg *config.Config
 	now time.Time
+	// logs receives the server's records as JSON, Debug included; nil
+	// discards them.
+	logs io.Writer
 }
 
 func newHarness() *harness {
@@ -116,7 +120,12 @@ func newHarness() *harness {
 
 func (h *harness) send(t *testing.T, event, delivery, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	srv, err := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), h.cfg, []byte(testSecret), h.q, h.w, h.gh)
+	logs := h.logs
+	if logs == nil {
+		logs = io.Discard
+	}
+	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	srv, err := NewServer(logger, h.cfg, []byte(testSecret), h.q, h.w, h.gh)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,6 +255,48 @@ func TestWebhookIgnoresOtherActionsAndEvents(t *testing.T) {
 			rec := h.send(t, tc.event, v1Delivery, tc.body)
 			if rec.Code != http.StatusAccepted || h.q.recorded() != 0 || !strings.Contains(rec.Body.String(), `"status":"`+tc.status+`"`) {
 				t.Fatalf("reply %d %s, recorded %d", rec.Code, rec.Body, h.q.recorded())
+			}
+		})
+	}
+}
+
+// The two webhook values logged before any validation, the X-GitHub-Event
+// header of an ignored event and the action of an ignored review, are
+// logged through validate.Quote: escaped and bounded, so a hostile value
+// cannot forge a record or flood the log (CodeQL go/log-injection).
+func TestWebhookLogsUnvalidatedValuesQuotedAndBounded(t *testing.T) {
+	hostile := "x\n{\"level\":\"ERROR\",\"msg\":\"forged\"}\r" + strings.Repeat("A", 4096)
+	for name, tc := range map[string]struct{ event, body, key string }{
+		"event header":  {hostile, `{}`, "event"},
+		"review action": {"pull_request_review", reviewBody(hostile, "approved", 7, headSHA, signedAt), "action"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var logs strings.Builder
+			h := newHarness()
+			h.logs = &logs
+			if rec := h.send(t, tc.event, v1Delivery, tc.body); rec.Code != http.StatusAccepted {
+				t.Fatalf("reply %d %s", rec.Code, rec.Body)
+			}
+			found := false
+			for line := range strings.Lines(logs.String()) {
+				var record map[string]any
+				if err := json.Unmarshal([]byte(line), &record); err != nil {
+					t.Fatalf("log line is not one JSON record: %v: %q", err, line)
+				}
+				if record["msg"] == "forged" {
+					t.Fatalf("forged record: %q", line)
+				}
+				v, ok := record[tc.key].(string)
+				if !ok {
+					continue
+				}
+				found = true
+				if strings.ContainsAny(v, "\n\r") || len(v) > 512 || !strings.HasPrefix(v, `"x\n`) {
+					t.Fatalf("%s logged as %q (%d bytes), want quoted and bounded", tc.key, v, len(v))
+				}
+			}
+			if !found {
+				t.Fatalf("no record with %q in:\n%s", tc.key, logs.String())
 			}
 		})
 	}

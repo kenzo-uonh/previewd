@@ -30,9 +30,10 @@ const (
 	maxQuotedLen    = 64
 )
 
-// quote renders untrusted input for an error message: escaped, and cut to
+// Quote renders untrusted input for an error message or a log value: escaped
+// (%q, so no control character survives), and cut to
 // maxQuotedLen bytes so a hostile value cannot flood a log line.
-func quote(s string) string {
+func Quote(s string) string {
 	if len(s) > maxQuotedLen {
 		return fmt.Sprintf("%q...(%d bytes)", s[:maxQuotedLen], len(s))
 	}
@@ -42,10 +43,10 @@ func quote(s string) string {
 // RepoFullName validates "owner/repository".
 func RepoFullName(s string) error {
 	if !repoFullNamePattern.MatchString(s) {
-		return fmt.Errorf("invalid repository name %s", quote(s))
+		return fmt.Errorf("invalid repository name %s", Quote(s))
 	}
 	if _, repo, _ := strings.Cut(s, "/"); repo == "." || repo == ".." {
-		return fmt.Errorf("invalid repository name %s", quote(s))
+		return fmt.Errorf("invalid repository name %s", Quote(s))
 	}
 	return nil
 }
@@ -54,7 +55,7 @@ func RepoFullName(s string) error {
 // audit trail only: identity is the numeric account ID.
 func Login(s string) error {
 	if !loginPattern.MatchString(s) {
-		return fmt.Errorf("invalid login %s", quote(s))
+		return fmt.Errorf("invalid login %s", Quote(s))
 	}
 	return nil
 }
@@ -63,11 +64,11 @@ func Login(s string) error {
 // no control character.
 func LabelName(s string) error {
 	if s == "" || len(s) > maxLabelLen || !utf8.ValidString(s) {
-		return fmt.Errorf("invalid label %s", quote(s))
+		return fmt.Errorf("invalid label %s", Quote(s))
 	}
 	for _, r := range s {
 		if unicode.IsControl(r) {
-			return fmt.Errorf("invalid label %s", quote(s))
+			return fmt.Errorf("invalid label %s", Quote(s))
 		}
 	}
 	return nil
@@ -77,11 +78,11 @@ func LabelName(s string) error {
 // submitted_at) after the Unix epoch, in UTC.
 func Timestamp(s string) (time.Time, error) {
 	if len(s) > maxTimestampLen {
-		return time.Time{}, fmt.Errorf("invalid timestamp %s", quote(s))
+		return time.Time{}, fmt.Errorf("invalid timestamp %s", Quote(s))
 	}
 	t, err := time.Parse(time.RFC3339, s)
 	if err != nil || t.Unix() <= 0 {
-		return time.Time{}, fmt.Errorf("invalid timestamp %s", quote(s))
+		return time.Time{}, fmt.Errorf("invalid timestamp %s", Quote(s))
 	}
 	return t.UTC(), nil
 }
@@ -89,7 +90,7 @@ func Timestamp(s string) (time.Time, error) {
 // CommitSHA validates a full lowercase SHA-1 or SHA-256 object name.
 func CommitSHA(s string) error {
 	if !commitSHAPattern.MatchString(s) {
-		return fmt.Errorf("invalid commit sha %s", quote(s))
+		return fmt.Errorf("invalid commit sha %s", Quote(s))
 	}
 	return nil
 }
@@ -97,7 +98,7 @@ func CommitSHA(s string) error {
 // GitRef validates a branch name with the rules of git check-ref-format
 // (one or more components, short form as GitHub sends it in head.ref).
 func GitRef(s string) error {
-	bad := func() error { return fmt.Errorf("invalid git ref %s", quote(s)) }
+	bad := func() error { return fmt.Errorf("invalid git ref %s", Quote(s)) }
 
 	if s == "" || len(s) > maxGitRefLen || s == "@" {
 		return bad()
@@ -123,7 +124,7 @@ func GitRef(s string) error {
 // DNSLabel validates an RFC 1123 label (lowercase).
 func DNSLabel(s string) error {
 	if !dnsLabelPattern.MatchString(s) {
-		return fmt.Errorf("invalid DNS label %s", quote(s))
+		return fmt.Errorf("invalid DNS label %s", Quote(s))
 	}
 	return nil
 }
@@ -131,11 +132,11 @@ func DNSLabel(s string) error {
 // DNSName validates a lowercase fully qualified name without trailing dot.
 func DNSName(s string) error {
 	if s == "" || len(s) > maxDNSNameLen {
-		return fmt.Errorf("invalid DNS name %s", quote(s))
+		return fmt.Errorf("invalid DNS name %s", Quote(s))
 	}
 	for label := range strings.SplitSeq(s, ".") {
 		if !dnsLabelPattern.MatchString(label) {
-			return fmt.Errorf("invalid DNS name %s", quote(s))
+			return fmt.Errorf("invalid DNS name %s", Quote(s))
 		}
 	}
 	return nil

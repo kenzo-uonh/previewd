@@ -185,12 +185,13 @@ func TestLoadBuildBoundsAndPruneKeys(t *testing.T) {
 		t.Fatalf("bounds = %+v", cfg)
 	}
 	for key, bads := range map[string][]string{
-		"PREVIEWD_MAX_BUILDS":            {"0", "65", "-1", "two", "2.0", " 2"},
-		"PREVIEWD_MAX_CONCURRENT_BUILDS": {"0", "17", "-1", "one", "1.5"},
+		// 4294967298 is 2 once narrowed to 32 bits; 2^63 overflows int64.
+		"PREVIEWD_MAX_BUILDS":            {"0", "65", "-1", "two", "2.0", " 2", "4294967298", "9223372036854775808", "-9223372036854775809"},
+		"PREVIEWD_MAX_CONCURRENT_BUILDS": {"0", "17", "-1", "one", "1.5", "4294967297"},
 		"PREVIEWD_BUILD_TIMEOUT":         {"59s", "2h1m", "0", "-20m", "20", "forever"},
 		"PREVIEWD_RETENTION":             {"23h59m", "0", "-720h", "720", "87601h"},
 		"PREVIEWD_PRUNE_INTERVAL":        {"59s", "24h1m", "0", "1"},
-		"PREVIEWD_PRUNE_BATCH":           {"9", "10001", "0", "-500", "500rows"},
+		"PREVIEWD_PRUNE_BATCH":           {"9", "10001", "0", "-500", "500rows", "4294967796"},
 	} {
 		for _, bad := range bads {
 			t.Run(key+"="+bad, func(t *testing.T) {

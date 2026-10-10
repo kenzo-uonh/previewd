@@ -205,7 +205,7 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
-	workers, err := boundedInt("PREVIEWD_MAX_BUILDS", defaultWorkers, 1, maxWorkers)
+	workers, err := boundedCount("PREVIEWD_MAX_BUILDS", defaultWorkers, 1, maxWorkers)
 	if err != nil {
 		return nil, err
 	}
@@ -281,7 +281,7 @@ func Load() (*Config, error) {
 		}
 	}
 
-	concurrentBuilds, err := boundedInt("PREVIEWD_MAX_CONCURRENT_BUILDS", defaultConcurrentBuilds, 1, maxConcurrentBuilds)
+	concurrentBuilds, err := boundedCount("PREVIEWD_MAX_CONCURRENT_BUILDS", defaultConcurrentBuilds, 1, maxConcurrentBuilds)
 	if err != nil {
 		return nil, err
 	}
@@ -297,7 +297,7 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	pruneBatch, err := boundedInt("PREVIEWD_PRUNE_BATCH", defaultPruneBatch, minPruneBatch, maxPruneBatch)
+	pruneBatch, err := boundedCount("PREVIEWD_PRUNE_BATCH", defaultPruneBatch, minPruneBatch, maxPruneBatch)
 	if err != nil {
 		return nil, err
 	}
@@ -359,7 +359,7 @@ func Load() (*Config, error) {
 		TraefikContainer:    traefikContainer,
 		AllowTmpfsSecrets:   allowTmpfs,
 		AllowUnlockedMemory: allowUnlocked,
-		Workers:             int(workers),
+		Workers:             workers,
 		ContainerMemoryMiB:  memoryMiB,
 		ContainerPids:       pids,
 		Approvers:           approvers,
@@ -375,12 +375,12 @@ func Load() (*Config, error) {
 		BuildKitCgroup:       buildkitCgroup,
 		AllowUnboundedBuilds: unbounded,
 		BuildProbeAddr:       probeAddr,
-		MaxConcurrentBuilds:  int(concurrentBuilds),
+		MaxConcurrentBuilds:  concurrentBuilds,
 		BuildTimeout:         buildTimeout,
 
 		Retention:     retention,
 		PruneInterval: pruneInterval,
-		PruneBatch:    int(pruneBatch),
+		PruneBatch:    pruneBatch,
 
 		EnvTTL:           envTTL,
 		MinFreeDiskBytes: minFreeDiskMiB << 20,
@@ -479,6 +479,22 @@ func boundedInt(name string, def, lo, hi int64) (int64, error) {
 		return def, nil
 	}
 	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < lo || n > hi {
+		return 0, fmt.Errorf("invalid %s %q: want an integer in %d..%d", name, v, lo, hi)
+	}
+	return n, nil
+}
+
+// boundedCount reads a count kept as an int (workers, slots, batch size).
+// It parses at the platform's int size, so no value is ever narrowed: an
+// integer outside [lo, hi], including one that does not fit an int, is a
+// configuration error.
+func boundedCount(name string, def, lo, hi int) (int, error) {
+	v := os.Getenv(name)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
 	if err != nil || n < lo || n > hi {
 		return 0, fmt.Errorf("invalid %s %q: want an integer in %d..%d", name, v, lo, hi)
 	}
