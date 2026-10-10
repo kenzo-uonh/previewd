@@ -275,3 +275,14 @@ Property-based tests (`pgregory.net/rapid`, `-rapid.checks=$(RAPID_CHECKS)`, def
 - On Ubuntu 24.04, `scripts/ci-apparmor-userns.sh` installs an AppArmor profile that grants the `userns` permission to `unshare` only. The global `kernel.apparmor_restrict_unprivileged_userns` stays on. The script then checks that an unprivileged network namespace can be created, and fails otherwise.
 - Harden-Runner, CodeQL and the Semgrep image are CI-only SaaS, authorized for the pipeline. None of them is a runtime dependency of `previewd`.
 - Actions are pinned by commit SHA, and checkout does not persist the job token to disk.
+
+### Release (`.github/workflows/release.yml`)
+
+On a pushed `v*` tag, job `build-and-release`:
+
+1. Refuses a tag that is not `vMAJOR.MINOR.PATCH[-PRERELEASE]` or does not point at the checked-out commit (the Makefile would otherwise package it as `1.0.0`).
+2. `make test-packages` with the tag's version: `make release` builds the deb and rpm into `dist/`, then both are installed and reinstalled in Ubuntu 24.04 and Fedora 42 containers.
+3. Generates a CycloneDX SBOM of the tree (`dist/previewd-sbom.json`) with a digest-pinned syft image run with `--network none`.
+4. Writes `dist/SHA256SUMS` and publishes the GitHub release (`gh release create --generate-notes`) with the packages, the SBOM and the checksums.
+
+Same rules as `ci.yml`: Harden-Runner in `block` mode, actions pinned by SHA, images by digest, no persisted token. The workflow needs `contents: write` to create the release. The release is not signed and is not gated on `ci.yml`: tag a commit whose CI passed.
