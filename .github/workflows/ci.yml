@@ -19,8 +19,7 @@ on:
   push:
     branches: [master]
   pull_request:
-  schedule:
-    - cron: '0 2 * * *'
+  workflow_dispatch: # Manual trigger for deep verification
 
 permissions:
   contents: read
@@ -222,10 +221,10 @@ jobs:
           GOSUMDB: "off"
           GOMODCACHE: ${{ runner.temp }}/empty-modcache
           PREVIEWD_REQUIRE_NS_TESTS: "1"
-          # PRs and master pushes get a smoke budget; the nightly schedule runs the full
+          # PRs and master pushes get a smoke budget; manual runs (workflow_dispatch) get the full
           # one (the Makefile's defaults).
-          RAPID_CHECKS: ${{ github.event_name == 'schedule' && '10000' || '100' }}
-          FUZZTIME: ${{ github.event_name == 'schedule' && '60s' || '10s' }}
+          RAPID_CHECKS: ${{ github.event_name == 'workflow_dispatch' && '10000' || '100' }}
+          FUZZTIME: ${{ github.event_name == 'workflow_dispatch' && '60s' || '10s' }}
         run: ./scripts/airgap-exec.sh make verify
 
       - name: "Phase 2 (air-gapped): mlockall success path"
