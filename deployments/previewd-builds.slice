@@ -26,7 +26,10 @@
 # default): every build in flight shares them. Scale MemoryMax, CPUQuota and
 # TasksMax before raising it.
 #
-# Install: cp previewd-builds.slice /etc/systemd/system/ && systemctl daemon-reload
+# Install: the packages put it in /usr/lib/systemd/system/; from a source
+#          checkout, cp previewd-builds.slice /etc/systemd/system/ && systemctl daemon-reload
+# Tune:    systemctl edit previewd-builds.slice (an /etc drop-in; upgrades
+#          replace the packaged unit)
 # Check:   systemctl show -p MemoryMax,MemorySwapMax,CPUQuotaPerSecUSec,TasksMax previewd-builds.slice
 #          cat /sys/fs/cgroup/previewd.slice/previewd-builds.slice/{memory.max,memory.swap.max,cpu.max,pids.max}
 #

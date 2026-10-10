@@ -1,7 +1,7 @@
 # previewd.service: the previewd agent (docs/deployment.md).
 #
 # Installed by the deb/rpm packages (nfpm.yaml) to
-# /lib/systemd/system/previewd.service. Site settings go in
+# /usr/lib/systemd/system/previewd.service. Site settings go in
 # /etc/previewd/previewd.conf (PREVIEWD_* keys, docs/configuration.md):
 # paths and identifiers only, never a secret value.
 #
@@ -32,7 +32,7 @@ StateDirectory=previewd previewd/routes
 StateDirectoryMode=0750
 Environment=PREVIEWD_DB_PATH=/var/lib/previewd/previewd.sqlite
 EnvironmentFile=-/etc/previewd/previewd.conf
-ExecStart=/usr/local/bin/previewd
+ExecStart=/usr/bin/previewd
 Restart=on-failure
 RestartSec=5s
 

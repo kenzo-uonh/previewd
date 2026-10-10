@@ -15,23 +15,21 @@ description: |-
 
 contents:
   - src: ./bin/previewd
-    dst: /usr/local/bin/previewd
+    dst: /usr/bin/previewd
     file_info:
       mode: 0755
   - src: deployments/previewd.service
-    dst: /lib/systemd/system/previewd.service
+    dst: /usr/lib/systemd/system/previewd.service
     file_info:
       mode: 0644
-  # Under /etc: sites tune the slice limits and the drop-in's ExecStart and
-  # egress allow-list, so upgrades keep their edits.
+  # Vendor units, replaced on upgrade. Sites never edit them: they override
+  # in /etc/systemd/system (docs/deployment.md, Install the package).
   - src: deployments/previewd-builds.slice
-    dst: /etc/systemd/system/previewd-builds.slice
-    type: config|noreplace
+    dst: /usr/lib/systemd/system/previewd-builds.slice
     file_info:
       mode: 0644
   - src: deployments/docker.service.d/previewd-builds.conf
-    dst: /etc/systemd/system/docker.service.d/previewd-builds.conf
-    type: config|noreplace
+    dst: /usr/lib/systemd/system/docker.service.d/previewd-builds.conf
     file_info:
       mode: 0644
 

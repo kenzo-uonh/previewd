@@ -31,10 +31,12 @@ sudo dnf install --disablerepo='*' ./previewd-<version>-1.x86_64.rpm
 
 | Installed file | From |
 |----------------|------|
-| `/usr/local/bin/previewd` | `bin/previewd` |
-| `/lib/systemd/system/previewd.service` | `deployments/previewd.service` |
-| `/etc/systemd/system/previewd-builds.slice` | `deployments/previewd-builds.slice` (configuration file: upgrades keep site edits) |
-| `/etc/systemd/system/docker.service.d/previewd-builds.conf` | `deployments/docker.service.d/previewd-builds.conf` (configuration file) |
+| `/usr/bin/previewd` | `bin/previewd` |
+| `/usr/lib/systemd/system/previewd.service` | `deployments/previewd.service` |
+| `/usr/lib/systemd/system/previewd-builds.slice` | `deployments/previewd-builds.slice` |
+| `/usr/lib/systemd/system/docker.service.d/previewd-builds.conf` | `deployments/docker.service.d/previewd-builds.conf` |
+
+- These are vendor files: every upgrade replaces them. Override in `/etc/systemd/system`, never in place: `systemctl edit previewd` or `systemctl edit previewd-builds.slice` for a drop-in; for the docker drop-in (another `ExecStart`, another allow-list), copy it to `/etc/systemd/system/docker.service.d/` under the same name and edit the copy, which then replaces the packaged one.
 
 - The post-install script creates the `docker` group if missing (Docker's packages keep an existing one) and the `previewd` system user (shell `/bin/false`, no home directory), adds it to `docker` and reloads systemd. It enables, starts and restarts nothing: finish the steps below, then `systemctl restart docker` (section 5) and `systemctl enable --now previewd` (section 8).
 - The package declares no dependency: install Docker Engine separately.
@@ -42,7 +44,7 @@ sudo dnf install --disablerepo='*' ./previewd-<version>-1.x86_64.rpm
 - Site settings go in `/etc/previewd/previewd.conf` (`PREVIEWD_*` keys, [configuration.md](configuration.md)), read by the unit as `EnvironmentFile=`: paths and identifiers only, never a secret value.
 - The unit keeps its state in `/var/lib/previewd` (`PREVIEWD_DB_PATH=/var/lib/previewd/previewd.sqlite`) and creates the default `PREVIEWD_ROUTES_DIR`, `/var/lib/previewd/routes`.
 - The unit filters its sockets to loopback (`IPAddressDeny=any`, cgroup v2). Allow the GHES address, which delivers the webhooks and serves the API and git, in a drop-in (`systemctl edit previewd`): `[Service]` then `IPAddressAllow=<GHES IP>/32`.
-- `make test-packages` installs then reinstalls both packages in throwaway Ubuntu 24.04 and Fedora 40 containers without network and checks the user, its groups and the installed files. It does not start the unit (no systemd in those containers).
+- `make test-packages` installs then reinstalls both packages in throwaway Ubuntu 24.04 and Fedora 42 containers without network and checks the user, its groups and the installed files. It does not start the unit (no systemd in those containers).
 
 ## 2. Load images offline
 
@@ -88,7 +90,7 @@ A BuildKit `RUN` step is the PR author's code. Two files bound the engine that r
 | `deployments/previewd-builds.slice` | `/etc/systemd/system/` | Bounded subtree of every build: MemoryMax 4G, MemorySwapMax 0, CPUQuota 200%, TasksMax 2048 |
 | `deployments/docker.service.d/previewd-builds.conf` | `/etc/systemd/system/docker.service.d/` | Makes the slice dockerd's default cgroup parent and filters dockerd's own egress (`IPAddressDeny`) |
 
-The packages install both files. From a source checkout, with the systemd cgroup driver:
+The packages install both files under `/usr/lib/systemd/system/` (see [Install the package](#install-the-package) for overrides). From a source checkout, with the systemd cgroup driver:
 
 ```bash
 sudo cp deployments/previewd-builds.slice /etc/systemd/system/

@@ -18,9 +18,10 @@ RAPID_SEED  ?= 1
 # Deep verification budgets (make verify, random rapid seed)
 RAPID_CHECKS ?= 10000
 FUZZTIME    ?= 60s
-# Package version: VERSION without its leading v when it starts with a
-# digit (a release tag), 1.0.0 otherwise (an untagged commit hash or "dev").
-PKG_VERSION ?= $(or $(shell echo '$(VERSION)' | sed -n 's/^v\{0,1\}\([0-9][0-9A-Za-z.+~-]*\)$$/\1/p'),1.0.0)
+# Package version: VERSION without its leading v when it is a release tag
+# (git describe: v1.2.3, v1.2.3-4-gabc1234-dirty), 1.0.0 otherwise (an
+# untagged commit hash, even one starting with a digit, or "dev").
+PKG_VERSION ?= $(or $(shell echo '$(VERSION)' | sed -nE 's/^v?([0-9]+\.[0-9]+\.[0-9]+([-+~][0-9A-Za-z.+~-]*)?)$$/\1/p'),1.0.0)
 DIST_DIR    := dist
 
 # Default target
@@ -115,7 +116,7 @@ semgrep: ## Semgrep rule self-tests, then the scan, in the pinned image without 
 # air-gapped builder, docker load them first.
 NFPM_IMAGE         ?= goreleaser/nfpm:v2.43.0@sha256:929e1056ba69bf1da57791e851d210e9d6d4f528fede53a55bd43cf85674450c
 PKG_TEST_DEB_IMAGE ?= ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
-PKG_TEST_RPM_IMAGE ?= fedora:40@sha256:3c86d25fef9d2001712bc3d9b091fc40cf04be4767e48f1aa3b785bf58d300ed
+PKG_TEST_RPM_IMAGE ?= fedora:42@sha256:99e203b80b1c3d8f7e161ec10a68fd02b081ef83a3963553e513c82846b97814
 
 release: build ## Package bin/previewd as deb and rpm into dist/ (nfpm.yaml, PKG_VERSION)
 	@echo "Packaging previewd $(PKG_VERSION) (deb, rpm)..."
@@ -128,7 +129,7 @@ release: build ## Package bin/previewd as deb and rpm into dist/ (nfpm.yaml, PKG
 		-v "$(CURDIR):/src:ro" -v "$(CURDIR)/$(DIST_DIR):/src/$(DIST_DIR)" -w /src "$(NFPM_IMAGE)" \
 		package --config nfpm.yaml --packager rpm --target $(DIST_DIR)/
 
-test-packages: release ## Install the deb (Ubuntu 24.04) and rpm (Fedora 40) in throwaway containers without network (install, reinstall), check user and files
+test-packages: release ## Install the deb (Ubuntu 24.04) and rpm (Fedora 42) in throwaway containers without network (install, reinstall), check user and files
 	@echo "Installing the deb on $(PKG_TEST_DEB_IMAGE)..."
 	docker run --rm --network none -v "$(CURDIR)/$(DIST_DIR):/dist:ro" \
 		-v "$(CURDIR)/scripts/check-package-install.sh:/check.sh:ro" "$(PKG_TEST_DEB_IMAGE)" \

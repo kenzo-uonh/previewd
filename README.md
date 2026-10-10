@@ -8,6 +8,26 @@ When a developer opens a pull request, reviewers usually read the code change bu
 
 Think of it as a hotel that hands each pull request a private room: the room is set up when the guest arrives, nobody can walk from one room into another, the keys are never written down, and the room is emptied the moment the guest checks out.
 
+## Quick Start Installation
+
+previewd ships as a `.deb` and an `.rpm` (`make release` builds both into `dist/`). Install from the file, no repository needed:
+
+```bash
+sudo apt install ./previewd_1.0.0_amd64.deb      # or: sudo dnf install --disablerepo='*' ./previewd-1.0.0-1.x86_64.rpm
+sudo editor /etc/previewd/previewd.conf          # PREVIEWD_* settings: paths and identifiers, never a secret
+sudo systemctl enable --now previewd
+```
+
+The package installs the binary (`/usr/bin/previewd`), the systemd unit, the build slice and the Docker drop-in, and creates the `previewd` system user. Before the first start, seal the credentials, mount the ramfs staging root, start Traefik and allow your GHES address: previewd checks each of them and refuses to start while one is missing. Every step: [Deployment](docs/deployment.md).
+
+## The Workflow (How it Works)
+
+1. **A developer opens a pull request** on the organization's GitHub Enterprise Server. GHES sends a signed webhook to previewd; nothing else is contacted.
+2. **previewd decides whether the code may run.** A branch of the same repository pushed by someone with write access deploys at once. A fork or an outside contributor waits until an approver listed in `PREVIEWD_APPROVERS` approves that exact commit; every decision goes to the audit trail.
+3. **previewd builds and runs it.** It fetches the commit's tarball from GHES with a repository-scoped GitHub App token revoked after use, builds the image without network inside the bounded `previewd-builds.slice` cgroup, and starts the environment on its own private network with its secrets as read-only in-memory files.
+4. **The preview gets its own address.** Traefik serves it at `http://pr-<number>-<hash>.<PREVIEWD_TRAEFIK_DOMAIN>`; the route file of the same name in `PREVIEWD_ROUTES_DIR` shows it. previewd posts nothing back to the pull request: PR status feedback is an Enterprise edition feature. Each new push rebuilds the preview (from a fork, once the new commit is approved).
+5. **The preview is destroyed** when the pull request is closed, when its approval is withdrawn (dismissed review, requested changes, label removed), or when its running version reaches the TTL with no newer push (`PREVIEWD_ENV_TTL`, default 7 days). Teardown removes the container, network, image, route and staged secrets.
+
 ## Why it exists
 
 Hosted preview services send source code, and often the secrets an application needs, to someone else's cloud. Banks, hospitals and defense organizations cannot do that: their code and credentials must stay inside their own network, often on machines with no internet access at all. previewd is built for them:
@@ -121,7 +141,7 @@ The project uses a strict `Makefile` for all build and verification pipelines to
 | `make airgap-check` | Dependency denylist on the linked binary |
 | `make verify` | Deep verification: property-based tests at volume, then every fuzz target |
 | `make release` | Build the binary, then the deb and rpm packages into `dist/` (nfpm, digest-pinned image, no network) |
-| `make test-packages` | Install, then reinstall, the packages in Ubuntu 24.04 and Fedora 40 containers without network and check the user and files |
+| `make test-packages` | Install, then reinstall, the packages in Ubuntu 24.04 and Fedora 42 containers without network and check the user and files |
 
 #### Initialize Infrastructure
 
