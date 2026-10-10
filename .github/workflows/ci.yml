@@ -220,6 +220,10 @@ jobs:
           GOSUMDB: "off"
           GOMODCACHE: ${{ runner.temp }}/empty-modcache
           PREVIEWD_REQUIRE_NS_TESTS: "1"
+          # Pull requests get a smoke budget; a push to master runs the full
+          # one (the Makefile's defaults).
+          RAPID_CHECKS: ${{ github.event_name == 'pull_request' && '100' || '10000' }}
+          FUZZTIME: ${{ github.event_name == 'pull_request' && '10s' || '60s' }}
         run: ./scripts/airgap-exec.sh make verify
 
       - name: "Phase 2 (air-gapped): mlockall success path"
