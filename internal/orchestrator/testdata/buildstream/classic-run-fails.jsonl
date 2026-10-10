@@ -1,0 +1,8 @@
+{"stream":"Step 1/2 : FROM busybox:latest"}
+{"stream":"\n"}
+{"stream":" ---\u003e fd7dc98638c8\n"}
+{"stream":"Step 2/2 : RUN echo about-to-fail \u0026\u0026 exit 3"}
+{"stream":"\n"}
+{"stream":" ---\u003e Running in daaf0536a1e4\n"}
+{"stream":"about-to-fail\n"}
+{"error":"The command '/bin/sh -c echo about-to-fail \u0026\u0026 exit 3' returned a non-zero code: 3","errorDetail":{"code":3,"message":"The command '/bin/sh -c echo about-to-fail \u0026\u0026 exit 3' returned a non-zero code: 3"}}

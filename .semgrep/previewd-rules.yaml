@@ -1,0 +1,113 @@
+# previewd architectural guardrails (docs/specs/phase4_ci_architecture.md §3).
+# Path rules match literals and same-file constants (constant propagation).
+# A path built at runtime or from another file's constant is invisible to
+# them; internal/orchestrator/docker_test.go asserts the real secrets mount.
+# Run offline: semgrep scan --config .semgrep/ --metrics=off --error
+# Rule self-test: semgrep --test .semgrep/  (fixture: previewd-rules.go)
+rules:
+  # 1. Zero secret persistence: container env is written to the daemon's
+  #    on-disk container config and is visible in `docker inspect` and /proc.
+  - id: previewd-no-container-env
+    languages: [go]
+    severity: ERROR
+    message: >-
+      container.Config.Env is persisted by dockerd and visible to `docker inspect`.
+      Never pass secrets or payload data through it: stage them on ramfs and
+      bind-mount read-only (hard refusal #1).
+    paths:
+      include: ["/internal/**", "/cmd/**"]
+      exclude: ["*_test.go"]
+    pattern-either:
+      - pattern: "container.Config{..., Env: $E, ...}"
+      - pattern: "($C : container.Config).Env = $E"
+      - pattern: "($C : *container.Config).Env = $E"
+
+  # 2a. Secret mounts must be memory-backed: a tmpfs, or a bind of the host
+  #     ramfs staging directory. Volumes persist under /var/lib/docker.
+  - id: previewd-secret-mount-memory-backed
+    languages: [go]
+    severity: ERROR
+    message: >-
+      Mount touching a secrets path must be mount.TypeTmpfs or a read-only
+      mount.TypeBind of the host ramfs staging directory; volumes persist on disk.
+    paths:
+      include: ["/internal/**", "/cmd/**"]
+      exclude: ["*_test.go"]
+    patterns:
+      - pattern-either:
+          - pattern: 'mount.Mount{..., Target: "$P", ...}'
+          - pattern: 'mount.Mount{..., Source: "$P", ...}'
+          # Elided element type: []mount.Mount{{...}}
+          - patterns:
+              - pattern-inside: "[]mount.Mount{...}"
+              - pattern-either:
+                  - pattern: '{..., Target: "$P", ...}'
+                  - pattern: '{..., Source: "$P", ...}'
+      - metavariable-regex:
+          metavariable: $P
+          regex: (?i).*secret.*
+      - pattern-not: "mount.Mount{..., Type: mount.TypeTmpfs, ...}"
+      - pattern-not: "mount.Mount{..., Type: mount.TypeBind, ...}"
+      - pattern-not: "{..., Type: mount.TypeTmpfs, ...}"
+      - pattern-not: "{..., Type: mount.TypeBind, ...}"
+
+  # 2b. A bind mount of secrets must be read-only.
+  - id: previewd-secret-bind-readonly
+    languages: [go]
+    severity: ERROR
+    message: >-
+      Bind mount touching a secrets path must set ReadOnly: true.
+    paths:
+      include: ["/internal/**", "/cmd/**"]
+      exclude: ["*_test.go"]
+    patterns:
+      - pattern-either:
+          - pattern: "mount.Mount{..., Type: mount.TypeBind, ...}"
+          - patterns:
+              - pattern-inside: "[]mount.Mount{...}"
+              - pattern: "{..., Type: mount.TypeBind, ...}"
+      - pattern-either:
+          - pattern: '$T{..., Target: "$P", ...}'
+          - pattern: '$T{..., Source: "$P", ...}'
+          - pattern: '{..., Target: "$P", ...}'
+          - pattern: '{..., Source: "$P", ...}'
+      - metavariable-regex:
+          metavariable: $P
+          regex: (?i).*secret.*
+      - pattern-not: "mount.Mount{..., ReadOnly: true, ...}"
+      - pattern-not: "{..., ReadOnly: true, ...}"
+
+  # 2c. Legacy HostConfig.Binds strings touching secrets must be read-only.
+  - id: previewd-secret-binds-readonly
+    languages: [go]
+    severity: ERROR
+    message: >-
+      HostConfig.Binds entry touching a secrets path must end in ":ro".
+    paths:
+      include: ["/internal/**", "/cmd/**"]
+      exclude: ["*_test.go"]
+    patterns:
+      - pattern-inside: "container.HostConfig{..., Binds: $B, ...}"
+      - pattern: '"$S"'
+      # `bind + ":ro"`: "$S" would otherwise match the left operand alone.
+      - pattern-not-inside: '$A + ":ro"'
+      - metavariable-regex:
+          metavariable: $S
+          regex: (?i)^(?=.*secret)(?!.*:ro(,[a-zA-Z]+)*$).*$
+
+  # 3. Bounded contexts: the orchestrator and store layers derive every
+  #    context from the caller (context.WithTimeout, context.WithoutCancel),
+  #    never from a fresh root that no shutdown or deadline can cancel.
+  - id: previewd-no-root-context
+    languages: [go]
+    severity: ERROR
+    message: >-
+      context.Background()/context.TODO() in the orchestrator or store layer
+      escapes cancellation and deadlines. Accept ctx from the caller and derive
+      with context.WithTimeout (cleanup: context.WithoutCancel(ctx) + timeout).
+    paths:
+      include: ["/internal/orchestrator/**", "/internal/store/**"]
+      exclude: ["*_test.go"]
+    pattern-either:
+      - pattern: context.Background()
+      - pattern: context.TODO()

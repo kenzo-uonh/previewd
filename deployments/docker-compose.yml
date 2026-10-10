@@ -1,22 +1,48 @@
+# Traefik for previewd: file provider only, no Docker socket, no API.
+#
+# Air-gapped hosts load the image from a tar (`docker load`); the digest pin
+# makes `docker compose up` refuse any other image under the same tag.
+# PREVIEWD_ROUTES_DIR must exist before `up` and be the same directory the
+# daemon writes to (default /var/lib/previewd/routes).
+
 services:
   traefik:
-    image: traefik:v3.7
+    image: traefik:v3.7.13@sha256:24841fe2de7304c149343d877d2923b4c8800a38ba015dea9174c23b20e344a0
     container_name: traefik-proxy
     command:
-      - "--api.insecure=true"
-      - "--providers.docker=true"
-      - "--providers.docker.exposedbydefault=false"
-      - "--entrypoints.web.address=:80"
+      - "--configFile=/etc/traefik/traefik.yml"
     ports:
       - "80:80"
-      - "8081:8080"
     volumes:
-      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "./traefik.yml:/etc/traefik/traefik.yml:ro"
+      - "${PREVIEWD_ROUTES_DIR:-/var/lib/previewd/routes}:/etc/traefik/routes:ro"
     networks:
-      - previewd-proxy
+      previewd-proxy:
+        # The web entry point binds this address only (traefik.yml).
+        ipv4_address: 172.30.255.2
+    # Routes point to IP addresses: Traefik needs no resolver. A loopback
+    # resolver with no listener keeps it from forwarding queries upstream.
+    dns:
+      - 127.0.0.1
+    read_only: true
+    # Never the daemon's default parent: with the BuildKit drop-in
+    # (docker.service.d/previewd-builds.conf) that is the build slice, which
+    # must hold build steps only (D-V1-4).
+    cgroup_parent: system.slice
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - "no-new-privileges:true"
     restart: unless-stopped
 
 networks:
   previewd-proxy:
     name: previewd-proxy
     driver: bridge
+    ipam:
+      config:
+        # Change together with ipv4_address above and traefik.yml if it
+        # overlaps a site network.
+        - subnet: 172.30.255.0/24

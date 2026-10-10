@@ -13,7 +13,9 @@ var (
 	commitSHAPattern = regexp.MustCompile(`^[0-9a-fA-F]{40}$`)
 )
 
-// FetchRepository securely clones a specific commit SHA into an ephemeral host directory.
+// FetchRepository checks out exactly commitSHA of cloneURL into destDir, the
+// fallback of Fetcher when no GitHub App is configured (H2): a shallow fetch
+// of that one commit, never a branch, a tag or the history (gitCommands).
 func FetchRepository(ctx context.Context, cloneURL, commitSHA, destDir string) error {
 	if !commitSHAPattern.MatchString(commitSHA) {
 		return fmt.Errorf("invalid commit SHA format: untrusted input")
@@ -28,33 +30,25 @@ func FetchRepository(ctx context.Context, cloneURL, commitSHA, destDir string) e
 		return fmt.Errorf("failed to create build directory: %w", err)
 	}
 
-	// #nosec G204 -- Static execution string.
-	initCmd := exec.CommandContext(ctx, "git", "init")
-	initCmd.Dir = destDir
-	if err := initCmd.Run(); err != nil {
-		return fmt.Errorf("git init failed: %w", err)
+	for _, args := range gitCommands(parsedURL.String(), commitSHA) {
+		// #nosec G204 -- fixed argument vectors (gitCommands): cloneURL parsed by url.ParseRequestURI, commitSHA matched by commitSHAPattern.
+		cmd := exec.CommandContext(ctx, "git", args...)
+		cmd.Dir = destDir
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("git %s failed: %w", args[0], err)
+		}
 	}
-
-	// #nosec G204 -- cloneURL validated via url.ParseRequestURI.
-	remoteCmd := exec.CommandContext(ctx, "git", "remote", "add", "origin", parsedURL.String())
-	remoteCmd.Dir = destDir
-	if err := remoteCmd.Run(); err != nil {
-		return fmt.Errorf("git remote add failed: %w", err)
-	}
-
-	// #nosec G204 -- commitSHA validated via commitSHAPattern regex.
-	fetchCmd := exec.CommandContext(ctx, "git", "fetch", "--depth=1", "origin", commitSHA)
-	fetchCmd.Dir = destDir
-	if err := fetchCmd.Run(); err != nil {
-		return fmt.Errorf("git fetch failed: %w", err)
-	}
-
-	// #nosec G204 -- Static execution string.
-	checkoutCmd := exec.CommandContext(ctx, "git", "checkout", "FETCH_HEAD")
-	checkoutCmd.Dir = destDir
-	if err := checkoutCmd.Run(); err != nil {
-		return fmt.Errorf("git checkout failed: %w", err)
-	}
-
 	return nil
+}
+
+// gitCommands is the git invocation of FetchRepository, in order: an empty
+// repository, the remote, a fetch of the one commit at depth 1 by its SHA,
+// and the checkout of what was fetched (FETCH_HEAD, never a branch).
+func gitCommands(cloneURL, commitSHA string) [][]string {
+	return [][]string{
+		{"init"},
+		{"remote", "add", "origin", cloneURL},
+		{"fetch", "--depth=1", "origin", commitSHA},
+		{"checkout", "FETCH_HEAD"},
+	}
 }

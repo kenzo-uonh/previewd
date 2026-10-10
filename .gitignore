@@ -12,7 +12,8 @@
 *.out
 
 # Dependency directories (remove the comment below to include it)
-# vendor/
+# Vendored modules are produced by CI (networked phase), never committed
+vendor/
 
 # Go workspace file
 go.work
@@ -23,6 +24,8 @@ go.work.sum
 
 # Build directories
 bin/
+# Packages (make release)
+dist/
 
 # Air live-reload temporary artifacts
 tmp/
@@ -30,16 +33,46 @@ build-errors.log
 
 # SQLite lock and journal files
 *.sqlite*
+# ...except the committed migration fixture, which is evidence (make store-fixture-v2)
+!internal/store/testdata/schema-v2-modernc.sqlite
 EOF
 
-# repomix output
+# TLA+ Model Checker artifacts
+states/
+*TTrace_*.tla
+*TTrace_*.bin
+# pcal.trans backup of the module it rewrites
+docs/formal/*.old
+
+# rapid failure files (reproduce a failing run locally; never committed)
+**/testdata/rapid/
+
+# Python bytecode (scripts/airgap_scan*.py)
+__pycache__/
+MC.tla
+MC.cfg
+MC.out
+*.st
+tla2tools.jar
+
+# AI Tools & Assistants
+.agent/
+CLAUDE.md
 repomix-output.xml
+claude.json
+.aider*
+.cursor/
+.cursorrules
+.cline/
+.agy/
+.gemini/
+claude/
 
 # vulnerability report
 vuln-report.txt
 
 # IntelliJ project files
-.idea
+.idea/
 *.iml
-out
-gen
+out/
+gen/

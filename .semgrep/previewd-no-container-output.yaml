@@ -1,0 +1,22 @@
+# previewd boundary (V1 spec H1, V1-I10): the daemon never reads what a PR
+# container prints. Container output is attacker-controlled bytes of any
+# size: reading it is an unbounded, untrusted input path, and printing an
+# environment's secrets to stdout would carry them into previewd's logs.
+# Run offline: semgrep scan --config .semgrep/ --metrics=off --error
+# Rule self-test: semgrep --test .semgrep/  (fixture: previewd-no-container-output.go)
+rules:
+  - id: previewd-no-container-output
+    languages: [go]
+    severity: ERROR
+    message: >-
+      previewd never reads container output (V1-I10): no ContainerLogs,
+      ContainerAttach or ContainerExecAttach outside tests. Observe state
+      through ContainerInspect and the ownership labels instead.
+    # Every Go file but tests and this rule's own fixture.
+    paths:
+      exclude: ["*_test.go", "/.semgrep/**"]
+    # The selector matches a call and a method value handed on alike.
+    pattern-either:
+      - pattern: $X.ContainerLogs
+      - pattern: $X.ContainerAttach
+      - pattern: $X.ContainerExecAttach

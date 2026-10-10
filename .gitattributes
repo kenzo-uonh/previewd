@@ -1,0 +1,2 @@
+# Daemon output recorded byte for byte (CRLF line ends included): never normalize.
+internal/orchestrator/testdata/buildstream/*.jsonl -text

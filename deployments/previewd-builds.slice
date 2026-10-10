@@ -1,0 +1,52 @@
+# previewd-builds.slice: the cgroup subtree that bounds every BuildKit RUN
+# step of previewd's builds (V1 spec D-V1-4, V1-I12). A RUN step is the PR
+# author's code. BuildKit ignores per-build memory, CPU and cgroup parent
+# (E0), so the bound is daemon-level: this slice, made the daemon's default
+# cgroup parent by docker.service.d/previewd-builds.conf.
+#
+# Placement (moby v28 and v29 with BuildKit v0.33, systemd cgroup driver,
+# cgroup v2): dockerd gives BuildKit "<cgroup-parent>:docker:" as executor
+# parent (cmd/dockerd newCgroupParent) and BuildKit runs each RUN in
+# "<cgroup-parent>:docker:<id>" (executor/oci GenerateSpec): the scope
+# docker-<id>.scope under that slice. The default parent, system.slice, is
+# shared with every container, so no subtree would hold builds only.
+#
+# Slice names nest on dashes: this unit is
+#   /sys/fs/cgroup/previewd.slice/previewd-builds.slice
+# which is what previewd verifies:
+#   PREVIEWD_BUILDKIT_CGROUP=/sys/fs/cgroup/previewd.slice/previewd-builds.slice
+#
+# At every start previewd reads, host side, memory.max, pids.max and the
+# cpu.max quota (finite) and memory.swap.max (0), then requires the subtree
+# idle, the probe build's RUN inside it while it runs, and nothing left
+# after; any failure refuses the start (hardening.CheckLimits,
+# orchestrator.VerifyBuildIsolation).
+#
+# The values hold one build at a time (PREVIEWD_MAX_CONCURRENT_BUILDS=1, the
+# default): every build in flight shares them. Scale MemoryMax, CPUQuota and
+# TasksMax before raising it.
+#
+# Install: the packages put it in /usr/lib/systemd/system/; from a source
+#          checkout, cp previewd-builds.slice /etc/systemd/system/ && systemctl daemon-reload
+# Tune:    systemctl edit previewd-builds.slice (an /etc drop-in; upgrades
+#          replace the packaged unit)
+# Check:   systemctl show -p MemoryMax,MemorySwapMax,CPUQuotaPerSecUSec,TasksMax previewd-builds.slice
+#          cat /sys/fs/cgroup/previewd.slice/previewd-builds.slice/{memory.max,memory.swap.max,cpu.max,pids.max}
+#
+# Not yet verified on the production shape: the cgroup v2 / systemd run of
+# scripts/verify-buildkit.sh (E0 bound-* cases) is pending. On cgroup v1
+# systemd enforces none of this, and previewd starts only with
+# PREVIEWD_ALLOW_UNBOUNDED_BUILDS=1 (logged as an error at every start).
+
+[Unit]
+Description=previewd build steps (PR Dockerfile RUN under BuildKit), bounded
+Before=slices.target
+
+[Slice]
+MemoryAccounting=yes
+MemoryMax=4G
+MemorySwapMax=0
+CPUAccounting=yes
+CPUQuota=200%
+TasksAccounting=yes
+TasksMax=2048

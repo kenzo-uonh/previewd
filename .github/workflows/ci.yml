@@ -1,0 +1,317 @@
+# CI pipeline.
+#
+# Stage 1: static guardrails, in parallel
+#   semgrep : project rules (.semgrep/), offline container, rule self-test first
+#   codeql  : Go taint analysis, security-extended + security-and-quality
+# Stage 2: air-gapped verification
+#   Phase 1 (networked): deps-check, go mod vendor, pinned tools, vulndb mirror
+#   Phase 2 (air-gapped): make check + make verify inside an unprivileged
+#   network namespace (loopback only, proven by scripts/airgap-exec.sh),
+#   vendor/ only, empty read-only GOMODCACHE, GOPROXY=off, GOTOOLCHAIN=local
+# Stage 3: build, only after stages 1 and 2 pass; compiled air-gapped
+#
+# Every job runs under StepSecurity Harden-Runner in block mode. CI-level SaaS
+# (Harden-Runner, CodeQL, Semgrep image) is authorized for CI only; nothing
+# here is a runtime dependency of previewd.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch: # Manual trigger for deep verification
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+  CGO_ENABLED: "0"
+  GOLANGCI_LINT_VERSION: v2.14.0
+  GOSEC_VERSION: v2.29.0
+  GOVULNCHECK_VERSION: v1.8.0
+  SEMGREP_IMAGE: semgrep/semgrep:1.179.0@sha256:93963d9295a366f59e4850127b1550400ee7b388f04fe144e4a1f6325d96e01b
+
+jobs:
+  # ---------------- Stage 1: static guardrails ----------------
+  semgrep:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            auth.docker.io:443
+            registry-1.docker.io:443
+            production.cloudflare.docker.com:443
+            production.cloudfront.docker.com:443
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Pull pinned Semgrep image
+        run: docker pull "${SEMGREP_IMAGE}"
+
+      - name: Rule self-test (each rule must fire on its fixture)
+        run: |
+          for rules in previewd-rules previewd-no-container-output; do
+            docker run --rm --network none -v "${PWD}:/src:ro" -w /src "${SEMGREP_IMAGE}" \
+              semgrep --test --metrics=off --disable-version-check \
+              --config ".semgrep/${rules}.yaml" ".semgrep/${rules}.go"
+          done
+
+      - name: Scan
+        run: |
+          docker run --rm --network none -v "${PWD}:/src:ro" -w /src "${SEMGREP_IMAGE}" \
+            semgrep scan --metrics=off --disable-version-check --error --strict --timeout 0 \
+            --config .semgrep/previewd-rules.yaml --config .semgrep/previewd-no-container-output.yaml .
+
+  codeql:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            uploads.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            raw.githubusercontent.com:443
+            go.dev:443
+            dl.google.com:443
+            proxy.golang.org:443
+            sum.golang.org:443
+            storage.googleapis.com:443
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          languages: go
+          build-mode: manual
+          queries: security-extended,security-and-quality
+
+      - name: Build for extraction
+        run: go build ./...
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          category: /language:go
+
+  # ---------------- Stage 2: air-gapped verification ----------------
+  airgapped:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            raw.githubusercontent.com:443
+            go.dev:443
+            dl.google.com:443
+            proxy.golang.org:443
+            sum.golang.org:443
+            storage.googleapis.com:443
+            vuln.go.dev:443
+            results-receiver.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
+
+      # ---- Phase 1: networked ----
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Never leave the job token in .git/config on disk.
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: "Phase 1: check module tidiness and hashes"
+        run: make deps-check
+
+      - name: "Phase 1: vendor dependencies"
+        run: |
+          go mod vendor
+          test -f vendor/modules.txt
+
+      - name: "Phase 1: provision pinned tools"
+        run: |
+          go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_LINT_VERSION}"
+          go install "github.com/securego/gosec/v2/cmd/gosec@${GOSEC_VERSION}"
+          go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: "Phase 1: mirror vulnerability database"
+        run: |
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --output "${RUNNER_TEMP}/vulndb.zip" https://vuln.go.dev/vulndb.zip # airgap:allow networked CI phase on a connected runner; customers mirror it via GOVULNDB=file://
+          mkdir -p "${RUNNER_TEMP}/vulndb"
+          unzip -q "${RUNNER_TEMP}/vulndb.zip" -d "${RUNNER_TEMP}/vulndb"
+          test -f "${RUNNER_TEMP}/vulndb/index/db.json"
+
+      - name: "Phase 1: seal module cache"
+        run: |
+          # Phase 2 sees an empty, read-only module cache: anything not in
+          # vendor/ fails to resolve instead of being served from disk.
+          mkdir -p "${RUNNER_TEMP}/empty-modcache"
+          chmod 0555 "${RUNNER_TEMP}/empty-modcache"
+
+      - name: "Phase 1: allow unprivileged user namespaces (AppArmor)"
+        run: ./scripts/ci-apparmor-userns.sh
+
+      # ---- Phase 2: air-gapped ----
+      - name: "Phase 2 (air-gapped): make check"
+        env:
+          GOFLAGS: -mod=vendor
+          GOPROXY: "off"
+          GOSUMDB: "off"
+          GOMODCACHE: ${{ runner.temp }}/empty-modcache
+          # Namespace system tests (real ramfs/tmpfs mounts) must run, not skip.
+          PREVIEWD_REQUIRE_NS_TESTS: "1"
+        run: |
+          ./scripts/airgap-exec.sh make check \
+            DEPS_GATE=vendor-check \
+            GOVULNDB="file://${RUNNER_TEMP}/vulndb"
+
+      - name: "Phase 2 (air-gapped): make verify"
+        env:
+          GOFLAGS: -mod=vendor
+          GOPROXY: "off"
+          GOSUMDB: "off"
+          GOMODCACHE: ${{ runner.temp }}/empty-modcache
+          PREVIEWD_REQUIRE_NS_TESTS: "1"
+          # PRs and master pushes get a smoke budget; manual runs (workflow_dispatch) get the full
+          # one (the Makefile's defaults).
+          RAPID_CHECKS: ${{ github.event_name == 'workflow_dispatch' && '10000' || '100' }}
+          FUZZTIME: ${{ github.event_name == 'workflow_dispatch' && '60s' || '10s' }}
+        run: ./scripts/airgap-exec.sh make verify
+
+      - name: "Phase 2 (air-gapped): mlockall success path"
+        env:
+          GOFLAGS: -mod=vendor
+          GOPROXY: "off"
+          GOSUMDB: "off"
+          GOMODCACHE: ${{ runner.temp }}/empty-modcache
+          PREVIEWD_REQUIRE_MLOCK_TEST: "1"
+        run: |
+          # Root raises this shell's RLIMIT_MEMLOCK to unlimited (what
+          # LimitMEMLOCK=infinity gives the daemon); the air-gap wrapper and
+          # the test inherit it and run as the runner user.
+          sudo prlimit --memlock=unlimited:unlimited --pid $$
+          ./scripts/airgap-exec.sh go test -count=1 -run '^TestLockMemory' ./internal/hardening/
+
+      - name: Upload fuzz crashers
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-crashers
+          path: "**/testdata/fuzz/**"
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ---------------- Stage 3: build ----------------
+  build:
+    needs: [semgrep, codeql, airgapped]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            raw.githubusercontent.com:443
+            go.dev:443
+            dl.google.com:443
+            proxy.golang.org:443
+            sum.golang.org:443
+            storage.googleapis.com:443
+            results-receiver.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # git describe in the Makefile needs tags.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: "Phase 1: vendor dependencies"
+        run: |
+          make deps-check
+          go mod vendor
+
+      - name: "Phase 1: allow unprivileged user namespaces (AppArmor)"
+        run: ./scripts/ci-apparmor-userns.sh
+
+      - name: "Phase 2 (air-gapped): build"
+        env:
+          GOFLAGS: -mod=vendor
+          GOPROXY: "off"
+          GOSUMDB: "off"
+        run: |
+          mkdir -p "${RUNNER_TEMP}/empty-modcache"
+          chmod 0555 "${RUNNER_TEMP}/empty-modcache"
+          GOMODCACHE="${RUNNER_TEMP}/empty-modcache" ./scripts/airgap-exec.sh make build
+          sha256sum bin/previewd | tee bin/previewd.sha256
+
+      - name: Upload binary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: previewd-linux-amd64
+          path: |
+            bin/previewd
+            bin/previewd.sha256
+          if-no-files-found: error
+          retention-days: 14

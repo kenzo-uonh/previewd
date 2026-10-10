@@ -1,0 +1,108 @@
+# Release pipeline: on a v* tag, build the deb and rpm packages, check that
+# they install, generate the SBOM and publish a GitHub release.
+#
+# Same rules as ci.yml: actions pinned by commit SHA, images by digest,
+# Harden-Runner in block mode, no job token left in .git/config. Docker Hub
+# serves the nfpm, Ubuntu, Fedora and syft images; uploads.github.com
+# receives the release assets. CI-level only: nothing here is a runtime
+# dependency of previewd.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+# gh release create needs it; the job runs nothing it did not pin.
+permissions:
+  contents: write
+
+env:
+  GOTOOLCHAIN: local
+  CGO_ENABLED: "0"
+  SYFT_IMAGE: anchore/syft:v1.52.0@sha256:500e2d872ac019436926e8322b4fc1f39441d94d21f6f4046c6ff29b30e8cb02
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            uploads.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            raw.githubusercontent.com:443
+            go.dev:443
+            dl.google.com:443
+            proxy.golang.org:443
+            sum.golang.org:443
+            storage.googleapis.com:443
+            auth.docker.io:443
+            registry-1.docker.io:443
+            production.cloudflare.docker.com:443
+            results-receiver.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # git describe in the Makefile needs the tags and history.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.2"
+          cache: false
+
+      # Fail closed: a tag the Makefile would not read as a release version
+      # (v1, v1.2, vfoo) would otherwise ship as 1.0.0.
+      - name: Check the tag
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          if ! printf '%s\n' "$TAG_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::tag $TAG_NAME is not vMAJOR.MINOR.PATCH[-PRERELEASE]"
+            exit 1
+          fi
+          git tag --points-at HEAD | grep -qxF "$TAG_NAME"
+          echo "PKG_VERSION=${TAG_NAME#v}" >> "$GITHUB_ENV"
+
+      # make test-packages runs make release (build, then nfpm deb and rpm
+      # into dist/), then installs both in throwaway Ubuntu and Fedora
+      # containers: a package that does not install is never published.
+      - name: Build and test packages
+        run: make test-packages PKG_VERSION="${PKG_VERSION}"
+
+      # Pinned syft image, run without network, instead of an install script
+      # fetched from a moving branch.
+      - name: Generate SBOM
+        run: |
+          docker pull "${SYFT_IMAGE}"
+          docker run --rm --network none -u "$(id -u):$(id -g)" \
+            -e SYFT_CHECK_FOR_APP_UPDATE=false --tmpfs /cache -e XDG_CACHE_HOME=/cache \
+            -v "${PWD}:/src:ro" "${SYFT_IMAGE}" \
+            scan dir:/src --source-name previewd --source-version "${PKG_VERSION}" \
+            -o cyclonedx-json > dist/previewd-sbom.json
+          test -s dist/previewd-sbom.json
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum ./*.deb ./*.rpm ./*.json | tee SHA256SUMS
+
+      - name: Publish release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          gh release create "$TAG_NAME" \
+            --verify-tag \
+            --title "Previewd $TAG_NAME" \
+            --generate-notes \
+            dist/*.deb dist/*.rpm dist/*.json dist/SHA256SUMS

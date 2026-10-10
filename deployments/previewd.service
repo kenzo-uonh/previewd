@@ -1,0 +1,62 @@
+# previewd.service: the previewd agent (docs/deployment.md).
+#
+# Installed by the deb/rpm packages (nfpm.yaml) to
+# /usr/lib/systemd/system/previewd.service. Site settings go in
+# /etc/previewd/previewd.conf (PREVIEWD_* keys, docs/configuration.md):
+# paths and identifiers only, never a secret value.
+#
+# Before the first start (each one is checked at start, and a missing one
+# refuses the start):
+#   - seal the credentials below with systemd-creds (docs/configuration.md,
+#     Credentials); add the TLS key credential when PREVIEWD_TLS_KEY_CREDENTIAL
+#     is set, it has no default name;
+#   - mount the ramfs staging root (docs/deployment.md, section 4);
+#   - load Traefik and the allowed base images, start Traefik.
+#
+# Group=docker gives the daemon the Engine API socket, which is root on this
+# host: keep the docker group to previewd and the administrators.
+
+[Unit]
+Description=previewd preview environment agent
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=previewd
+Group=docker
+# State (SQLite: environments, jobs, audit trail) and the default
+# PREVIEWD_ROUTES_DIR, created owned by previewd. The conf file may override
+# PREVIEWD_DB_PATH: EnvironmentFile= takes precedence over Environment=.
+StateDirectory=previewd previewd/routes
+StateDirectoryMode=0750
+Environment=PREVIEWD_DB_PATH=/var/lib/previewd/previewd.sqlite
+EnvironmentFile=-/etc/previewd/previewd.conf
+ExecStart=/usr/bin/previewd
+Restart=on-failure
+RestartSec=5s
+
+# The daemon locks all memory before reading any secret and refuses to start
+# unless RLIMIT_MEMLOCK is unlimited.
+LimitMEMLOCK=infinity
+
+# Read by name from $CREDENTIALS_DIRECTORY, never from the environment.
+LoadCredentialEncrypted=webhook_secret:/etc/credstore.encrypted/webhook_secret
+LoadCredentialEncrypted=github-app-key:/etc/credstore.encrypted/github-app-key
+
+# Kernel filter on the daemon's sockets and its git children, both ways:
+# nothing but loopback until the site allows its GHES address, which both
+# delivers the webhooks and serves the API and git. Add it with a drop-in
+# (systemctl edit previewd), never by editing this file:
+#   [Service]
+#   IPAddressAllow=10.20.0.10/32
+# The Engine API is a Unix socket and is unaffected. Needs cgroup v2.
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
