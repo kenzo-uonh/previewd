@@ -64,6 +64,7 @@ claude.json
 .cline/
 .agy/
 .gemini/
+claude/
 
 # vulnerability report
 vuln-report.txt
