@@ -44,8 +44,8 @@ Hosted preview services send source code, and often the secrets an application n
 | [Architecture](docs/architecture.md) | Tech stack, build isolation, secret staging, webhook ingestion, reconciliation, audit trail, formal verification |
 | [Configuration](docs/configuration.md) | Every `PREVIEWD_*` environment variable, systemd credentials, opt-ins |
 | [Deployment](docs/deployment.md) | Host setup: offline images, Traefik, ramfs secrets staging, build cgroup and egress filter, GHES |
-| [V1 specification](docs/specs/V1-previewd.md) | V1 design, decisions and invariants |
 | [Formal models](docs/formal/README.md) | TLA+ models, TLC results, how to run TLC offline |
+
 
 On this page: [Codebase Structure](#codebase-structure) · [Development & Execution](#development--execution) · [CI](#ci-githubworkflowsciyml)
 
@@ -70,8 +70,7 @@ On this page: [Codebase Structure](#codebase-structure) · [Development & Execut
 │   ├── architecture.md            # Tech stack, ingestion, staging, reconciliation, audit trail, verification.
 │   ├── configuration.md           # Environment variables and credentials.
 │   ├── deployment.md              # Host setup.
-│   ├── formal/                    # TLA+ models and TLC results.
-│   └── specs/                     # MVP and V1 specifications.
+│   └── formal/                    # TLA+ models and TLC results.
 ├── internal/
 │   ├── api/
 │   │   ├── handlers.go            # Webhook receivers for GitHub PR events (validate + envid).

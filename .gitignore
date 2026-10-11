@@ -76,3 +76,7 @@ vuln-report.txt
 *.iml
 out/
 gen/
+
+# Internal design specifications & roadmap drafts
+docs/specs/
+.git_backup_safety/
