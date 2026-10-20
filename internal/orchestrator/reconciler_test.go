@@ -309,6 +309,8 @@ type rig struct {
 	maxBuilds     int
 	buildTimeout  time.Duration
 	pruneInterval time.Duration
+	// clock, when set, replaces the fixed now as the reconciler's clock.
+	clock func() time.Time
 	// Auto-cleanup (V1 F5); 0 for the defaults. buildDir is the rig's own.
 	minFreeDisk int64
 	envTTL      time.Duration
@@ -382,7 +384,12 @@ func (r *rig) reconciler() *Reconciler {
 		},
 		AllowedBaseImages: testBases, MaxBuildContextBytes: 1 << 20,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Domain: "local.previewd", AppPort: 8080,
-		Now: func() time.Time { return r.now }, PollInterval: 5 * time.Millisecond,
+		Now: func() time.Time {
+			if r.clock != nil {
+				return r.clock()
+			}
+			return r.now
+		}, PollInterval: 5 * time.Millisecond,
 	})
 	if err != nil {
 		r.t.Fatal(err)
@@ -828,6 +835,63 @@ func (r *rig) running() bool {
 	r.engine.mu.Lock()
 	defer r.engine.mu.Unlock()
 	return r.engine.envs[testEnv].Running
+}
+
+// E2b: a teardown (an urgent one: a closed PR, a revoked approval) never
+// waits behind a build. Every build slot is taken and the only worker leases
+// a deploy first: the deploy goes back to the queue, still unclassified and
+// untouched on the host, and the same worker then runs the teardown.
+func TestReconciler_TeardownNotBlockedBySaturatedBuildSlots(t *testing.T) {
+	r := newRig(t)
+	r.maxBuilds = 2
+	rec := r.started()
+	for range cap(rec.builds) {
+		rec.builds <- struct{}{} // every slot is taken by a build in flight
+	}
+	const deployEnv = "pr-8-0b0b0b0b0b"
+	r.enqueueEnv(deployEnv) // seq 1: the worker leases it first
+	r.enqueue(store.JobTeardown)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		rec.Run(ctx, 1)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	var jobs []store.Job
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		jobs = r.jobs()
+		if i := slices.IndexFunc(jobs, func(j store.Job) bool { return j.Type == store.JobTeardown }); i >= 0 && jobs[i].Status == store.StatusSuccess {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	var deploy, teardown store.Job
+	for _, j := range jobs {
+		if j.Type == store.JobDeploy {
+			deploy = j
+		} else {
+			teardown = j
+		}
+	}
+	if teardown.Status != store.StatusSuccess {
+		t.Fatalf("teardown %+v, want SUCCESS while every build slot is taken", teardown)
+	}
+	if deploy.Status != store.StatusQueued || deploy.Attempts != 1 || deploy.NotBefore <= r.now.UnixMilli() || deploy.Trust != store.TrustUnclassified {
+		t.Fatalf("deploy %+v, want QUEUED, unclassified, requeued once with a not_before in the future", deploy)
+	}
+	if r.built() {
+		t.Fatal("the engine was asked to build without a slot")
+	}
+	if len(rec.builds) != cap(rec.builds) {
+		t.Fatalf("%d of %d slots taken, want the test's own %d untouched", len(rec.builds), cap(rec.builds), cap(rec.builds))
+	}
 }
 
 // V1-I2: each deploy stages the secret section of its own trust; an

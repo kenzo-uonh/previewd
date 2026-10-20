@@ -182,6 +182,10 @@ const (
 	pruneTimeout = 5 * time.Minute
 )
 
+// buildSlotBackoff is the wait before a deploy that found every build slot
+// taken is leased again.
+const buildSlotBackoff = 5 * time.Second
+
 // ErrBuildTimeout fails a build still running at PREVIEWD_BUILD_TIMEOUT.
 var ErrBuildTimeout = errors.New("build cancelled at PREVIEWD_BUILD_TIMEOUT")
 
@@ -473,7 +477,22 @@ func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 }
 
+// deploy takes a build slot before anything else, without waiting: a worker
+// never blocks on a build while teardowns and revocations sit in the queue
+// (E2b). With every slot taken the deploy goes back to the queue, still
+// unclassified, and the worker is free for the next job. The slot is taken
+// that early because only an unclassified deploy can be requeued
+// (store.ErrDeployCannotRetry): once AuthorizeDeploy recorded its verdict
+// the deploy runs or fails. It is held until the deploy ends, so deploys in
+// flight, preparing or building, never exceed MaxConcurrentBuilds.
 func (r *Reconciler) deploy(ctx context.Context, l store.Lease, log *slog.Logger) {
+	select {
+	case r.builds <- struct{}{}:
+		defer func() { <-r.builds }()
+	default:
+		r.requeueForBuildSlot(ctx, l, log)
+		return
+	}
 	d, ok := r.authorizeDeploy(ctx, l, log)
 	if !ok {
 		return
@@ -509,6 +528,18 @@ func (r *Reconciler) deploy(ctx context.Context, l store.Lease, log *slog.Logger
 	}
 	if fErr != nil {
 		log.Error("Could not record the failed deploy", "error", fErr)
+	}
+}
+
+// requeueForBuildSlot releases the lease of a deploy that found every build
+// slot taken. Nothing of it reached the host.
+func (r *Reconciler) requeueForBuildSlot(ctx context.Context, l store.Lease, log *slog.Logger) {
+	cctx, cancel := cleanupContext(ctx)
+	defer cancel()
+	notBefore := r.cfg.Now().Add(buildSlotBackoff)
+	log.Info("Every build slot is taken: deploy requeued", "build_slots", cap(r.builds), "not_before", notBefore)
+	if err := r.cfg.Queue.Requeue(cctx, l, notBefore); err != nil {
+		log.Error("Could not requeue the deploy: the next startup sweep requeues it", "error", err)
 	}
 }
 
@@ -598,9 +629,9 @@ func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, l
 	return nil
 }
 
-// build runs one build within the build bounds (D-V1-4, V1-I12): it waits
-// for one of MaxConcurrentBuilds slots, shared by every worker because
-// every build shares the daemon-level BuildKit limits, and its request is
+// build runs one build within the build bounds (D-V1-4, V1-I12): its caller
+// holds one of MaxConcurrentBuilds slots (deploy), shared by every worker
+// because every build shares the daemon-level BuildKit limits, and its request is
 // cancelled at BuildTimeout (E0: closing the request stops the solve and
 // its RUN processes). A build whose deadline passed fails even when the
 // engine reports success: a cancelled build is never read as one.
@@ -610,12 +641,6 @@ func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, l
 // the free-disk floor (ErrDiskFloor); the build cache is pruned after the
 // build, whatever its outcome, before the slot is released.
 func (r *Reconciler) build(ctx context.Context, spec BuildSpec, log *slog.Logger) error {
-	select {
-	case r.builds <- struct{}{}:
-	case <-ctx.Done():
-		return fmt.Errorf("wait for a build slot: %w", context.Cause(ctx))
-	}
-	defer func() { <-r.builds }()
 	if err := r.cleanBuildCache(ctx, log); err != nil {
 		return err
 	}

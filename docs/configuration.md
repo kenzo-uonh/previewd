@@ -237,7 +237,7 @@ Set exactly `1` to skip the cgroup checks of the startup probe (dev hosts, cgrou
 
 ### `PREVIEWD_MAX_CONCURRENT_BUILDS`
 
-Builds in flight at once across every worker, 1..16 (default: 1). Every build shares the BuildKit cgroup's limits (D-V1-4), so a value above 1 needs `previewd-builds.slice` scaled; it is logged at every start. A worker waits for a free slot before it builds.
+Builds in flight at once across every worker, 1..16 (default: 1). Every build shares the BuildKit cgroup's limits (D-V1-4), so a value above 1 needs `previewd-builds.slice` scaled; it is logged at every start. A deploy takes a slot, without waiting, before it is authorized and holds it until it ends; with every slot taken it returns to the queue (retried after 5 s) and its worker takes the next job, so a teardown never waits behind a build. Each such return counts as an attempt of the deploy.
 
 ### `PREVIEWD_BUILD_TIMEOUT`
 
