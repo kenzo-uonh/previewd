@@ -58,12 +58,17 @@ On this page: [Codebase Structure](#codebase-structure) · [Development & Execut
 │   └── previewd/
 │       ├── main.go                # Single binary entry point initializing config, store, and HTTP server.
 │       ├── audit.go               # `previewd audit verify|export`: read-only check and JSON Lines export of the audit trail.
-│       └── buildprobe.go          # `previewd build-probe`: the network check run inside the startup probe's BuildKit RUN step.
+│       ├── buildprobe.go          # `previewd build-probe`: the network check run inside the startup probe's BuildKit RUN step.
+│       ├── doctor.go              # `previewd doctor`: host pre-flight (build cgroup, dockerd egress, ramfs staging, memory lock, clock skew, Traefik isolation), [PASS]/[FAIL], exit 0/1.
+│       └── backup.go              # `previewd backup|restore`: online SQLite snapshot beside the daemon, verified audit chain; restore from a verified snapshot, 0600.
 ├── deployments/
 │   ├── docker-compose.yml         # Traefik: digest-pinned, read-only, no socket, routes dir mounted read-only, cgroup parent system.slice.
 │   ├── docker.service.d/
 │   │   └── previewd-builds.conf   # dockerd drop-in: default cgroup parent previewd-builds.slice (BuildKit RUN steps), egress filter (IPAddressDeny).
 │   ├── previewd.service           # Daemon unit (packages): User previewd, Group docker, LimitMEMLOCK, credentials, IPAddressDeny.
+│   ├── previewd-proxy.service     # Traefik run by systemd with `docker run` (no compose, no socket mounted, read-only, routes read-only); opt-in.
+│   ├── run-previewd-secrets.mount # ramfs at /run/previewd/secrets (mode 0700) at boot.
+│   ├── 99-previewd.conf           # /etc/sysctl.d drop-in: unprivileged user namespaces.
 │   ├── previewd-builds.slice      # Bounded subtree of every build: MemoryMax 4G, MemorySwapMax 0, CPUQuota 200%, TasksMax 2048 (D-V1-4).
 │   └── traefik.yml                # Traefik static configuration: file provider only, no API, no telemetry.
 ├── docs/
@@ -78,7 +83,7 @@ On this page: [Codebase Structure](#codebase-structure) · [Development & Execut
 │   ├── config/
 │   │   └── config.go              # Air-gapped environment configuration loading.
 │   ├── envid/                     # Environment ID: pr-<n>-<hash(repo, branch)>, a DNS label (leaf).
-│   ├── hardening/                 # mlockall checks; build probe network checks; build cgroup limits and processes; free disk (statfs) (leaf, _linux/_other).
+│   ├── hardening/                 # mlockall checks and probe; build probe network checks; build cgroup limits and processes; free disk (statfs); dockerd egress filter and unit memlock (systemctl show); ramfs staging mount; forge clock skew (leaf, _linux/_other).
 │   ├── orchestrator/
 │   │   ├── buildprobe.go          # Startup build probe: probe image, isolation verification, bridge gateway.
 │   │   ├── authorizer.go          # D4 deploy gate: trusted/untrusted from GHES, approvals re-read (review, approver ID and write access).
@@ -112,8 +117,10 @@ On this page: [Codebase Structure](#codebase-structure) · [Development & Execut
 ├── test/e2e/                      # E2E tools, e2e build tag: fakegithub (fake GHES, tarballs), exfil (E3 listener), dockerapi (G1 on the real engine).
 ├── scripts/
 │   ├── build.sh                   # Static binary compilation script.
-│   ├── check-package-install.sh   # `make test-packages`: user, group and installed files after a package install.
+│   ├── check-package-install.sh   # `make test-packages`: refused without Docker, user, group, files and conffiles after install, staged secret gone after removal.
+│   ├── preinstall.sh              # Package pre-install: aborts the apt/dnf transaction without Docker Engine or cgroup v2.
 │   ├── postinstall.sh             # Package post-install: previewd system user (no shell, no home) in group docker.
+│   ├── preremove.sh               # Package pre-remove: stops the units, unmounts and empties the ramfs staging root (removal only, not upgrade).
 │   ├── verify-buildkit.sh         # E0 engine probe: BuildKit network isolation, stream errors, cache, pulls, cgroup placement and bounds, cancellation.
 │   └── verify-e2e.sh              # Local, air-gapped end-to-end integration validation.
 ├── Makefile                       # Build, test, and infrastructure automation targets.

@@ -177,6 +177,14 @@ const defaultRoutesDir = "/var/lib/previewd/routes"
 // defaultTraefikContainer is the container_name in deployments/docker-compose.yml.
 const defaultTraefikContainer = "traefik-proxy"
 
+// Defaults `previewd doctor` applies to the keys it reads without loading
+// the whole configuration. DefaultBuildCgroup is the subtree of
+// deployments/previewd-builds.slice.
+const (
+	DefaultTraefikContainer = defaultTraefikContainer
+	DefaultBuildCgroup      = "/sys/fs/cgroup/previewd.slice/previewd-builds.slice"
+)
+
 // Load extracts configuration from the host environment with strict fallback defaults.
 func Load() (*Config, error) {
 	apiPort := 8080

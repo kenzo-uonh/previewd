@@ -10,16 +10,27 @@
 #   - seal the credentials below with systemd-creds (docs/configuration.md,
 #     Credentials); add the TLS key credential when PREVIEWD_TLS_KEY_CREDENTIAL
 #     is set, it has no default name;
-#   - mount the ramfs staging root (docs/deployment.md, section 4);
-#   - load Traefik and the allowed base images, start Traefik.
+#   - mount the ramfs staging root: systemctl enable --now
+#     run-previewd-secrets.mount (docs/deployment.md, section 4);
+#   - load Traefik and the allowed base images, start Traefik: systemctl
+#     enable --now previewd-proxy.service (docs/deployment.md, section 3);
+#   - run `previewd doctor` and fix what it reports.
 #
 # Group=docker gives the daemon the Engine API socket, which is root on this
 # host: keep the docker group to previewd and the administrators.
 
 [Unit]
 Description=previewd preview environment agent
-After=network.target docker.service
+After=network.target docker.service previewd-proxy.service
 Requires=docker.service
+# Ordering only: the proxy is verified at every start, but starting it stays
+# the site's choice (previewd-proxy.service, or docker compose on a host that
+# already runs Traefik that way: two proxies would fight for the name, the
+# address and port 80).
+# run-previewd-secrets.mount, pulled in and ordered before this unit. A site
+# that moves PREVIEWD_SECRETS_STAGING_DIR overrides this line and the chown
+# below in a drop-in.
+RequiresMountsFor=/run/previewd/secrets
 
 [Service]
 Type=simple
@@ -32,6 +43,10 @@ StateDirectory=previewd previewd/routes
 StateDirectoryMode=0750
 Environment=PREVIEWD_DB_PATH=/var/lib/previewd/previewd.sqlite
 EnvironmentFile=-/etc/previewd/previewd.conf
+# ramfs takes no uid= option: hand the staging root to the daemon's user
+# (with privileges, "+"). A failure is ignored here and refused by the
+# daemon, which checks the owner itself.
+ExecStartPre=-+/usr/bin/chown previewd:previewd /run/previewd/secrets
 ExecStart=/usr/bin/previewd
 Restart=on-failure
 RestartSec=5s

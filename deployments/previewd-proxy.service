@@ -1,0 +1,102 @@
+# previewd-proxy.service: Traefik for previewd, run by systemd with `docker
+# run` directly (no docker compose on the host). The same container as
+# deployments/docker-compose.yml, which stays for development (`make
+# docker-up`): file provider only, no Docker socket, no labels, read-only
+# root file system, no capability but NET_BIND_SERVICE.
+#
+# Installed by the deb/rpm packages (nfpm.yaml) to
+# /usr/lib/systemd/system/previewd-proxy.service, with the Traefik
+# configuration in /etc/previewd/traefik.yml. Keep the image digest, the
+# network, the address and the flags below in step with docker-compose.yml
+# and traefik.yml (the web entry point binds 172.30.255.2:80 only).
+#
+# Air-gapped: the image is never pulled (--pull=never). Load it first:
+# docker load -i traefik.tar (docs/deployment.md, section 2). The digest pin
+# makes docker refuse any other image under the same tag.
+#
+# PREVIEWD_ROUTES_DIR (default /var/lib/previewd/routes) and
+# PREVIEWD_TRAEFIK_CONTAINER (default traefik-proxy) come from
+# /etc/previewd/previewd.conf, as for previewd.service: the daemon verifies
+# the container of that name at every start.
+#
+# The unit runs as the previewd user, who is in the docker group already
+# (previewd.service has Group=docker), not as root.
+
+[Unit]
+Description=previewd Traefik proxy (file provider, no Docker socket)
+After=docker.service
+Requires=docker.service
+# Created before the daemon verifies the proxy at its start.
+Before=previewd.service
+
+[Service]
+Type=simple
+User=previewd
+Group=docker
+Environment=PREVIEWD_ROUTES_DIR=/var/lib/previewd/routes
+Environment=PREVIEWD_TRAEFIK_CONTAINER=traefik-proxy
+EnvironmentFile=-/etc/previewd/previewd.conf
+# The docker CLI wants a configuration directory; this user has no home.
+RuntimeDirectory=previewd-proxy
+Environment=DOCKER_CONFIG=%t/previewd-proxy
+
+# Idempotent: the network exists after the first start. Change the subnet
+# together with docker-compose.yml, traefik.yml and docker.service.d/.
+ExecStartPre=/bin/sh -c '/usr/bin/docker network inspect previewd-proxy >/dev/null 2>&1 || /usr/bin/docker network create --driver bridge --subnet 172.30.255.0/24 previewd-proxy'
+# A stopped container left by a crash would hold the name. Never --force: a
+# running one, a Traefik started by docker compose for instance, is not this
+# unit's to kill; docker run then fails on the name, loudly.
+ExecStartPre=-/usr/bin/docker rm ${PREVIEWD_TRAEFIK_CONTAINER}
+# cgroup parent system.slice: never docker's default, which is the build
+# slice (docker.service.d/previewd-builds.conf) and must hold builds only.
+# DNS 127.0.0.1: routes are IP addresses; a resolver with no listener keeps
+# Traefik from forwarding queries upstream.
+ExecStart=/usr/bin/docker run --rm --pull=never \
+    --name=${PREVIEWD_TRAEFIK_CONTAINER} \
+    --network=previewd-proxy --ip=172.30.255.2 --dns=127.0.0.1 \
+    --publish=80:80 \
+    --read-only \
+    --cap-drop=ALL --cap-add=NET_BIND_SERVICE \
+    --security-opt=no-new-privileges:true \
+    --cgroup-parent=system.slice \
+    --volume=/etc/previewd/traefik.yml:/etc/traefik/traefik.yml:ro \
+    --volume=${PREVIEWD_ROUTES_DIR}:/etc/traefik/routes:ro \
+    traefik:v3.7.13@sha256:24841fe2de7304c149343d877d2923b4c8800a38ba015dea9174c23b20e344a0 \
+    --configFile=/etc/traefik/traefik.yml
+ExecStop=/usr/bin/docker stop --time 10 ${PREVIEWD_TRAEFIK_CONTAINER}
+Restart=always
+RestartSec=5s
+TimeoutStopSec=30s
+
+# The docker CLI only talks to the Engine API over its Unix socket; the
+# container, not this process, binds port 80 and reads the routes. Nothing
+# below widens what the previewd user can do through the docker group.
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

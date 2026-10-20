@@ -17,6 +17,7 @@ Every value is validated at start: a malformed value refuses to start. Each `PRE
 - [Workers and containers](#workers-and-containers) (including [Compose sidecars](#compose-sidecars-previewd_compose_enabled-and-previewd_compose_max_services))
 - [Routing](#routing)
 - [Storage, retention and cleanup](#storage-retention-and-cleanup)
+- [Operator commands](#operator-commands) (`doctor`, `backup`, `restore`)
 
 ## Quick reference
 
@@ -334,7 +335,7 @@ Name of the Traefik container, joined to each environment network (default: `tra
 
 ### `PREVIEWD_DB_PATH`
 
-SQLite database path (default: previewd.sqlite).
+SQLite database path (default: previewd.sqlite; `previewd.service` sets `/var/lib/previewd/previewd.sqlite`). `previewd audit`, `backup` and `restore` default their `-db` flag to it.
 
 ### `PREVIEWD_RETENTION`
 
@@ -372,3 +373,15 @@ The maintenance loop runs a pass at start, then every interval, 1m..24h (default
 - A pass reads the host's environments first and never prunes the job that built one, nor any job newer than it; if the engine cannot be read the pass prunes nothing.
 - Never pruned: a job not finished, the latest job of an environment, watermarks, revocations and new-head records, the newest 100 boot epochs, and the audit trail.
 - Each pass first queues the TTL teardowns (`PREVIEWD_ENV_TTL`) and ends with an image prune (see [Disk](architecture.md#disk-v1-f5-v1-i9)).
+
+## Operator commands
+
+`previewd doctor`, `backup` and `restore` read no credential and need no complete configuration ([Day-2 in deployment.md](deployment.md#9-day-2-doctor-backup-and-restore)).
+
+| Command | Reads |
+|---------|-------|
+| `previewd doctor [-conf PATH] [-user NAME]` | The `PREVIEWD_*` lines of `PATH` (default `/etc/previewd/previewd.conf`, the unit's `EnvironmentFile=`; it must exist when `-conf` is given), then the environment, then the defaults: [`PREVIEWD_VCS_PROVIDER`](#previewd_vcs_provider), `PREVIEWD_GHES_URL`, `PREVIEWD_GHES_CA_FILE`, `PREVIEWD_GITLAB_URL`, `PREVIEWD_GITLAB_CA_FILE`, [`PREVIEWD_BUILDKIT_CGROUP`](#previewd_buildkit_cgroup) (default `/sys/fs/cgroup/previewd.slice/previewd-builds.slice`), [`PREVIEWD_SECRETS_STAGING_DIR`](#previewd_secrets_staging_dir), [`PREVIEWD_TRAEFIK_CONTAINER`](#previewd_traefik_container). `NAME` is the service user whose uid must own the staging directory (default `previewd`). |
+| `previewd backup [-db PATH] -out FILE` | [`PREVIEWD_DB_PATH`](#previewd_db_path) when `-db` is not given. |
+| `previewd restore -in FILE [-db PATH] [-force]` | [`PREVIEWD_DB_PATH`](#previewd_db_path) when `-db` is not given. |
+
+A line of the conf file that is not `KEY=VALUE` (optionally quoted), a comment or empty, an unterminated quote and a line continuation are errors (exit 2): half a configuration is not read.

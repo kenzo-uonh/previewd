@@ -129,15 +129,15 @@ release: build ## Package bin/previewd as deb and rpm into dist/ (nfpm.yaml, PKG
 		-v "$(CURDIR):/src:ro" -v "$(CURDIR)/$(DIST_DIR):/src/$(DIST_DIR)" -w /src "$(NFPM_IMAGE)" \
 		package --config nfpm.yaml --packager rpm --target $(DIST_DIR)/
 
-test-packages: release ## Install the deb (Ubuntu 24.04) and rpm (Fedora 42) in throwaway containers without network (install, reinstall), check user and files
+test-packages: release ## Packages in throwaway containers without network: refused without Docker, installed and reinstalled, removed (needs a cgroup v2 docker host)
 	@echo "Installing the deb on $(PKG_TEST_DEB_IMAGE)..."
 	docker run --rm --network none -v "$(CURDIR)/$(DIST_DIR):/dist:ro" \
 		-v "$(CURDIR)/scripts/check-package-install.sh:/check.sh:ro" "$(PKG_TEST_DEB_IMAGE)" \
-		sh -euc 'apt-get install -y -q /dist/previewd*.deb && apt-get install -y -q --reinstall /dist/previewd*.deb && sh /check.sh' # airgap:allow installs the local package file, --network none
+		sh -euc 'if apt-get install -y -q /dist/previewd*.deb; then echo "FAIL: installed without Docker Engine" >&2; exit 1; fi; sh /check.sh refused; sh /check.sh stub-docker; apt-get install -y -q /dist/previewd*.deb && apt-get install -y -q --reinstall /dist/previewd*.deb && sh /check.sh installed && sh /check.sh stage-secret && apt-get remove -y -q previewd && sh /check.sh removed' # airgap:allow installs the local package file, --network none
 	@echo "Installing the rpm on $(PKG_TEST_RPM_IMAGE)..."
 	docker run --rm --network none -v "$(CURDIR)/$(DIST_DIR):/dist:ro" \
 		-v "$(CURDIR)/scripts/check-package-install.sh:/check.sh:ro" "$(PKG_TEST_RPM_IMAGE)" \
-		sh -euc 'dnf install -y -q --disablerepo="*" /dist/previewd*.rpm && dnf reinstall -y -q --disablerepo="*" /dist/previewd*.rpm && sh /check.sh' # airgap:allow installs the local package file, --network none
+		sh -euc 'if dnf install -y -q --disablerepo="*" /dist/previewd*.rpm; then echo "FAIL: installed without Docker Engine" >&2; exit 1; fi; sh /check.sh refused; sh /check.sh stub-docker; dnf install -y -q --disablerepo="*" /dist/previewd*.rpm && dnf reinstall -y -q --disablerepo="*" /dist/previewd*.rpm && sh /check.sh installed && sh /check.sh stage-secret && dnf remove -y -q previewd && sh /check.sh removed' # airgap:allow installs the local package file, --network none
 
 sec: ## Run gosec AST security scanner
 	@echo "Running AST security scanner..."

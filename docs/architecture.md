@@ -277,6 +277,7 @@ previewd audit export [-db PATH] > audit.jsonl   # verified first; a broken chai
 - They run beside the daemon or on a copy.
 - A chain truncated from the end is still a valid chain: record the head hash outside the host (with each export, in a ticket) and pass it to `-head`, which fails when the chain no longer contains it.
 - Exit 2 is a usage or read error.
+- `previewd backup` and `previewd restore` carry the trail across hosts and disasters: the snapshot is taken through SQLite's online backup API while the daemon runs, and is accepted only when its whole chain verifies, at backup and again at restore ([Day-2](deployment.md#9-day-2-doctor-backup-and-restore)).
 
 ## Formal Verification (Phase 1)
 
