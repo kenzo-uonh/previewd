@@ -144,6 +144,14 @@ type ReconcilerConfig struct {
 	// approvals changed during the read): the last one parks the deploy
 	// instead of requeuing it (default 10).
 	AuthorizeMaxAttempts int64
+	// Feedback, when set, gives the developer the commit status and the
+	// sticky comment of each deploy (PREVIEWD_FEEDBACK). FeedbackTimeout
+	// bounds each call (default 10 s, at most 1 m); PreviewScheme is the
+	// scheme of the preview URL in them, http or https (default http, the
+	// shipped Traefik entrypoint).
+	Feedback        Feedback
+	FeedbackTimeout time.Duration
+	PreviewScheme   string
 	// Now and PollInterval default to time.Now and 2 s.
 	Now          func() time.Time
 	PollInterval time.Duration
@@ -273,6 +281,14 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 		if cfg.EnvTTL < minEnvTTL {
 			return nil, fmt.Errorf("reconciler: TTL %s is shorter than %s", cfg.EnvTTL, minEnvTTL)
 		}
+	}
+	if cfg.FeedbackTimeout < 0 || cfg.FeedbackTimeout > maxFeedbackTimeout {
+		return nil, fmt.Errorf("reconciler: feedback timeout %s is outside (0, %s]", cfg.FeedbackTimeout, maxFeedbackTimeout)
+	}
+	cfg.FeedbackTimeout = cmp.Or(cfg.FeedbackTimeout, defaultFeedbackTimeout)
+	cfg.PreviewScheme = cmp.Or(cfg.PreviewScheme, defaultPreviewScheme)
+	if cfg.PreviewScheme != "http" && cfg.PreviewScheme != "https" {
+		return nil, fmt.Errorf("reconciler: preview scheme %q is not http or https", cfg.PreviewScheme)
 	}
 	cfg.BuildDir = cmp.Or(cfg.BuildDir, os.TempDir())
 	if !filepath.IsAbs(cfg.BuildDir) {
@@ -499,12 +515,14 @@ func (r *Reconciler) deploy(ctx context.Context, l store.Lease, log *slog.Logger
 	}
 	log = log.With("trust", string(d.Trust))
 	log.Info("Deploying environment")
+	r.notify(ctx, log, "begin", func(c context.Context) error { return r.cfg.Feedback.Begin(c, r.status(l, d)) })
 	err := r.runDeploy(ctx, l, d, log)
 	cctx, cancel := cleanupContext(ctx)
 	defer cancel()
 	if err == nil {
 		if err = r.cfg.Queue.Finish(cctx, l, store.StatusSuccess, r.cfg.Now()); err == nil {
 			log.Info("Environment deployed")
+			r.notify(ctx, log, "succeed", func(c context.Context) error { return r.cfg.Feedback.Succeed(c, r.status(l, d)) })
 			return
 		}
 		err = failAt(store.FailureCommit, fmt.Errorf("commit deploy: %w", err))
@@ -529,6 +547,11 @@ func (r *Reconciler) deploy(ctx context.Context, l store.Lease, log *slog.Logger
 	if fErr != nil {
 		log.Error("Could not record the failed deploy", "error", fErr)
 	}
+	r.notify(ctx, log, "fail", func(c context.Context) error {
+		s := r.status(l, d)
+		s.Failure = cmp.Or(string(failure), failureSetup)
+		return r.cfg.Feedback.Fail(c, s)
+	})
 }
 
 // requeueForBuildSlot releases the lease of a deploy that found every build

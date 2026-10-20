@@ -316,6 +316,10 @@ type rig struct {
 	envTTL      time.Duration
 	disableTTL  bool
 	buildDir    string
+	// Developer feedback (V1.1 spec 3.3); nil is off.
+	feedback        Feedback
+	feedbackTimeout time.Duration
+	previewScheme   string
 }
 
 func newRig(t *testing.T) *rig {
@@ -367,12 +371,21 @@ func (r *rig) crash() {
 
 func (r *rig) reconciler() *Reconciler {
 	r.t.Helper()
-	rec, err := NewReconciler(ReconcilerConfig{
+	rec, err := NewReconciler(r.config())
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	return rec
+}
+
+func (r *rig) config() ReconcilerConfig {
+	return ReconcilerConfig{
 		Queue: r.queue, Engine: r.engine, Routes: r.routes, Stager: r.stager,
 		Secrets: sectionSecrets{}, Authorizer: r.auth,
 		RevalidateInterval: r.interval, RevalidateGrace: r.grace, AuthorizeMaxAttempts: r.maxAttempts,
 		MaxConcurrentBuilds: r.maxBuilds, BuildTimeout: r.buildTimeout, PruneInterval: r.pruneInterval, PruneBatch: 2,
 		MinFreeDiskBytes: r.minFreeDisk, EnvTTL: r.envTTL, DisableTTL: r.disableTTL, BuildDir: r.buildDir,
+		Feedback: r.feedback, FeedbackTimeout: r.feedbackTimeout, PreviewScheme: r.previewScheme,
 		Fetch: func(_ context.Context, repo, _, _, dest string) error {
 			if r.fetchErr != nil {
 				return r.fetchErr
@@ -390,11 +403,7 @@ func (r *rig) reconciler() *Reconciler {
 			}
 			return r.now
 		}, PollInterval: 5 * time.Millisecond,
-	})
-	if err != nil {
-		r.t.Fatal(err)
 	}
-	return rec
 }
 
 func (r *rig) enqueue(typ store.JobType) {

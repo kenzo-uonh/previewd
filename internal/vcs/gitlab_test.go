@@ -283,6 +283,10 @@ type glFake struct {
 
 	mr     func() any
 	member func() (int, any)
+	// feedback: the statuses and the notes of merge request 7 (feedback_gitlab_test.go).
+	statuses []glStatus
+	notes    []*glNote
+	notePage int // notes per page; 0 is 100
 	// others answers a membership read for an account other than the author.
 	others func(uid int64) (int, any)
 	// project answers GET /projects/:path-or-id for a project path.
@@ -356,6 +360,7 @@ func newGLFake(t *testing.T) *glFake {
 		}
 		f.archive(w, r)
 	}))
+	f.feedbackRoutes(mux, guard)
 	f.srv = httptest.NewTLSServer(mux)
 	t.Cleanup(f.srv.Close)
 	return f

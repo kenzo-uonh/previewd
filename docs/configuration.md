@@ -64,6 +64,8 @@ Every value is validated at start: a malformed value refuses to start. Each `PRE
 | [`PREVIEWD_DB_PATH`](#previewd_db_path) | `previewd.sqlite` | path |
 | [`PREVIEWD_RETENTION`](#previewd_retention) | `720h` | at least `24h` |
 | [`PREVIEWD_ENV_TTL`](#previewd_env_ttl) | `168h` | at least `1h`, or exactly `0` |
+| [`PREVIEWD_FEEDBACK`](#developer-feedback-previewd_feedback-and-previewd_preview_url_scheme) | on | `0` or `1` |
+| [`PREVIEWD_PREVIEW_URL_SCHEME`](#developer-feedback-previewd_feedback-and-previewd_preview_url_scheme) | `http` | `http` or `https` |
 | [`PREVIEWD_MIN_FREE_DISK_MIB`](#previewd_min_free_disk_mib) | `10240` | at least `1024` |
 | [`PREVIEWD_DOCKER_DATA_ROOT`](#previewd_docker_data_root) | the daemon's `DockerRootDir` | clean absolute path |
 | [`PREVIEWD_PRUNE_INTERVAL`](#previewd_prune_interval-and-previewd_prune_batch) | `1h` | `1m`..`24h` |
@@ -82,6 +84,7 @@ Each of these is logged as an error at every start. Use them only where the reas
 | `PREVIEWD_LABEL_APPROVAL=1` | Lets an approver approve by labeling the pull request |
 | `PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS` | Gives approved untrusted deploys the trusted secret section (also logged at every such deploy and audited) |
 | `PREVIEWD_ENV_TTL=0` | Disables the environment TTL |
+| `PREVIEWD_FEEDBACK=0` | Posts no commit status and no comment on the pull or merge request |
 
 ## Webhook listener
 
@@ -142,6 +145,7 @@ PEM bundle of the site CA that signs the GHES certificate. When set, it is the o
 
 - The App needs **Pull requests: read**, **Contents: read** (source tarballs, H2) and the default **Metadata: read**, installed on the repositories previewd serves.
 - Each read mints a token scoped to one repository, read only, with the one permission it needs, and revokes it before returning.
+- [Developer feedback](#developer-feedback-previewd_feedback-and-previewd_preview_url_scheme) adds **Commit statuses: write** and **Pull requests: write**. Each write mints a token scoped to one repository and to that one permission at write level, and revokes it before returning. An App without them still deploys: the write is refused and logged at warn.
 
 ## GitLab
 
@@ -149,7 +153,7 @@ With `PREVIEWD_VCS_PROVIDER=gitlab` (V1.1 spec 3.1). The driver speaks REST API 
 
 - `PREVIEWD_GITLAB_URL` is **required**: `https://host[:port]`, no path, user info, query or fragment.
 - `PREVIEWD_GITLAB_CA_FILE` is the PEM bundle of the site CA that signs the GitLab certificate: a clean absolute path; when set it is the only trust; every block must be a certificate.
-- `PREVIEWD_GITLAB_TOKEN_CREDENTIAL` (default `gitlab-api-token`) names the credential holding a **Project or Group Access Token** with `read_api` and `read_repository`, role Developer or more; previewd only reads. It is sent in `PRIVATE-TOKEN` to the configured host only, kept in memory, never logged or quoted.
+- `PREVIEWD_GITLAB_TOKEN_CREDENTIAL` (default `gitlab-api-token`) names the credential holding a **Project or Group Access Token** with `read_api` and `read_repository`, role Developer or more. The `api` scope instead of `read_api` also lets previewd write the commit status and the merge request note ([developer feedback](#developer-feedback-previewd_feedback-and-previewd_preview_url_scheme)); with `read_api` those writes are refused and logged at warn, and the deploy is not affected. previewd writes nothing else. It is sent in `PRIVATE-TOKEN` to the configured host only, kept in memory, never logged or quoted.
 - `PREVIEWD_GITLAB_WEBHOOK_SECRET_CREDENTIAL` (default `gitlab-webhook-secret`) names the credential holding the secret token of the project or group hook. Every hook must carry exactly one `X-Gitlab-Token` equal to it (constant-time comparison); enable only **Merge request events**. GitLab does not sign the body, so keep the listener on TLS.
 - `PREVIEWD_GITLAB_TOKEN` and `PREVIEWD_GITLAB_WEBHOOK_SECRET` (the secrets themselves) refuse to start whatever their value, as `PREVIEWD_WEBHOOK_SECRET` does.
 
@@ -326,6 +330,16 @@ Age past which finished jobs, approval grants no longer live and deliveries are 
 ### `PREVIEWD_ENV_TTL`
 
 Age, at least `1h` (default: `168h`), after which an environment whose running version has not been replaced is torn down, and a deploy parked for an approval since its creation is dropped: each maintenance pass queues an internal teardown (`origin = 'ttl'`, audited `ttl_expired`) pinned to that job's commit, which supersedes a parked job. A later push, or an approval of the open head, deploys it again. `0`, exactly, disables the TTL and is logged as an error at every start.
+
+### Developer feedback: `PREVIEWD_FEEDBACK` and `PREVIEWD_PREVIEW_URL_SCHEME`
+
+On by default (V1.1 spec 3.3); `PREVIEWD_FEEDBACK=0`, exactly, turns it off, any other value than `0` or `1` refuses to start.
+
+- **Commit status** `previewd`: `pending` when the deploy is authorized and starts, `success` with the preview URL when the environment runs, `failure` naming the step (`fetch`, `preflight`, `build`, `stage`, `start`, `route`, `commit`, or `setup`) once the rollback is done. GitLab spells it `failed`.
+- **One sticky comment** per pull or merge request, found by its first line `<!-- previewd-status -->` and updated in place, never duplicated: 🟢 with the preview URL, the short commit, who authorized the deploy (the trusted author, or `login#id` of the approver) and the expiry from `PREVIEWD_ENV_TTL`; 🔴 with the failed step. Only a comment written by previewd's own credential (the GitHub App, the GitLab token's account) is ever taken for it or edited; a comment of anyone else carrying the marker is ignored. The search reads at most 10 pages of 100.
+- **It fails open.** An error or a hang of the forge is logged at warn and dropped; each call is bounded to 10 s and runs after the state it reports is recorded. No deploy fails, waits or rolls back because of it.
+- `PREVIEWD_PREVIEW_URL_SCHEME` is the scheme of the URL in the status and the comment (`http` by default: the shipped Traefik entrypoint `web` serves plain HTTP on port 80). Set `https` only where a TLS entrypoint fronts it.
+- Titles, branch names and descriptions of the request are never copied into either: the text is previewd's own, built from validated identifiers, and a URL or a name that does not validate is not posted.
 
 ### `PREVIEWD_MIN_FREE_DISK_MIB`
 

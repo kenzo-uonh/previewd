@@ -71,7 +71,14 @@ type Config struct {
 	// Auto-cleanup (V1 F5). EnvTTL is 0 when PREVIEWD_ENV_TTL=0 disables
 	// the TTL. A build starts only with MinFreeDiskBytes free on the file
 	// system of DockerDataRoot ("" for the daemon's DockerRootDir).
-	EnvTTL           time.Duration
+	EnvTTL time.Duration
+	// Developer feedback (V1.1 spec 3.3): the commit status and sticky comment
+	// of each deploy. Feedback is PREVIEWD_FEEDBACK (on unless exactly 0);
+	// PreviewScheme is the scheme of the preview URL in them,
+	// PREVIEWD_PREVIEW_URL_SCHEME (http or https, default http: the shipped
+	// Traefik entrypoint serves plain HTTP).
+	Feedback         bool
+	PreviewScheme    string
 	MinFreeDiskBytes int64
 	DockerDataRoot   string
 
@@ -334,6 +341,14 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	envTTL := time.Duration(0)
+	feedback, err := feedbackSwitch()
+	if err != nil {
+		return nil, err
+	}
+	previewScheme, err := previewScheme()
+	if err != nil {
+		return nil, err
+	}
 	if os.Getenv("PREVIEWD_ENV_TTL") != "0" {
 		if envTTL, err = boundedDuration("PREVIEWD_ENV_TTL", defaultEnvTTL, minEnvTTL, maxEnvTTL); err != nil {
 			return nil, fmt.Errorf("%w (or 0 to disable)", err)
@@ -418,6 +433,8 @@ func Load() (*Config, error) {
 		PruneBatch:    pruneBatch,
 
 		EnvTTL:           envTTL,
+		Feedback:         feedback,
+		PreviewScheme:    previewScheme,
 		MinFreeDiskBytes: minFreeDiskMiB << 20,
 		DockerDataRoot:   dataRoot,
 
@@ -544,6 +561,31 @@ func boundedCount(name string, def, lo, hi int) (int, error) {
 
 // optIn reads an opt-in flag. Opt-ins are exact: only "1" enables, any other
 // non-empty value is a configuration error.
+// feedbackSwitch reads PREVIEWD_FEEDBACK: on when unset or 1, off when
+// exactly 0, an error otherwise.
+func feedbackSwitch() (bool, error) {
+	switch v := os.Getenv("PREVIEWD_FEEDBACK"); v {
+	case "", "1":
+		return true, nil
+	case "0":
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid PREVIEWD_FEEDBACK %q: set exactly 0 or 1, or leave unset", v)
+	}
+}
+
+// previewScheme reads PREVIEWD_PREVIEW_URL_SCHEME: http (default) or https.
+func previewScheme() (string, error) {
+	switch v := os.Getenv("PREVIEWD_PREVIEW_URL_SCHEME"); v {
+	case "", "http":
+		return "http", nil
+	case "https":
+		return "https", nil
+	default:
+		return "", fmt.Errorf("invalid PREVIEWD_PREVIEW_URL_SCHEME %q: set http or https, or leave unset", v)
+	}
+}
+
 func optIn(name string) (bool, error) {
 	switch v := os.Getenv(name); v {
 	case "":

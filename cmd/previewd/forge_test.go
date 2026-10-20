@@ -95,3 +95,22 @@ func TestNewForgeKeepsTheGitHubPathForGitHub(t *testing.T) {
 		t.Error("an unknown provider was wired")
 	}
 }
+
+// Feedback follows PREVIEWD_FEEDBACK. Off is a nil interface, not a typed nil
+// the reconciler would call.
+func TestNewForgeWiresFeedbackOnlyWhenEnabled(t *testing.T) {
+	credentials(t, "gitlab-api-token", "glpat-TESTONLYtokenvalue0123")
+	cfg := gitlabConfig()
+	cfg.Feedback = true
+	f, err := newForge(cfg, noApprovals{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f.feedback.(*vcs.Notifier); !ok {
+		t.Errorf("feedback is %T, want the notifier", f.feedback)
+	}
+	cfg.Feedback = false
+	if f, err = newForge(cfg, noApprovals{}, slog.New(slog.DiscardHandler)); err != nil || f.feedback != nil {
+		t.Errorf("feedback = %v, %v; want none when disabled", f.feedback, err)
+	}
+}

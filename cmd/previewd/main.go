@@ -244,6 +244,8 @@ func main() {
 		MinFreeDiskBytes:     cfg.MinFreeDiskBytes,
 		EnvTTL:               cfg.EnvTTL,
 		DisableTTL:           cfg.EnvTTL == 0,
+		Feedback:             vcsForge.feedback,
+		PreviewScheme:        cfg.PreviewScheme,
 	})
 	if err != nil {
 		logger.Error("Reconciler initialization failure", "error", err)

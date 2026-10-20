@@ -5,8 +5,10 @@ package vcs
 // Token, read from a systemd credential into memory, sent in the
 // PRIVATE-TOKEN header to the one configured host and nowhere else: no
 // redirect is followed, so the header cannot be carried to another host.
-// The token needs read_api and read_repository, nothing more, and previewd
-// only reads.
+// The token needs read_api and read_repository to deploy, and api to give
+// the developer feedback (commit status, sticky comment): without it those
+// writes are refused and logged, the deploy is not affected. previewd writes
+// nothing else.
 //
 // Like the GHES client: REST over net/http only (no SDK), HTTPS only, the
 // site CA when one is configured, no proxy from the environment, every reply
@@ -14,12 +16,14 @@ package vcs
 // and consistently is an error, never a default.
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -301,16 +305,28 @@ func glIDs(projectID, mrIID string) (iid uint32, base string, err error) {
 // request sends one GET authenticated by the token. The caller closes the
 // body (decodeReply does).
 func (g *GitLab) request(ctx context.Context, client *http.Client, path string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.api+path, nil)
+	return g.do(ctx, client, http.MethodGet, path, nil)
+}
+
+// do sends one request authenticated by the token; a body is JSON.
+func (g *GitLab) do(ctx context.Context, client *http.Client, method, path string, body []byte) (*http.Response, error) {
+	var rd io.Reader
+	if body != nil {
+		rd = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, g.api+path, rd)
 	if err != nil {
-		return nil, fmt.Errorf("GET %s: build request: %w", path, err)
+		return nil, fmt.Errorf("%s %s: build request: %w", method, path, err)
 	}
 	req.Header.Set("PRIVATE-TOKEN", g.token)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", userAgent)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("GET %s: %w", path, err)
+		return nil, fmt.Errorf("%s %s: %w", method, path, err)
 	}
 	return resp, nil
 }

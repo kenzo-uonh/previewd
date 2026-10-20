@@ -27,6 +27,9 @@ type forge struct {
 	// whose driver the options carry.
 	github  api.GitHub
 	options []api.Option
+	// feedback gives the developer the commit status and the sticky comment
+	// of each deploy; nil when PREVIEWD_FEEDBACK=0.
+	feedback orchestrator.Feedback
 }
 
 // newForge wires the forge cfg selects. A credential that cannot be read, a
@@ -75,7 +78,12 @@ func newGitHubForge(cfg *config.Config, approvals orchestrator.Approvals, logger
 		return forge{}, fmt.Errorf("source fetcher: %w", err)
 	}
 	logger.Info("Source fetch armed", "forge", vcs.ProviderGitHub, "ghes_tarball", fetcher.Tarball(), "max_bytes", cfg.MaxBuildContextBytes)
-	return forge{provider: vcs.ProviderGitHub, authorizer: authorizer, fetch: fetcher.Fetch, github: ghes}, nil
+	f := forge{provider: vcs.ProviderGitHub, authorizer: authorizer, fetch: fetcher.Fetch, github: ghes}
+	if cfg.Feedback {
+		f.feedback = vcs.NewNotifier(ghes, nil)
+		logger.Info("Developer feedback armed", "forge", vcs.ProviderGitHub, "permissions", "statuses:write, pull_requests:write")
+	}
+	return f, nil
 }
 
 // newGitLabForge wires GitLab Self-Managed: the access token from its systemd
@@ -118,5 +126,10 @@ func newGitLabForge(cfg *config.Config, approvals orchestrator.Approvals, logger
 		return forge{}, fmt.Errorf("source fetcher: %w", err)
 	}
 	logger.Info("Source fetch armed", "forge", vcs.ProviderGitLab, "gitlab_url", cfg.GitLabURL, "max_bytes", cfg.MaxBuildContextBytes)
-	return forge{provider: vcs.ProviderGitLab, authorizer: authorizer, fetch: fetcher.Fetch, options: []api.Option{api.WithProvider(gitlab)}}, nil
+	f := forge{provider: vcs.ProviderGitLab, authorizer: authorizer, fetch: fetcher.Fetch, options: []api.Option{api.WithProvider(gitlab)}}
+	if cfg.Feedback {
+		f.feedback = vcs.NewNotifier(gitlab, gitlab.ResolveProject)
+		logger.Info("Developer feedback armed", "forge", vcs.ProviderGitLab, "token_scope", "api")
+	}
+	return f, nil
 }

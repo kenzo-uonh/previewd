@@ -379,9 +379,10 @@ func validToken(t string) bool {
 	return true
 }
 
-// mint returns an installation token for repo with read access to perms,
-// and nothing else: a reply that grants another permission, another
-// repository, or a lifetime outside (0, 2 h] is revoked and refused.
+// mint returns an installation token for repo with the access perms name
+// ("pull_requests" is read, "statuses:write" is write), and nothing else: a
+// reply that grants another permission, another level, another repository,
+// or a lifetime outside (0, 2 h] is revoked and refused.
 func (c *Client) mint(ctx context.Context, repo string, perms ...string) (token, error) {
 	path, err := repoPath(repo)
 	if err != nil {
@@ -403,7 +404,11 @@ func (c *Client) mint(ctx context.Context, repo string, perms ...string) (token,
 	_, name, _ := strings.Cut(repo, "/")
 	want := map[string]string{}
 	for _, p := range perms {
-		want[p] = "read"
+		name, level, ok := strings.Cut(p, ":")
+		if !ok {
+			level = "read"
+		}
+		want[name] = level
 	}
 	body, err := json.Marshal(tokenRequest{Repositories: []string{name}, Permissions: want})
 	if err != nil {
@@ -442,8 +447,17 @@ func checkGrant(r tokenReply, repo string, want map[string]string, now time.Time
 		return errors.New("the reply names no permission")
 	}
 	for p, level := range r.Permissions {
-		if level != "read" || (want[p] == "" && p != "metadata") {
-			return fmt.Errorf("granted %s:%s, beyond the read access requested", textutil.Truncate(p, 32), textutil.Truncate(level, 16))
+		asked, ok := want[p]
+		if p == "metadata" && !ok {
+			asked, ok = "read", true // GitHub adds it to every installation token
+		}
+		if !ok || level != asked {
+			return fmt.Errorf("granted %s:%s, beyond the %s access requested", textutil.Truncate(p, 32), textutil.Truncate(level, 16), asked)
+		}
+	}
+	for p, asked := range want {
+		if r.Permissions[p] != asked {
+			return fmt.Errorf("granted %s:%s, not the %s access requested", textutil.Truncate(p, 32), textutil.Truncate(r.Permissions[p], 16), asked)
 		}
 	}
 	return nil

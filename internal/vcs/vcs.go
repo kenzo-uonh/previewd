@@ -66,6 +66,14 @@ type Provider interface {
 	GetMRState(ctx context.Context, projectID, mrIID string) (*MRState, error)
 	// GetApprovals reads who approves the request now.
 	GetApprovals(ctx context.Context, projectID, mrIID string) ([]Approval, error)
+	// SetCommitStatus sets previewd's status (StatePending, StateSuccess or
+	// StateFailure) on the commit. targetURL is "" or the preview URL.
+	SetCommitStatus(ctx context.Context, projectID, commitSHA, state, targetURL, description string) error
+	// PostComment keeps previewd's one sticky comment on the request: body
+	// starts with CommentMarker, and the comment this driver's credential
+	// already wrote with that marker is updated in place, else one is
+	// created. It never touches a comment another account wrote.
+	PostComment(ctx context.Context, projectID, mrIID, body string) error
 }
 
 // Event is a validated webhook: every field has passed its validator.
