@@ -10,6 +10,7 @@ How previewd turns a signed pull-request webhook into an isolated, routed previe
   - [Startup build probe](#startup-build-probe)
   - [Persistence](#persistence)
 - [Secret Staging](#secret-staging)
+- [Forges](#forges)
 - [Webhook Ingestion](#webhook-ingestion)
 - [Reconciliation](#reconciliation)
   - [Disk (V1 F5, V1-I9)](#disk-v1-f5-v1-i9)
@@ -118,6 +119,23 @@ Secrets reach a preview container only as read-only files:
 
 The staging root lives in memory and must be mounted before starting previewd ([deployment step 4](deployment.md#4-mount-the-secrets-staging-root-ramfs)). ramfs is never swapped. A reboot discards it, together with every staged secret.
 
+## Forges
+
+A forge is a `vcs.Provider` (`internal/vcs/vcs.go`): `Name`, `VerifyWebhook` (authenticates a request against the secret and returns its body, at most 1 MiB), `ParseEvent`, `FetchTarball`, `GetMRState` (open, head commit, trusted) and `GetApprovals`. The daemon serves one (`PREVIEWD_VCS_PROVIDER`). `vcs.Client` (the GitHub App) and `vcs.GitLab` implement it; `vcs.Authorized` matches approvals to `PREVIEWD_APPROVERS` by account ID.
+
+| | GitHub (GHES, github.com) | GitLab (Self-Managed, gitlab.com) |
+|---|---|---|
+| Route | `POST /webhooks/github` | `POST /webhooks/gitlab` |
+| Authentication | `X-Hub-Signature-256`, HMAC-SHA256 of the body | `X-Gitlab-Token`, the shared secret, compared in constant time (digests, `subtle.ConstantTimeCompare`) |
+| Event | `X-GitHub-Event: pull_request`, `pull_request_review` | `X-Gitlab-Event: Merge Request Hook` |
+| Replay key | `X-GitHub-Delivery` (UUIDv1) and the body's digest | `X-Gitlab-Event-UUID` (body digest when absent) and the body's digest |
+| Order of intents | the delivery UUID's time | the instant the hook is received |
+| API credential | installation token per read, scoped, revoked | access token in `PRIVATE-TOKEN`, read only |
+| Trusted | head in the repository, opener can write | head in the project, author an active member with Developer or more |
+| Approval bound to a commit | yes (review `commit_id`) | no (`Approval.CommitSHA` is empty) |
+
+GitLab ingestion shares the pull request path of GitHub from the decoded event on (signed window, environment ID, enqueue). `cmd/previewd/forge.go` wires the forge the daemon serves: `orchestrator.GitLabAuthorizer` is its deploy gate and `vcs.GitLabFetcher` its source fetch (the store keeps a project by path, GitLab is addressed by ID, so the path is resolved at each use). Approval events are not recorded yet; see [Configuration: GitLab](configuration.md#gitlab).
+
 ## Webhook Ingestion
 
 0. **Transport:** TLS 1.2+ from an allowed source (`PREVIEWD_WEBHOOK_ALLOWED_CIDRS`, checked before the body is read).
@@ -207,6 +225,8 @@ With the GitHub App (always, in this daemon):
 - The directory is then packed into the build context, which checks every symlink again, and preflighted.
 
 Without an App, `git fetch --depth=1 origin <sha>` and `git checkout FETCH_HEAD`: never a branch, a tag or the history.
+
+With GitLab (`vcs.GitLab.FetchTarball`): `GET /api/v4/projects/{id}/repository/archive.tar.gz?sha={sha}` by the numeric project ID, authenticated by the access token in `PRIVATE-TOKEN`. GitLab serves the archive itself: a redirect is refused, so the token cannot reach another host. The same cap and the same extraction apply (`git archive` writes the same pax header naming the commit).
 
 ### Teardown
 

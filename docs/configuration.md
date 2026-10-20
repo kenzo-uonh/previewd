@@ -29,10 +29,15 @@ Every value is validated at start: a malformed value refuses to start. Each `PRE
 | [`PREVIEWD_WEBHOOK_ALLOWED_CIDRS`](#previewd_webhook_allowed_cidrs) | unset (any source) | comma-separated prefixes |
 | [`PREVIEWD_WEBHOOK_SECRET_CREDENTIAL`](#previewd_webhook_secret_credential) | `webhook_secret` | credential name; **required credential** |
 | [`PREVIEWD_DELIVERY_MAX_AGE`](#previewd_delivery_max_age) | `15m` | `1m`..`2h` |
-| [`PREVIEWD_GHES_URL`](#previewd_ghes_url) | — | **required**, `https://host[:port]` |
+| [`PREVIEWD_VCS_PROVIDER`](#previewd_vcs_provider) | `github` | `github` or `gitlab` |
+| [`PREVIEWD_GHES_URL`](#previewd_ghes_url) | — | **required** with `github`, `https://host[:port]` |
 | [`PREVIEWD_GHES_CA_FILE`](#previewd_ghes_ca_file) | unset (system roots) | PEM bundle path |
-| [`PREVIEWD_GITHUB_APP_ID`](#previewd_github_app_id-and-previewd_github_app_key_credential) | — | **required** |
+| [`PREVIEWD_GITHUB_APP_ID`](#previewd_github_app_id-and-previewd_github_app_key_credential) | — | **required** with `github` |
 | [`PREVIEWD_GITHUB_APP_KEY_CREDENTIAL`](#previewd_github_app_id-and-previewd_github_app_key_credential) | `github-app-key` | credential name |
+| [`PREVIEWD_GITLAB_URL`](#gitlab) | — | **required** with `gitlab`, `https://host[:port]` |
+| [`PREVIEWD_GITLAB_CA_FILE`](#gitlab) | unset (system roots) | clean absolute PEM bundle path |
+| [`PREVIEWD_GITLAB_TOKEN_CREDENTIAL`](#gitlab) | `gitlab-api-token` | credential name |
+| [`PREVIEWD_GITLAB_WEBHOOK_SECRET_CREDENTIAL`](#gitlab) | `gitlab-webhook-secret` | credential name |
 | [`PREVIEWD_APPROVERS`](#previewd_approvers) | unset (no approver) | `owner/repo:login#id`, comma-separated |
 | [`PREVIEWD_LABEL_APPROVAL`](#previewd_label_approval) | unset | exactly `1` |
 | [`PREVIEWD_APPROVAL_LABEL`](#previewd_approval_label) | `previewd-approved` | 1 to 50 bytes |
@@ -113,6 +118,14 @@ Default `webhook_secret`. Name of the systemd credential holding the HMAC secret
 
 How long after its signed time a delivery is still accepted (default: `15m`, a Go duration in 1m..2h; see V1-I7, step 5 of [Webhook Ingestion](architecture.md#webhook-ingestion)).
 
+## Forge
+
+### `PREVIEWD_VCS_PROVIDER`
+
+`github` (the default: GHES and github.com) or `gitlab` (GitLab Self-Managed CE/EE and gitlab.com). Exactly those two spellings: anything else, case and padding included, refuses to start. One forge per daemon: only that forge's webhook route exists (`/webhooks/github` or `/webhooks/gitlab`).
+
+The keys of the other forge are a contradiction, refused at start whatever their value: a stale `PREVIEWD_GHES_URL` in a GitLab deployment (or `PREVIEWD_GITLAB_URL` in a GitHub one) is never ignored. With `gitlab`, `PREVIEWD_WEBHOOK_SECRET_CREDENTIAL` is refused too: the webhook secret is the credential of `PREVIEWD_GITLAB_WEBHOOK_SECRET_CREDENTIAL`. `PREVIEWD_APPROVERS` and `PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS` name projects as the forge spells them (see [Approvals and trust](#approvals-and-trust)).
+
 ## GitHub Enterprise Server
 
 ### `PREVIEWD_GHES_URL`
@@ -129,6 +142,22 @@ PEM bundle of the site CA that signs the GHES certificate. When set, it is the o
 
 - The App needs **Pull requests: read**, **Contents: read** (source tarballs, H2) and the default **Metadata: read**, installed on the repositories previewd serves.
 - Each read mints a token scoped to one repository, read only, with the one permission it needs, and revokes it before returning.
+
+## GitLab
+
+With `PREVIEWD_VCS_PROVIDER=gitlab` (V1.1 spec 3.1). The driver speaks REST API v4 over net/http only, through no proxy, following no redirect (the token cannot be carried to another host).
+
+- `PREVIEWD_GITLAB_URL` is **required**: `https://host[:port]`, no path, user info, query or fragment.
+- `PREVIEWD_GITLAB_CA_FILE` is the PEM bundle of the site CA that signs the GitLab certificate: a clean absolute path; when set it is the only trust; every block must be a certificate.
+- `PREVIEWD_GITLAB_TOKEN_CREDENTIAL` (default `gitlab-api-token`) names the credential holding a **Project or Group Access Token** with `read_api` and `read_repository`, role Developer or more; previewd only reads. It is sent in `PRIVATE-TOKEN` to the configured host only, kept in memory, never logged or quoted.
+- `PREVIEWD_GITLAB_WEBHOOK_SECRET_CREDENTIAL` (default `gitlab-webhook-secret`) names the credential holding the secret token of the project or group hook. Every hook must carry exactly one `X-Gitlab-Token` equal to it (constant-time comparison); enable only **Merge request events**. GitLab does not sign the body, so keep the listener on TLS.
+- `PREVIEWD_GITLAB_TOKEN` and `PREVIEWD_GITLAB_WEBHOOK_SECRET` (the secrets themselves) refuse to start whatever their value, as `PREVIEWD_WEBHOOK_SECRET` does.
+
+Hooks: `open`, `reopen`, `update` (only when the head moved: a title or label edit builds nothing), `close` and `merge` (teardown). Ordering is by the instant the hook is received; the replay keys are `X-Gitlab-Event-UUID` and the body's digest. A trusted merge request is one whose head lives in the target project and whose author is an active member with Developer access or more.
+
+The deploy gate (`orchestrator.GitLabAuthorizer`) reads GitLab again before anything is fetched or built, and again on every re-validation: the project is resolved from its path to its numeric ID (the reply must name exactly that path), then the merge request. It deploys only an **open** merge request that is **trusted**; a read that fails requeues the deploy (nothing runs), and a project, an author or a state that cannot be confirmed refuses it. The source is the project's archive at the exact commit (`GET /projects/:id/repository/archive.tar.gz?sha=`), extracted under the same bounds as a GHES tarball; git never runs for a merge request.
+
+**Not yet:** GitLab approvals (`approved`, `unapproved`) are acknowledged (`202 unsupported`, logged as a warning) and not recorded, so a merge request from a fork or from a non-member does not deploy. `PREVIEWD_LABEL_APPROVAL` and `PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS` act only on an approved untrusted request and are refused at start with `gitlab` rather than ignored. The merge request's opener is stored as `gitlab-user-<id>` (a hook names its author by ID only); the ID is the identity.
 
 ## Credentials
 
@@ -151,13 +180,15 @@ In GHES, enable SSL verification on the webhook and make the listener certificat
 |------------|----------|-------|
 | `webhook_secret` | `PREVIEWD_WEBHOOK_SECRET_CREDENTIAL` | HMAC secret of the GitHub webhook |
 | `github-app-key` | `PREVIEWD_GITHUB_APP_KEY_CREDENTIAL` | GitHub App private key |
+| `gitlab-api-token` | `PREVIEWD_GITLAB_TOKEN_CREDENTIAL` | GitLab Project or Group Access Token (`gitlab` provider) |
+| `gitlab-webhook-secret` | `PREVIEWD_GITLAB_WEBHOOK_SECRET_CREDENTIAL` | Secret token of the GitLab hook (`gitlab` provider) |
 | (no default name) | `PREVIEWD_TLS_KEY_CREDENTIAL` | Webhook listener's TLS key |
 
 ## Approvals and trust
 
 ### `PREVIEWD_APPROVERS`
 
-Accounts whose review approves untrusted code, as comma-separated `owner/repo:login#id` entries (repository spelled as GitHub spells it).
+Accounts whose review approves untrusted code, as comma-separated `owner/repo:login#id` entries (repository spelled as GitHub spells it; with `gitlab`, `group[/subgroup]/project:username#id`, the numeric user ID mandatory as well).
 
 - The numeric account ID is mandatory and is the identity; the login is for logs and the audit trail.
 - Any malformed entry, or an account listed twice for a repository, refuses to start.

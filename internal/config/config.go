@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
@@ -79,12 +80,25 @@ type Config struct {
 	// environment or a configured path.
 	WebhookSecretCredential string
 
+	// VCSProvider is PREVIEWD_VCS_PROVIDER: the one forge the daemon serves,
+	// "github" (the default: GHES and github.com) or "gitlab" (V1.1 spec 3.1).
+	// Approvers and FullSecretsRepos name projects as that forge spells them.
+	VCSProvider string
+
 	// GHES (V1 F4, C3): read as a GitHub App. The key is a systemd
-	// credential name, never a path.
+	// credential name, never a path. Set for the github provider only.
 	GHESURL                string // https://host[:port]
 	GHESCAFile             string // site CA bundle; "" for the system roots
 	GitHubAppID            int64
 	GitHubAppKeyCredential string
+
+	// GitLab (V1.1 spec 3.1), for the gitlab provider only: the access token
+	// and the webhook's shared secret are systemd credential names, never
+	// paths and never values. WebhookSecretCredential is then the latter.
+	GitLabURL                     string // https://host[:port]
+	GitLabCAFile                  string // site CA bundle; "" for the system roots
+	GitLabTokenCredential         string
+	GitLabWebhookSecretCredential string
 
 	// Webhook listener (V1 F4, C2). TLS unless AllowPlaintextWebhooks.
 	TLSCertFile            string
@@ -94,10 +108,14 @@ type Config struct {
 }
 
 const (
-	defaultAppKeyCredential        = "github-app-key" // #nosec G101 -- the name of a systemd credential, not a credential
-	defaultWebhookSecretCredential = "webhook_secret" // #nosec G101 -- the name of a systemd credential, not a credential
+	defaultAppKeyCredential        = "github-app-key"        // #nosec G101 -- the name of a systemd credential, not a credential
+	defaultWebhookSecretCredential = "webhook_secret"        // #nosec G101 -- the name of a systemd credential, not a credential
+	defaultGitLabTokenCredential   = "gitlab-api-token"      // #nosec G101 -- the name of a systemd credential, not a credential
+	defaultGitLabHookCredential    = "gitlab-webhook-secret" // #nosec G101 -- the name of a systemd credential, not a credential
 	// legacyWebhookSecretEnv held the secret itself before V1: refused.
-	legacyWebhookSecretEnv    = "PREVIEWD_WEBHOOK_SECRET" // #nosec G101 -- an environment variable name, not a credential
+	legacyWebhookSecretEnv    = "PREVIEWD_WEBHOOK_SECRET"        // #nosec G101 -- an environment variable name, not a credential
+	legacyGitLabTokenEnv      = "PREVIEWD_GITLAB_TOKEN"          // #nosec G101 -- an environment variable name, not a credential
+	legacyGitLabHookEnv       = "PREVIEWD_GITLAB_WEBHOOK_SECRET" // #nosec G101 -- an environment variable name, not a credential
 	defaultApprovalLabel      = "previewd-approved"
 	defaultDeliveryMaxAge     = 15 * time.Minute
 	minDeliveryMaxAge         = time.Minute
@@ -171,6 +189,16 @@ func Load() (*Config, error) {
 			"remove it and pass the secret as the systemd credential named by PREVIEWD_WEBHOOK_SECRET_CREDENTIAL (default %s)",
 			legacyWebhookSecretEnv, defaultWebhookSecretCredential)
 	}
+	for _, name := range []string{legacyGitLabTokenEnv, legacyGitLabHookEnv} {
+		if _, set := os.LookupEnv(name); set {
+			return nil, fmt.Errorf("%s is set: a GitLab secret is never read from the environment; "+
+				"remove it and pass it as the systemd credential named by %s_CREDENTIAL", name, name)
+		}
+	}
+	provider, err := vcsProvider()
+	if err != nil {
+		return nil, err
+	}
 	webhookSecretCred, err := credentialName("PREVIEWD_WEBHOOK_SECRET_CREDENTIAL", defaultWebhookSecretCredential)
 	if err != nil {
 		return nil, err
@@ -219,7 +247,11 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
-	approvers, err := validate.ParseApprovers(os.Getenv("PREVIEWD_APPROVERS"))
+	parseApprovers, repoValid := validate.ParseApprovers, validate.RepoFullName
+	if provider == providerGitLab {
+		parseApprovers, repoValid = validate.ParseGitLabApprovers, validate.GitLabProjectPath
+	}
+	approvers, err := parseApprovers(os.Getenv("PREVIEWD_APPROVERS"))
 	if err != nil {
 		return nil, fmt.Errorf("invalid PREVIEWD_APPROVERS: %w", err)
 	}
@@ -239,7 +271,7 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
-	fullSecrets, err := repoSet("PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS")
+	fullSecrets, err := repoSet("PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS", repoValid)
 	if err != nil {
 		return nil, err
 	}
@@ -316,17 +348,26 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("invalid PREVIEWD_DOCKER_DATA_ROOT %q: want a clean absolute path", dataRoot)
 	}
 
-	ghesURL, err := validate.GHESURL(os.Getenv("PREVIEWD_GHES_URL"))
-	if err != nil {
-		return nil, fmt.Errorf("PREVIEWD_GHES_URL is required: %w", err)
-	}
-	appID, err := strconv.ParseInt(os.Getenv("PREVIEWD_GITHUB_APP_ID"), 10, 64)
-	if err != nil || appID < 1 {
-		return nil, fmt.Errorf("PREVIEWD_GITHUB_APP_ID is required: a positive integer")
-	}
-	appKey, err := credentialName("PREVIEWD_GITHUB_APP_KEY_CREDENTIAL", defaultAppKeyCredential)
+	forge, err := loadForge(provider)
 	if err != nil {
 		return nil, err
+	}
+	if provider == providerGitLab {
+		// Both act on an approved untrusted request, and GitLab approvals are
+		// not recorded yet: refused, not ignored.
+		switch {
+		case labelApproval:
+			return nil, errors.New("PREVIEWD_LABEL_APPROVAL is not supported with PREVIEWD_VCS_PROVIDER=gitlab: GitLab approvals are not recorded yet")
+		case len(fullSecrets) > 0:
+			return nil, errors.New("PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS is not supported with PREVIEWD_VCS_PROVIDER=gitlab: GitLab approvals are not recorded yet")
+		}
+	}
+	if provider == providerGitLab {
+		if _, set := os.LookupEnv("PREVIEWD_WEBHOOK_SECRET_CREDENTIAL"); set {
+			return nil, fmt.Errorf("PREVIEWD_WEBHOOK_SECRET_CREDENTIAL contradicts PREVIEWD_VCS_PROVIDER=gitlab: " +
+				"the webhook secret is the credential named by PREVIEWD_GITLAB_WEBHOOK_SECRET_CREDENTIAL")
+		}
+		webhookSecretCred = forge.gitlabHookCredential
 	}
 	plaintext, err := optIn("PREVIEWD_ALLOW_PLAINTEXT_WEBHOOKS")
 	if err != nil {
@@ -387,14 +428,20 @@ func Load() (*Config, error) {
 		DockerDataRoot:   dataRoot,
 
 		WebhookSecretCredential: webhookSecretCred,
-		GHESURL:                 ghesURL,
-		GHESCAFile:              os.Getenv("PREVIEWD_GHES_CA_FILE"),
-		GitHubAppID:             appID,
-		GitHubAppKeyCredential:  appKey,
-		TLSCertFile:             certFile,
-		TLSKeyCredential:        keyCred,
-		AllowPlaintextWebhooks:  plaintext,
-		WebhookAllowedCIDRs:     cidrs,
+		VCSProvider:             provider,
+		GHESURL:                 forge.ghesURL,
+		GHESCAFile:              forge.ghesCAFile,
+		GitHubAppID:             forge.appID,
+		GitHubAppKeyCredential:  forge.appKey,
+
+		GitLabURL:                     forge.gitlabURL,
+		GitLabCAFile:                  forge.gitlabCAFile,
+		GitLabTokenCredential:         forge.gitlabTokenCredential,
+		GitLabWebhookSecretCredential: forge.gitlabHookCredential,
+		TLSCertFile:                   certFile,
+		TLSKeyCredential:              keyCred,
+		AllowPlaintextWebhooks:        plaintext,
+		WebhookAllowedCIDRs:           cidrs,
 	}, nil
 }
 
@@ -410,14 +457,14 @@ func DBPath() string {
 // repoSet reads a comma-separated owner/repo list. Unset or empty is the
 // empty set; an empty entry, an invalid name or a repository listed twice
 // is a configuration error.
-func repoSet(name string) (map[string]bool, error) {
+func repoSet(name string, valid func(string) error) (map[string]bool, error) {
 	out := map[string]bool{}
 	v := os.Getenv(name)
 	if v == "" {
 		return out, nil
 	}
 	for i, repo := range strings.Split(v, ",") {
-		if err := validate.RepoFullName(repo); err != nil {
+		if err := valid(repo); err != nil {
 			return nil, fmt.Errorf("invalid %s entry %d: %w", name, i+1, err)
 		}
 		if out[repo] {

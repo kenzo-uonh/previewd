@@ -9,11 +9,14 @@ import (
 
 // GHESURL validates PREVIEWD_GHES_URL: https, a host, no user info, no
 // path, query or fragment. It returns the URL without a trailing slash.
-func GHESURL(s string) (string, error) {
+func GHESURL(s string) (string, error) { return forgeURL("GHES", s) }
+
+// forgeURL validates the base URL of the forge called name.
+func forgeURL(name, s string) (string, error) {
 	u, err := url.Parse(s)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.Hostname() == "" || u.User != nil ||
 		(u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Opaque != "" {
-		return "", fmt.Errorf("GHES URL %s must be https://host[:port] with no user info, path, query or fragment", Quote(s))
+		return "", fmt.Errorf("%s URL %s must be https://host[:port] with no user info, path, query or fragment", name, Quote(s))
 	}
 	return "https://" + u.Host, nil
 }

@@ -23,6 +23,12 @@ type Approver struct {
 // whole value: an approver list is never partly applied. An empty value
 // means no approver anywhere.
 func ParseApprovers(s string) (map[string][]Approver, error) {
+	return parseApprovers(s, RepoFullName, Login)
+}
+
+// parseApprovers is ParseApprovers for a forge whose repository and account
+// names are checked by repoOK and loginOK.
+func parseApprovers(s string, repoOK, loginOK func(string) error) (map[string][]Approver, error) {
 	out := map[string][]Approver{}
 	if s == "" {
 		return out, nil
@@ -39,10 +45,10 @@ func ParseApprovers(s string) (map[string][]Approver, error) {
 		if !ok {
 			return nil, fmt.Errorf("approver entry %d %s: the numeric account ID (#id) is mandatory", i+1, Quote(entry))
 		}
-		if err := RepoFullName(repo); err != nil {
+		if err := repoOK(repo); err != nil {
 			return nil, fmt.Errorf("approver entry %d: %w", i+1, err)
 		}
-		if err := Login(login); err != nil {
+		if err := loginOK(login); err != nil {
 			return nil, fmt.Errorf("approver entry %d: %w", i+1, err)
 		}
 		id, err := strconv.ParseInt(idText, 10, 64)
