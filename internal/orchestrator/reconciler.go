@@ -152,6 +152,13 @@ type ReconcilerConfig struct {
 	Feedback        Feedback
 	FeedbackTimeout time.Duration
 	PreviewScheme   string
+	// ComposeEnabled is PREVIEWD_COMPOSE_ENABLED (off by default): a
+	// previewd.compose.yml, else docker-compose.yml, at the root of the
+	// checkout adds ephemeral sidecars to the environment (ParseCompose).
+	// ComposeMaxServices is PREVIEWD_COMPOSE_MAX_SERVICES, the services of an
+	// environment, primary included (default 3, at most 8).
+	ComposeEnabled     bool
+	ComposeMaxServices int
 	// Now and PollInterval default to time.Now and 2 s.
 	Now          func() time.Time
 	PollInterval time.Duration
@@ -290,6 +297,10 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 	if cfg.PreviewScheme != "http" && cfg.PreviewScheme != "https" {
 		return nil, fmt.Errorf("reconciler: preview scheme %q is not http or https", cfg.PreviewScheme)
 	}
+	if cfg.ComposeMaxServices < 0 || cfg.ComposeMaxServices > maxComposeServices {
+		return nil, fmt.Errorf("reconciler: compose service bound %d is outside 1..%d", cfg.ComposeMaxServices, maxComposeServices)
+	}
+	cfg.ComposeMaxServices = cmp.Or(cfg.ComposeMaxServices, defaultComposeServices)
 	cfg.BuildDir = cmp.Or(cfg.BuildDir, os.TempDir())
 	if !filepath.IsAbs(cfg.BuildDir) {
 		return nil, fmt.Errorf("reconciler: build directory %q is not absolute", cfg.BuildDir)
@@ -622,6 +633,10 @@ func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, l
 			log.Error("Could not close the build context", "error", cErr)
 		}
 	}()
+	compose, err := r.loadCompose(srcDir, log)
+	if err != nil {
+		return failAt(store.FailurePreflight, fmt.Errorf("compose: %w", err))
+	}
 	if err := r.cfg.Engine.ProvisionNetwork(ctx, env); err != nil {
 		return fmt.Errorf("network: %w", err)
 	}
@@ -640,6 +655,7 @@ func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, l
 	// StartContainer.
 	backend, err := r.cfg.Engine.Deploy(ctx, Environment{
 		ID: env, Image: tag, Port: r.cfg.AppPort, Domain: r.cfg.Domain, JobID: l.JobID, SecretsDir: secretsDir,
+		Compose: compose,
 	})
 	if err != nil {
 		return failAt(store.FailureStart, fmt.Errorf("start container: %w", err))
@@ -650,6 +666,30 @@ func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, l
 		return failAt(store.FailureRoute, fmt.Errorf("publish route: %w", err))
 	}
 	return nil
+}
+
+// loadCompose reads and validates the checkout's compose file: nil when the
+// feature is off (the file is then never read) or the checkout has none. The
+// sidecar images must be on the allowlist of the build preflight. A refusal
+// fails the deploy before anything reaches the engine.
+func (r *Reconciler) loadCompose(srcDir string, log *slog.Logger) (*ComposeSpec, error) {
+	if !r.cfg.ComposeEnabled {
+		return nil, nil
+	}
+	data, name, err := LoadCompose(srcDir)
+	if err != nil || data == nil {
+		return nil, err
+	}
+	spec, err := ParseCompose(data, r.cfg.AllowedBaseImages, r.cfg.ComposeMaxServices)
+	if err != nil {
+		return nil, err
+	}
+	ignored := spec.Primary.IgnoredPorts
+	for _, sc := range spec.Sidecars {
+		ignored += sc.IgnoredPorts
+	}
+	log.Info("Compose sidecars", "file", name, "services", 1+len(spec.Sidecars), "volumes", len(spec.Volumes), "ports_ignored", ignored)
+	return spec, nil
 }
 
 // build runs one build within the build bounds (D-V1-4, V1-I12): its caller

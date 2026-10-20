@@ -14,7 +14,7 @@ Every value is validated at start: a malformed value refuses to start. Each `PRE
 - [Approvals and trust](#approvals-and-trust)
 - [Secrets and memory](#secrets-and-memory)
 - [Builds](#builds)
-- [Workers and containers](#workers-and-containers)
+- [Workers and containers](#workers-and-containers) (including [Compose sidecars](#compose-sidecars-previewd_compose_enabled-and-previewd_compose_max_services))
 - [Routing](#routing)
 - [Storage, retention and cleanup](#storage-retention-and-cleanup)
 
@@ -58,6 +58,8 @@ Every value is validated at start: a malformed value refuses to start. Each `PRE
 | [`PREVIEWD_MAX_BUILDS`](#previewd_max_builds) | `2` | `1`..`64` |
 | [`PREVIEWD_CONTAINER_MEMORY_MIB`](#previewd_container_memory_mib) | `512` | `1`..`2^40` |
 | [`PREVIEWD_CONTAINER_PIDS`](#previewd_container_pids) | `256` | `1`..`2^40` |
+| [`PREVIEWD_COMPOSE_ENABLED`](#compose-sidecars-previewd_compose_enabled-and-previewd_compose_max_services) | off | exactly `1` |
+| [`PREVIEWD_COMPOSE_MAX_SERVICES`](#compose-sidecars-previewd_compose_enabled-and-previewd_compose_max_services) | `3` | `1`..`8` |
 | [`PREVIEWD_TRAEFIK_DOMAIN`](#previewd_traefik_domain) | `local.previewd` | domain |
 | [`PREVIEWD_ROUTES_DIR`](#previewd_routes_dir) | `/var/lib/previewd/routes` | existing absolute directory |
 | [`PREVIEWD_TRAEFIK_CONTAINER`](#previewd_traefik_container) | `traefik-proxy` | container name |
@@ -302,6 +304,17 @@ Memory limit of each PR container, swap disabled (default: 512). Must be an inte
 ### `PREVIEWD_CONTAINER_PIDS`
 
 Task limit of each PR container (default: 256). Same validation.
+
+### Compose sidecars: `PREVIEWD_COMPOSE_ENABLED` and `PREVIEWD_COMPOSE_MAX_SERVICES`
+
+Off unless `PREVIEWD_COMPOSE_ENABLED=1`, exactly; any other value refuses to start. When on, a `previewd.compose.yml` (preferred) or else a `docker-compose.yml` at the root of the checkout adds ephemeral sidecars (a database, a cache) to the environment. With the feature off the files are never read.
+
+- `PREVIEWD_COMPOSE_MAX_SERVICES` bounds the services of one environment, the application included (default `3`, at most `8`). A file above it fails the deploy (`failure = 'preflight'`). It is validated even when the feature is off.
+- **Sidecar images are the allowlisted ones.** A sidecar's `image` must be one of [`PREVIEWD_ALLOWED_BASE_IMAGES`](#previewd_allowed_base_images), written `name:tag@sha256:<digest>`. It must already be on the host: the deploy fails if it is not, or if the local `name:tag` is another image. previewd never pulls.
+- **Limits are per container.** `PREVIEWD_CONTAINER_MEMORY_MIB` and `PREVIEWD_CONTAINER_PIDS` apply to each container of an environment: three services can use three times the memory limit.
+- **Values in the compose file are not secrets.** `environment` values (for example `POSTGRES_PASSWORD`) come from the PR, are visible in `docker inspect` and are passed literally, without interpolation. Use them for the throwaway credentials of an ephemeral database only. The application's real secrets keep reaching it as files under `/run/secrets`; no sidecar gets that mount.
+
+The accepted subset of the compose file is in [Compose sidecars](architecture.md#compose-sidecars-v11-spec-33).
 
 ## Routing
 

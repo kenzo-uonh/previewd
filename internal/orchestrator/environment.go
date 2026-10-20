@@ -22,14 +22,19 @@ type Environment struct {
 	// staged secrets. It is bind-mounted read-only; secret values never travel
 	// through the Engine.
 	SecretsDir string
+	// Compose, when set (PREVIEWD_COMPOSE_ENABLED, a valid compose file in the
+	// checkout), adds the sidecars of the environment and the settings of the
+	// primary container. It holds no secret, no port and no host path.
+	Compose *ComposeSpec
 }
 
 // EngineState is what the engine holds for one environment.
 type EngineState struct {
-	Running      bool  // a container of the environment is running
+	Running      bool  // the primary container is running (a sidecar alone is not)
 	NetworkBound bool  // its internal network exists
-	Containers   int   // containers owned by the environment, any state
-	JobID        int64 // ownership label of the container; 0 if unknown
+	Containers   int   // containers owned by the environment (primary and sidecars), any state
+	Volumes      int   // named volumes owned by the environment
+	JobID        int64 // ownership label of the primary container; 0 if unknown
 }
 
 // SecretStager stages an environment's secrets on memory-backed host storage

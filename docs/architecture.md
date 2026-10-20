@@ -15,6 +15,7 @@ How previewd turns a signed pull-request webhook into an isolated, routed previe
 - [Reconciliation](#reconciliation)
   - [Disk (V1 F5, V1-I9)](#disk-v1-f5-v1-i9)
   - [Startup sweep](#startup-sweep)
+- [Compose sidecars](#compose-sidecars-v11-spec-33)
 - [Audit Trail](#audit-trail)
 - [Formal Verification (Phase 1)](#formal-verification-phase-1)
 
@@ -34,14 +35,14 @@ Reconciler worker (deploy)
    ├─ authorize against GHES (trusted, or approved on the exact commit)
    ├─ remove the previous version
    ├─ fetch the commit tarball (scoped token, revoked after use)
-   ├─ pack the build context · Dockerfile preflight
+   ├─ pack the build context · Dockerfile preflight · compose file validation (when enabled)
    ├─ create the internal network (no default route)
    ├─ build (BuildKit, networkmode=none, bounded cgroup)
    ├─ stage secrets on ramfs · bind-mount read-only
-   ├─ start the container
+   ├─ start the sidecars (compose), then the application container
    └─ publish the route document ──▶ Traefik (file provider)
 
-PR closed ──▶ teardown: route, container, network, image, staging
+PR closed ──▶ teardown: route, containers, network, volumes, image, staging
 ```
 
 Each step is detailed in [Webhook Ingestion](#webhook-ingestion) and [Reconciliation](#reconciliation).
@@ -52,7 +53,7 @@ Each step is detailed in [Webhook Ingestion](#webhook-ingestion) and [Reconcilia
 - **Orchestration:** Docker API (`github.com/moby/moby/client`).
   - Each environment runs on its own internal bridge network (no default route, no egress), shared only with the Traefik container.
   - PR containers run with every capability dropped, `no-new-privileges`, a read-only root file system with no writable mount (no tmpfs), a memory limit without swap and a task limit.
-  - An application that must write at run time is not supported yet.
+  - An application that must write at run time is not supported yet. Compose sidecars are the one exception, see [Compose sidecars](#compose-sidecars-v11-spec-33).
 - **Ingress & Routing:** Traefik with the file provider only.
   - previewd writes one route document per environment into `PREVIEWD_ROUTES_DIR` and removes it at teardown.
   - Traefik has no Docker socket and reads no container label, so nothing in a PR image can add or change a route.
@@ -194,11 +195,11 @@ The pull request is read from GHES.
 
 1. Remove the previous version.
 2. Fetch the commit (the GHES tarball of exactly that commit, see [Source fetch](#source-fetch-h2-v1-i11)).
-3. Pack the build context and run the preflight (a refusal fails the deploy before any engine request).
+3. Pack the build context and run the preflight, then validate the compose file when [compose sidecars](#compose-sidecars-v11-spec-33) are enabled (a refusal fails the deploy, `failure = 'preflight'`, before any engine request).
 4. Create the internal network.
 5. Build (the deploy holds one of `PREVIEWD_MAX_CONCURRENT_BUILDS` slots from its lease, taken without waiting: with none free it is requeued unclassified and teardowns run; only above `PREVIEWD_MIN_FREE_DISK_MIB`, cancelled at `PREVIEWD_BUILD_TIMEOUT`, the build cache pruned after it).
 6. Stage the secret section of its trust.
-7. Start the container.
+7. Start the containers: with a compose file, the sidecars first (images verified on the host, volumes created), then the application.
 8. Publish the route document.
 9. Commit SUCCESS.
 
@@ -230,7 +231,7 @@ With GitLab (`vcs.GitLab.FetchTarball`): `GET /api/v4/projects/{id}/repository/a
 
 ### Teardown
 
-Remove route, container, network, image and staging, then prune the images of every environment gone. A failure requeues it with backoff (1 s doubling to 5 min); a teardown never ends FAILED.
+Remove route, every container of the environment (application and sidecars, by ownership label), network, named volumes, image and staging, then prune the images of every environment gone. A failure requeues it with backoff (1 s doubling to 5 min); a teardown never ends FAILED.
 
 ### TTL
 
@@ -249,10 +250,10 @@ The free-disk floor, the data root and the maintenance loop are configured in [S
 At every start, before the API listens, the startup sweep runs:
 
 0. Remove the build directories a crash left behind (the daemon's own `previewd-build-*` directories; files, links and other users' entries are left).
-1. Inventory the host: containers and networks previewd owns (`previewd.env` label, or the environment name for resources created before labels), staging directories, route documents.
+1. Inventory the host: containers (sidecars included), networks and named volumes previewd owns (`previewd.env` label, or the environment name for resources created before labels), staging directories, route documents.
 2. Garbage-collect the routes directory. Crash debris from an interrupted write and any `.yml`, `.yaml` or `.toml` file that is not the route document of a valid environment ID are deleted. A directory or symlink there refuses the start.
 3. Sweep the queue against that inventory.
-   - An environment is kept only if it is complete (container running, network, staged secrets, route document) and built by the newest executed job, a SUCCESS deploy.
+   - An environment is kept only if it is complete (application container running, network, staged secrets, route document) and built by the newest executed job, a SUCCESS deploy.
    - An interrupted deploy becomes FAILED and an interrupted teardown is queued again.
    - A latest SUCCESS deploy whose environment is gone (a reboot wiped its secrets, its route was lost) is queued again.
 4. Destroy everything else.
@@ -305,6 +306,30 @@ previewd audit export [-db PATH] > audit.jsonl   # verified first; a broken chai
 `make check` runs all of these deterministically (fixed rapid seed, fuzz seed corpora). `make verify` runs rapid at 10,000 checks with random seeds, plus each fuzz target for `FUZZTIME`. Namespace tests skip where unprivileged user namespaces are unavailable. `PREVIEWD_REQUIRE_NS_TESTS=1` and `PREVIEWD_REQUIRE_MLOCK_TEST=1` turn those skips into failures, and CI sets both.
 
 Phase 2 is a TLA+ model of the queue design (webhook API, SQLite job queue, reconciler workers, route documents, startup sweep, daemon crash and host reboot) in `docs/formal/previewd.tla`. TLC checks zero secret leakage, no orphaned resources (route documents included), routes only to running containers, monotonic ordering, eventual completion and eventual consistency. The daemon runs this design: `internal/store/jobs.go` and `internal/orchestrator/reconciler.go`. `docs/formal/README.md` has the results, the mutation table and how to run TLC offline.
+
+## Compose sidecars (V1.1 spec 3.3)
+
+Opt-in (`PREVIEWD_COMPOSE_ENABLED=1`, see [Configuration](configuration.md#compose-sidecars-previewd_compose_enabled-and-previewd_compose_max_services)). The compose file is read from the extracted checkout (`os.Root`, a regular file of at most 256 KiB, never a link), parsed with `gopkg.in/yaml.v3` and validated by `orchestrator.ParseCompose` after the Dockerfile preflight and before the first request that changes the host. It accepts a small subset and refuses everything else: a key not listed below is a refusal, not an ignored setting.
+
+**Services.** At most `PREVIEWD_COMPOSE_MAX_SERVICES`, named as DNS labels. Exactly one builds (`build: .` or `build: {context: .}`): that is the application, built from the root Dockerfile with the locked request every PR build gets; its `image`, if any, is not used. Every other service is a sidecar with an `image` from `PREVIEWD_ALLOWED_BASE_IMAGES`, no `build`.
+
+**Accepted keys.** `image`, `build`, `environment` (map or `KEY=value` list; literal values, no inheritance from the host, no `${…}`; at most 64 variables of 4 KiB), `command` (list form), `volumes`, `depends_on` (names must exist; start order is fixed, sidecars first, and conditions are not read), `ports`, `expose`, `restart` (the last three are dropped, see below). At the top level: `services`, `volumes`, and the ignored `version` and `name`. Anything else (`privileged`, `network_mode`, `pid`, `ipc`, `cap_add`, `devices`, `security_opt`, `env_file`, `volumes_from`, `user`, `entrypoint`, `healthcheck`, top-level `networks`, `secrets`, `configs`) refuses the file. Duplicate keys, aliases that expand excessively and more than one YAML document are refused.
+
+**Storage.** Named volumes only, each declared at the top level without any option (a driver, a driver option or `external` could turn it into a host bind mount) and named as a DNS label. A host path (`/…`, `./…`, `../…`, `~…`, anything with a slash), a `bind` or `tmpfs` mount, an anonymous volume, a mode other than `ro`/`rw` and a target that is not a clean absolute path, or is under `/run/secrets`, `/proc`, `/sys` or `/dev`, are refused. The daemon-wide volume name is `previewd-<env-id>-<name>`; it is created on the plain `local` driver with the ownership labels. A volume of that name that already exists is reused only if it carries this environment's label, uses `local` and has no option.
+
+**Network and ingress.** Every container of the environment attaches to the environment's internal bridge network only (`<env-id>-net`, the existing name) and answers to its service name there, so `postgres` resolves from the application. `ports` and `expose` are counted and dropped (the count is logged): nothing is published, and the network has no route out. The route document points to the application container only; the proxy joins the network as before.
+
+**Sidecar containers.** Same as the application's (all capabilities dropped, `no-new-privileges`, read-only root file system, memory limit without swap, task limit, `system.slice` cgroup parent, ownership labels `previewd.env` and `previewd.job`) with three differences:
+
+- they get **no secrets mount**; only the application receives the read-only ramfs directory;
+- they get `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETGID` and `SETUID` back: the official database and cache images start as root to own their data directory and drop to their own user. Nothing else;
+- they get two bounded tmpfs (`/tmp`, `/run`, 64 MiB each, `nosuid`, `nodev`), and their named volumes, as their only writable state.
+
+**Images.** Before any volume or container is created, each sidecar image is inspected on the host: the local `name:tag` must be the pinned digest and carry no `ONBUILD` trigger (the checks of the base images at start). The container then runs the verified image ID, so a tag moved afterwards changes nothing. A missing image fails the deploy (`failure = 'start'`); there is no pull.
+
+**Lifecycle.** `Engine.Deploy` verifies the images, creates the volumes, creates and starts the sidecars, then creates and starts the application, joins the proxy and returns the application's address. `Engine.Destroy` removes every container labelled `previewd.env=<env-id>` (and the container named `<env-id>`, for resources that predate labels), the network, every volume labelled `previewd.env=<env-id>`, then the image, in that order: a network or a volume in use cannot be removed. `Engine.Observe` counts all the containers and volumes of an environment, but reports it `Running` only when its application container runs: a sidecar alone does not keep an environment alive. A volume with no container (a crash after it was created) is an environment the startup sweep destroys.
+
+**What it does not do.** No readiness wait (the application must retry its connection to a sidecar that is still starting), no seeding, no per-service resource limits, no sidecar reachable from outside the environment.
 
 ## Developer feedback (V1.1 spec 3.3)
 

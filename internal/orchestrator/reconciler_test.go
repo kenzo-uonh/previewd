@@ -61,6 +61,8 @@ type hostEngine struct {
 	cache int
 	// free is what FreeDisk reports.
 	free int64
+	// deployed is the Environment of each Deploy call, in order.
+	deployed []Environment
 }
 
 func newHostEngine() *hostEngine {
@@ -179,6 +181,9 @@ func (h *hostEngine) Deploy(_ context.Context, e Environment) (netip.AddrPort, e
 	if err := h.step("deploy"); err != nil {
 		return netip.AddrPort{}, err
 	}
+	h.mu.Lock()
+	h.deployed = append(h.deployed, e)
+	h.mu.Unlock()
 	h.set(e.ID, func(st *EngineState) { st.Running, st.Containers, st.JobID = true, 1, e.JobID })
 	return netip.MustParseAddrPort("172.31.0.2:8080"), nil
 }
@@ -320,6 +325,15 @@ type rig struct {
 	feedback        Feedback
 	feedbackTimeout time.Duration
 	previewScheme   string
+	// Compose sidecars (V1.1 phase 4): what the fake fetch writes as the
+	// compose file ("" for none, named composeName, default previewd.compose.yml),
+	// whether the feature is on, its service bound (0 for the default), and
+	// the allowlist (testBases when nil).
+	composeFile    string
+	composeName    string
+	composeEnabled bool
+	composeMax     int
+	bases          map[string]bool
 }
 
 func newRig(t *testing.T) *rig {
@@ -393,9 +407,16 @@ func (r *rig) config() ReconcilerConfig {
 			if repo != "acme/app" {
 				return fmt.Errorf("fetch of repository %q, want the job's acme/app", repo)
 			}
-			return writeCheckout(dest, cmp.Or(r.dockerfile, testDockerfile))
+			if err := writeCheckout(dest, cmp.Or(r.dockerfile, testDockerfile)); err != nil {
+				return err
+			}
+			if r.composeFile == "" {
+				return nil
+			}
+			return os.WriteFile(filepath.Join(dest, cmp.Or(r.composeName, composeFileName)), []byte(r.composeFile), 0o600)
 		},
-		AllowedBaseImages: testBases, MaxBuildContextBytes: 1 << 20,
+		ComposeEnabled: r.composeEnabled, ComposeMaxServices: r.composeMax,
+		AllowedBaseImages: r.allowedBases(), MaxBuildContextBytes: 1 << 20,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Domain: "local.previewd", AppPort: 8080,
 		Now: func() time.Time {
 			if r.clock != nil {
@@ -404,6 +425,14 @@ func (r *rig) config() ReconcilerConfig {
 			return r.now
 		}, PollInterval: 5 * time.Millisecond,
 	}
+}
+
+// allowedBases is the allowlist of the rig's reconciler.
+func (r *rig) allowedBases() map[string]bool {
+	if r.bases != nil {
+		return r.bases
+	}
+	return testBases
 }
 
 func (r *rig) enqueue(typ store.JobType) {

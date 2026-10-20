@@ -162,6 +162,10 @@ func main() {
 	logger.Info("Build preflight armed",
 		"allowed_base_images", slices.Sorted(maps.Keys(cfg.AllowedBaseImages)),
 		"max_build_context_bytes", cfg.MaxBuildContextBytes)
+	if cfg.ComposeEnabled {
+		// Sidecar images are the allowlisted ones, verified above.
+		logger.Info("Compose sidecars enabled", "max_services", cfg.ComposeMaxServices)
+	}
 
 	// Free-disk floor (V1 F5, V1-I9): the data root must be measurable, or
 	// no deploy could ever start. Below the floor the daemon still starts,
@@ -246,6 +250,8 @@ func main() {
 		DisableTTL:           cfg.EnvTTL == 0,
 		Feedback:             vcsForge.feedback,
 		PreviewScheme:        cfg.PreviewScheme,
+		ComposeEnabled:       cfg.ComposeEnabled,
+		ComposeMaxServices:   cfg.ComposeMaxServices,
 	})
 	if err != nil {
 		logger.Error("Reconciler initialization failure", "error", err)

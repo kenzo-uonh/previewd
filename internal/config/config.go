@@ -82,6 +82,17 @@ type Config struct {
 	MinFreeDiskBytes int64
 	DockerDataRoot   string
 
+	// Compose sidecars (V1.1 phase 4). ComposeEnabled is
+	// PREVIEWD_COMPOSE_ENABLED (off unless exactly 1): a compose file at the
+	// root of a PR's checkout adds ephemeral sidecars (databases, caches) to
+	// its environment. ComposeMaxServices is PREVIEWD_COMPOSE_MAX_SERVICES,
+	// the services of one environment, the application included (default 3,
+	// at most 8: the same bounds as orchestrator.maxComposeServices, which
+	// this package cannot import). Sidecar images must be on
+	// AllowedBaseImages.
+	ComposeEnabled     bool
+	ComposeMaxServices int
+
 	// WebhookSecretCredential names the systemd credential holding the
 	// webhook HMAC secret: read from $CREDENTIALS_DIRECTORY, never from the
 	// environment or a configured path.
@@ -130,6 +141,8 @@ const (
 	defaultRevalidateInterval = 10 * time.Minute
 	defaultRevalidateGrace    = time.Hour
 	maxRevalidateGrace        = 24 * time.Hour
+	defaultComposeServices    = 3
+	maxComposeServices        = 8
 	defaultMaxBuildContextMiB = 512
 	maxBuildContextMiB        = 16384
 	defaultWorkers            = 2
@@ -349,6 +362,14 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	composeEnabled, err := optIn("PREVIEWD_COMPOSE_ENABLED")
+	if err != nil {
+		return nil, err
+	}
+	composeServices, err := boundedCount("PREVIEWD_COMPOSE_MAX_SERVICES", defaultComposeServices, 1, maxComposeServices)
+	if err != nil {
+		return nil, err
+	}
 	if os.Getenv("PREVIEWD_ENV_TTL") != "0" {
 		if envTTL, err = boundedDuration("PREVIEWD_ENV_TTL", defaultEnvTTL, minEnvTTL, maxEnvTTL); err != nil {
 			return nil, fmt.Errorf("%w (or 0 to disable)", err)
@@ -437,6 +458,9 @@ func Load() (*Config, error) {
 		PreviewScheme:    previewScheme,
 		MinFreeDiskBytes: minFreeDiskMiB << 20,
 		DockerDataRoot:   dataRoot,
+
+		ComposeEnabled:     composeEnabled,
+		ComposeMaxServices: composeServices,
 
 		WebhookSecretCredential: webhookSecretCred,
 		VCSProvider:             provider,
