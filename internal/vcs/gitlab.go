@@ -429,6 +429,26 @@ func (g *GitLab) state(mr glMergeRequestReply, projectID string, iid uint32) (*M
 // canPush reports whether account id is an active member of the project,
 // inherited memberships included, with Developer access or more. A user who
 // is not a member is a plain false; any other failure is an error.
+// CanPush reports whether account id is an active member of the project
+// projectID with Developer access or more: what makes an author trusted
+// (GetMRState) and an approver's approval count. A 404 is no; any other
+// failure is an error, never no.
+func (g *GitLab) CanPush(ctx context.Context, projectID string, id int64) (bool, error) {
+	if err := validate.GitLabProjectID(projectID); err != nil {
+		return false, err
+	}
+	if id < 1 {
+		return false, fmt.Errorf("invalid GitLab account id %d", id)
+	}
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
+	ok, err := g.canPush(ctx, "/projects/"+projectID, id)
+	if err != nil {
+		return false, fmt.Errorf("read membership of account %d in project %s: %w", id, projectID, err)
+	}
+	return ok, nil
+}
+
 func (g *GitLab) canPush(ctx context.Context, base string, id int64) (bool, error) {
 	path := base + "/members/all/" + strconv.FormatInt(id, 10)
 	resp, err := g.request(ctx, g.http, path)

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/kenzo-uonh/previewd/internal/store"
+	"github.com/kenzo-uonh/previewd/internal/validate"
 	"github.com/kenzo-uonh/previewd/internal/vcs"
 )
 
@@ -18,15 +19,38 @@ const glRepo = "acme/sub/app"
 // fakeMergeRequests is GitLab as the gate reads it: one project (15,
 // acme/sub/app) with one merge request (7).
 type fakeMergeRequests struct {
-	state   vcs.MRState
-	resolve error
-	read    error
-	calls   []string
+	state     vcs.MRState
+	approvals []vcs.Approval
+	push      map[int64]bool // account -> may push
+	resolve   error
+	read      error
+	failing   map[string]error // call -> error
+	calls     []string
 }
 
 func newFakeMergeRequests() *fakeMergeRequests {
-	return &fakeMergeRequests{state: vcs.MRState{Open: true, HeadSHA: authCommit, HeadProject: "15",
-		Author: vcs.Account{Login: "author", ID: 4242}, Trusted: true}}
+	return &fakeMergeRequests{
+		state:     vcs.MRState{Open: true, HeadSHA: authCommit, HeadProject: "15", Author: vcs.Account{Login: "author", ID: 4242}, Trusted: true},
+		approvals: []vcs.Approval{{User: vcs.Account{Login: "lead.dev", ID: approverID}}},
+		push:      map[int64]bool{approverID: true},
+		failing:   map[string]error{},
+	}
+}
+
+func (f *fakeMergeRequests) GetApprovals(_ context.Context, projectID, iid string) ([]vcs.Approval, error) {
+	f.calls = append(f.calls, "approvals:"+projectID+"!"+iid)
+	if err := f.failing["approvals"]; err != nil {
+		return nil, err
+	}
+	return f.approvals, nil
+}
+
+func (f *fakeMergeRequests) CanPush(_ context.Context, projectID string, id int64) (bool, error) {
+	f.calls = append(f.calls, fmt.Sprintf("push:%s#%d", projectID, id))
+	if err := f.failing["push"]; err != nil {
+		return false, err
+	}
+	return f.push[id], nil
 }
 
 func (f *fakeMergeRequests) ResolveProject(_ context.Context, path string) (string, error) {
@@ -57,9 +81,40 @@ func glLease() store.Lease {
 		Source: store.Source{Repo: glRepo, HeadRepo: glRepo, PRNumber: 7, OpenerLogin: "gitlab-user-4242", OpenerID: 4242, CommitSHA: authCommit}}
 }
 
+// fakeGrants is the store's record of approvals.
+type fakeGrants struct {
+	grant store.Approval
+	live  bool
+	err   error
+}
+
+func (f *fakeGrants) LiveApproval(_ context.Context, envID, commit string) (store.Approval, bool, error) {
+	if f.err != nil {
+		return store.Approval{}, false, f.err
+	}
+	if envID != "pr-7-abc" || commit != authCommit {
+		return store.Approval{}, false, fmt.Errorf("unexpected read of %s at %s", envID, commit)
+	}
+	return f.grant, f.live, nil
+}
+
+func liveGrant() *fakeGrants {
+	return &fakeGrants{live: true, grant: store.Approval{EnvID: "pr-7-abc", CommitSHA: authCommit,
+		ApproverLogin: "lead.dev", ApproverID: approverID, Via: store.ApprovalViaMR}}
+}
+
 func newGLGate(t *testing.T, f *fakeMergeRequests) *GitLabAuthorizer {
 	t.Helper()
-	a, err := NewGitLabAuthorizer(f, nil)
+	return newGLGateWith(t, f, liveGrant())
+}
+
+func newGLGateWith(t *testing.T, f *fakeMergeRequests, g Approvals) *GitLabAuthorizer {
+	t.Helper()
+	a, err := NewGitLabAuthorizer(GitLabAuthorizerConfig{
+		MergeRequests: f, Approvals: g,
+		Approvers:        map[string][]validate.Approver{glRepo: {{Login: "lead.dev", ID: approverID}}},
+		FullSecretsRepos: map[string]bool{},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,8 +135,8 @@ func TestGitLabAuthorizeTrustsAMemberAuthoredMergeRequestOfTheProject(t *testing
 	}
 }
 
-// Fails closed: nothing but a trusted, open merge request deploys. Approvals
-// of untrusted ones are not supported yet.
+// Fails closed: an untrusted or closed merge request with no live approval
+// of its commit deploys nothing.
 func TestGitLabAuthorizeRefusesWhatIsNotTrusted(t *testing.T) {
 	for name, edit := range map[string]func(*vcs.MRState){
 		"untrusted author": func(s *vcs.MRState) { s.Trusted = false },
@@ -93,7 +148,7 @@ func TestGitLabAuthorizeRefusesWhatIsNotTrusted(t *testing.T) {
 	} {
 		f := newFakeMergeRequests()
 		edit(&f.state)
-		d, err := newGLGate(t, f).Authorize(context.Background(), glLease())
+		d, err := newGLGateWith(t, f, &fakeGrants{}).Authorize(context.Background(), glLease())
 		var revoked *RevokedError
 		if !errors.Is(err, ErrNotApproved) || !errors.As(err, &revoked) || d.Trust != "" || d.Approval != nil {
 			t.Errorf("%s: decision %+v, err %v; want ErrNotApproved and nothing", name, d, err)
@@ -173,7 +228,134 @@ func TestGitLabRevalidate(t *testing.T) {
 }
 
 func TestNewGitLabAuthorizerNeedsGitLab(t *testing.T) {
-	if _, err := NewGitLabAuthorizer(nil, nil); err == nil {
+	if _, err := NewGitLabAuthorizer(GitLabAuthorizerConfig{Approvals: &fakeGrants{}}); err == nil {
 		t.Error("no GitLab accepted")
 	}
+	if _, err := NewGitLabAuthorizer(GitLabAuthorizerConfig{MergeRequests: newFakeMergeRequests()}); err == nil {
+		t.Error("no approval store accepted")
+	}
+}
+
+// An untrusted merge request (here a fork) runs on a live approval of its
+// exact commit whose approver is still in PREVIEWD_APPROVERS, still approves
+// on GitLab, and can still push.
+func forkOf(f *fakeMergeRequests) *fakeMergeRequests {
+	f.state.Trusted, f.state.HeadProject = false, "88"
+	return f
+}
+
+func TestGitLabAuthorizeRunsAnUntrustedMergeRequestOnItsApproval(t *testing.T) {
+	f := forkOf(newFakeMergeRequests())
+	grants := liveGrant()
+	g := newGLGateWith(t, f, grants)
+	d, err := g.Authorize(context.Background(), glLease())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Trust != store.TrustUntrusted || d.Approval == nil || *d.Approval != grants.grant || d.FullSecrets {
+		t.Errorf("decision = %+v", d)
+	}
+	if got := fmt.Sprint(f.calls); got != "[resolve:acme/sub/app state:15!7 approvals:15!7 push:15#7]" {
+		t.Errorf("calls %s", got)
+	}
+
+	// The opt-in of the repository rides the verdict.
+	g.cfg.FullSecretsRepos = map[string]bool{glRepo: true}
+	if d, err = g.Authorize(context.Background(), glLease()); err != nil || !d.FullSecrets {
+		t.Errorf("full secrets opt-in: %+v, %v", d, err)
+	}
+}
+
+func TestGitLabAuthorizeRefusesAnApprovalGitLabNoLongerBacks(t *testing.T) {
+	for name, tc := range map[string]struct {
+		edit   func(*fakeMergeRequests, *fakeGrants, *GitLabAuthorizer)
+		reason store.RevocationReason
+	}{
+		"no live approval": {edit: func(_ *fakeMergeRequests, g *fakeGrants, _ *GitLabAuthorizer) { g.live = false }},
+		"approver left PREVIEWD_APPROVERS": {reason: store.RevokedApproverRemoved,
+			edit: func(_ *fakeMergeRequests, _ *fakeGrants, a *GitLabAuthorizer) {
+				a.cfg.Approvers = map[string][]validate.Approver{glRepo: {{Login: "other", ID: 99}}}
+			}},
+		"approver of another repository": {reason: store.RevokedApproverRemoved,
+			edit: func(_ *fakeMergeRequests, _ *fakeGrants, a *GitLabAuthorizer) {
+				a.cfg.Approvers = map[string][]validate.Approver{"acme/other": {{Login: "lead.dev", ID: approverID}}}
+			}},
+		"approval by a review": {edit: func(_ *fakeMergeRequests, g *fakeGrants, _ *GitLabAuthorizer) { g.grant.Via = store.ApprovalViaReview }},
+		"approval by a label":  {edit: func(_ *fakeMergeRequests, g *fakeGrants, _ *GitLabAuthorizer) { g.grant.Via = store.ApprovalViaLabel }},
+		"head moved":           {edit: func(f *fakeMergeRequests, _ *fakeGrants, _ *GitLabAuthorizer) { f.state.HeadSHA = otherCommit }},
+		"approval withdrawn": {reason: store.RevokedDismissed,
+			edit: func(f *fakeMergeRequests, _ *fakeGrants, _ *GitLabAuthorizer) { f.approvals = nil }},
+		"only another account approves": {reason: store.RevokedDismissed,
+			edit: func(f *fakeMergeRequests, _ *fakeGrants, _ *GitLabAuthorizer) {
+				f.approvals = []vcs.Approval{{User: vcs.Account{Login: "lead.dev", ID: 8}}}
+			}},
+		"approver cannot push any more": {reason: store.RevokedPermissionLost,
+			edit: func(f *fakeMergeRequests, _ *fakeGrants, _ *GitLabAuthorizer) { f.push[approverID] = false }},
+		"closed": {edit: func(f *fakeMergeRequests, _ *fakeGrants, _ *GitLabAuthorizer) { f.state.Open = false }},
+		// Never a second pair of eyes: the approval of the author counts for nothing.
+		"approver is the author": {edit: func(f *fakeMergeRequests, _ *fakeGrants, _ *GitLabAuthorizer) { f.state.Author.ID = approverID }},
+	} {
+		f := forkOf(newFakeMergeRequests())
+		grants := liveGrant()
+		g := newGLGateWith(t, f, grants)
+		tc.edit(f, grants, g)
+		d, err := g.Authorize(context.Background(), glLease())
+		var revoked *RevokedError
+		if !errors.Is(err, ErrNotApproved) || !errors.As(err, &revoked) || revoked.Reason != tc.reason || d.Trust != "" || d.Approval != nil {
+			t.Errorf("%s: decision %+v, err %v (reason %q); want ErrNotApproved with reason %q", name, d, err, reasonOf(revoked), tc.reason)
+		}
+	}
+}
+
+func TestGitLabAuthorizeIsUnavailableWhenAnApprovalCannotBeConfirmed(t *testing.T) {
+	boom := errors.New("connection refused")
+	for _, call := range []string{"approvals", "push"} {
+		f := forkOf(newFakeMergeRequests())
+		f.failing[call] = boom
+		d, err := newGLGate(t, f).Authorize(context.Background(), glLease())
+		if !errors.Is(err, ErrUnavailable) || errors.Is(err, ErrNotApproved) || d.Trust != "" {
+			t.Errorf("%s: decision %+v, err %v; want ErrUnavailable", call, d, err)
+		}
+	}
+	// A store that cannot answer deploys nothing and parks nothing.
+	f := forkOf(newFakeMergeRequests())
+	d, err := newGLGateWith(t, f, &fakeGrants{err: errors.New("database is locked")}).Authorize(context.Background(), glLease())
+	if err == nil || errors.Is(err, ErrNotApproved) || errors.Is(err, ErrUnavailable) || d.Trust != "" {
+		t.Errorf("store failure: %+v, %v", d, err)
+	}
+}
+
+func TestGitLabRevalidateConfirmsTheApprovalARunningVersionWasBuiltOn(t *testing.T) {
+	built := func() store.Job { j := glRunning(); j.Trust = store.TrustUntrusted; return j }
+	f := forkOf(newFakeMergeRequests())
+	g := newGLGate(t, f)
+	if err := g.Revalidate(context.Background(), built()); err != nil {
+		t.Fatalf("an approved version was refused: %v", err)
+	}
+
+	f.approvals = nil // withdrawn
+	err := g.Revalidate(context.Background(), built())
+	var revoked *RevokedError
+	if !errors.Is(err, ErrNotApproved) || !errors.As(err, &revoked) || revoked.Reason != store.RevokedDismissed {
+		t.Errorf("a withdrawn approval kept the environment: %v", err)
+	}
+
+	f.approvals = []vcs.Approval{{User: vcs.Account{Login: "lead.dev", ID: approverID}}}
+	f.failing["approvals"] = errors.New("connection refused")
+	if err := g.Revalidate(context.Background(), built()); !errors.Is(err, ErrUnavailable) {
+		t.Errorf("unreadable approvals: %v; want ErrUnavailable", err)
+	}
+
+	// Trusted now: the approval no longer matters.
+	f = newFakeMergeRequests()
+	if err := newGLGateWith(t, f, &fakeGrants{}).Revalidate(context.Background(), built()); err != nil {
+		t.Errorf("a version whose merge request is trusted now was refused: %v", err)
+	}
+}
+
+func reasonOf(e *RevokedError) store.RevocationReason {
+	if e == nil {
+		return ""
+	}
+	return e.Reason
 }

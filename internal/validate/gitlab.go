@@ -39,11 +39,19 @@ func gitLabName(s string) bool {
 	return !strings.HasSuffix(s, ".") && !strings.HasSuffix(s, ".git") && !strings.HasSuffix(s, ".atom")
 }
 
+// The longest project path and login the queue and the audit trail keep
+// (store.maxRepoLen, store.maxLoginLen: GitHub's own limits). GitLab allows
+// more; what cannot be kept is refused where it enters.
+const (
+	maxStoredRepoLen  = 140
+	maxStoredLoginLen = 39
+)
+
 // GitLabProjectPath validates path_with_namespace: two to 22 segments, each
-// a GitLab name, the whole at most 255 bytes.
+// a GitLab name, the whole at most 140 bytes.
 func GitLabProjectPath(s string) error {
 	segments := strings.Split(s, "/")
-	if len(s) > maxGitLabNameLen || len(segments) < 2 || len(segments) > maxGitLabDepth {
+	if len(s) > maxStoredRepoLen || len(segments) < 2 || len(segments) > maxGitLabDepth {
 		return fmt.Errorf("invalid GitLab project path %s", Quote(s))
 	}
 	for _, seg := range segments {
@@ -103,7 +111,12 @@ func GitLabURL(s string) (string, error) { return forgeURL("GitLab", s) }
 // comma-separated group[/subgroup]/project:username#id entries, with the
 // guarantees of ParseApprovers.
 func ParseGitLabApprovers(s string) (map[string][]Approver, error) {
-	return parseApprovers(s, GitLabProjectPath, GitLabUsername)
+	return parseApprovers(s, GitLabProjectPath, func(login string) error {
+		if len(login) > maxStoredLoginLen {
+			return fmt.Errorf("GitLab username %s exceeds the %d bytes an approver is recorded with", Quote(login), maxStoredLoginLen)
+		}
+		return GitLabUsername(login)
+	})
 }
 
 // GitLabEventUUID validates X-Gitlab-Event-UUID, the identifier GitLab gives

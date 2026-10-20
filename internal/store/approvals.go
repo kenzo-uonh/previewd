@@ -37,6 +37,10 @@ type ApprovalVia string
 const (
 	ApprovalViaReview ApprovalVia = "review"
 	ApprovalViaLabel  ApprovalVia = "label"
+	// ApprovalViaMR is a GitLab merge request approval (V1.1 spec 3.1). It
+	// carries no review ID, and, unlike a review, no commit: the commit is
+	// the head the approval hook named when it was recorded.
+	ApprovalViaMR ApprovalVia = "approval"
 )
 
 // RevocationReason is the closed vocabulary of revocations.reason.
@@ -91,7 +95,7 @@ type Grant struct {
 	ApproverLogin string
 	ApproverID    int64
 	Via           ApprovalVia
-	ReviewID      int64 // 0 for a label approval
+	ReviewID      int64 // 0 for a label or a merge request approval
 	Trusted       bool
 	OpenHead      bool
 }
@@ -99,7 +103,7 @@ type Grant struct {
 func (g Grant) valid() bool {
 	return validDeliveryKeys(g.DeliveryID, g.PayloadSHA256) && validPreviewID(g.EnvID) && g.Source.valid() && g.Seq > 0 &&
 		validLogin(g.ApproverLogin) && g.ApproverID > 0 &&
-		((g.Via == ApprovalViaReview && g.ReviewID > 0) || (g.Via == ApprovalViaLabel && g.ReviewID == 0))
+		((g.Via == ApprovalViaReview && g.ReviewID > 0) || ((g.Via == ApprovalViaLabel || g.Via == ApprovalViaMR) && g.ReviewID == 0))
 }
 
 // Revoke is a revocation delivery (dismissal, change request, label

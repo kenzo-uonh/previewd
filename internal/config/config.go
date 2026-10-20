@@ -352,15 +352,9 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	if provider == providerGitLab {
-		// Both act on an approved untrusted request, and GitLab approvals are
-		// not recorded yet: refused, not ignored.
-		switch {
-		case labelApproval:
-			return nil, errors.New("PREVIEWD_LABEL_APPROVAL is not supported with PREVIEWD_VCS_PROVIDER=gitlab: GitLab approvals are not recorded yet")
-		case len(fullSecrets) > 0:
-			return nil, errors.New("PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS is not supported with PREVIEWD_VCS_PROVIDER=gitlab: GitLab approvals are not recorded yet")
-		}
+	if provider == providerGitLab && labelApproval {
+		// The label path is GitHub's: a GitLab approval is an approval event.
+		return nil, errors.New("PREVIEWD_LABEL_APPROVAL is not supported with PREVIEWD_VCS_PROVIDER=gitlab: a GitLab merge request is approved with GitLab's own approval")
 	}
 	if provider == providerGitLab {
 		if _, set := os.LookupEnv("PREVIEWD_WEBHOOK_SECRET_CREDENTIAL"); set {

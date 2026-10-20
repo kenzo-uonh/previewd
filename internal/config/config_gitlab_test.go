@@ -149,17 +149,27 @@ func TestLoadApproversFollowTheProvider(t *testing.T) {
 	}
 }
 
-// Approvals are not recorded for GitLab yet: an opt-in that only acts on an
-// approved untrusted request is refused, never silently ignored.
-func TestLoadGitLabRefusesApprovalOptIns(t *testing.T) {
-	for key, value := range map[string]string{
-		"PREVIEWD_LABEL_APPROVAL":                  "1",
-		"PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS": "acme/app",
-	} {
-		gitlabEnv(t)
-		t.Setenv(key, value)
-		if _, err := Load(); err == nil || !strings.Contains(err.Error(), key) {
-			t.Errorf("%s=%s under gitlab: err = %v; want a refusal naming the key", key, value, err)
-		}
+// A label approves on GitHub only: GitLab has its own approval. An opt-in
+// that cannot act is refused, never silently ignored.
+func TestLoadGitLabRefusesTheLabelApproval(t *testing.T) {
+	gitlabEnv(t)
+	t.Setenv("PREVIEWD_LABEL_APPROVAL", "1")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "PREVIEWD_LABEL_APPROVAL") {
+		t.Errorf("err = %v; want a refusal naming the key", err)
+	}
+}
+
+// The full-secrets opt-in follows an approval, GitLab's included, and names
+// projects as GitLab spells them.
+func TestLoadGitLabFullSecretsOptIn(t *testing.T) {
+	gitlabEnv(t)
+	t.Setenv("PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS", "acme/sub/app")
+	cfg, err := Load()
+	if err != nil || !cfg.FullSecretsRepos["acme/sub/app"] {
+		t.Fatalf("Load = %v, %v", cfg, err)
+	}
+	t.Setenv("PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS", "app")
+	if _, err := Load(); err == nil {
+		t.Error("a project without a namespace accepted")
 	}
 }

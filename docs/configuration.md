@@ -124,7 +124,7 @@ How long after its signed time a delivery is still accepted (default: `15m`, a G
 
 `github` (the default: GHES and github.com) or `gitlab` (GitLab Self-Managed CE/EE and gitlab.com). Exactly those two spellings: anything else, case and padding included, refuses to start. One forge per daemon: only that forge's webhook route exists (`/webhooks/github` or `/webhooks/gitlab`).
 
-The keys of the other forge are a contradiction, refused at start whatever their value: a stale `PREVIEWD_GHES_URL` in a GitLab deployment (or `PREVIEWD_GITLAB_URL` in a GitHub one) is never ignored. With `gitlab`, `PREVIEWD_WEBHOOK_SECRET_CREDENTIAL` is refused too: the webhook secret is the credential of `PREVIEWD_GITLAB_WEBHOOK_SECRET_CREDENTIAL`. `PREVIEWD_APPROVERS` and `PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS` name projects as the forge spells them (see [Approvals and trust](#approvals-and-trust)).
+The keys of the other forge are a contradiction, refused at start whatever their value: a stale `PREVIEWD_GHES_URL` in a GitLab deployment (or `PREVIEWD_GITLAB_URL` in a GitHub one) is never ignored. With `gitlab`, `PREVIEWD_WEBHOOK_SECRET_CREDENTIAL` is refused too: the webhook secret is the credential of `PREVIEWD_GITLAB_WEBHOOK_SECRET_CREDENTIAL`. `PREVIEWD_APPROVERS` and `PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS` name projects as the forge spells them (see [Approvals and trust](#approvals-and-trust)); `PREVIEWD_LABEL_APPROVAL` is refused with `gitlab`.
 
 ## GitHub Enterprise Server
 
@@ -157,7 +157,14 @@ Hooks: `open`, `reopen`, `update` (only when the head moved: a title or label ed
 
 The deploy gate (`orchestrator.GitLabAuthorizer`) reads GitLab again before anything is fetched or built, and again on every re-validation: the project is resolved from its path to its numeric ID (the reply must name exactly that path), then the merge request. It deploys only an **open** merge request that is **trusted**; a read that fails requeues the deploy (nothing runs), and a project, an author or a state that cannot be confirmed refuses it. The source is the project's archive at the exact commit (`GET /projects/:id/repository/archive.tar.gz?sha=`), extracted under the same bounds as a GHES tarball; git never runs for a merge request.
 
-**Not yet:** GitLab approvals (`approved`, `unapproved`) are acknowledged (`202 unsupported`, logged as a warning) and not recorded, so a merge request from a fork or from a non-member does not deploy. `PREVIEWD_LABEL_APPROVAL` and `PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS` act only on an approved untrusted request and are refused at start with `gitlab` rather than ignored. The merge request's opener is stored as `gitlab-user-<id>` (a hook names its author by ID only); the ID is the identity.
+**Approvals.** A merge request that is not trusted (a fork, a deleted head project, an author who cannot push) deploys only on the approval of an account listed in `PREVIEWD_APPROVERS` for its project (`group[/subgroup]/project:username#id`, the login at most 39 bytes):
+
+- An `approved` hook of that account is a grant of **the head the hook named**. GitLab binds an approval to no commit and keeps it across a push, so the commit is the store's: a new push revokes every other commit (`new_head`) and the merge request needs a new approval. An `unapproved` hook of that account revokes the commit (`dismissed`), however late it arrives. A hook of any other account is ignored (`202 ignored`).
+- The author's own approval counts for nothing (GitLab can allow it, GitHub cannot): ignored at the hook, refused again by the gate.
+- Before anything is fetched or built, and on every re-validation, the gate confirms on GitLab that the head is still that commit, that the approver still approves the merge request (`/merge_requests/:iid/approvals`), is still in `PREVIEWD_APPROVERS` (by account ID) and is still an active member with Developer access or more. A read that fails requeues the deploy; anything else refuses it and, on re-validation, tears the environment down.
+- Recorded as `approval_granted` / `untrusted_deploy` with detail `approval` (schema 4). `PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS` applies as for GitHub. `PREVIEWD_LABEL_APPROVAL` is GitHub's and is refused at start with `gitlab`.
+
+The merge request's opener is stored as `gitlab-user-<id>` (a hook names its author by ID only); the ID is the identity. A project path is at most 140 bytes (what the queue keeps); a longer one is refused at the hook.
 
 ## Credentials
 

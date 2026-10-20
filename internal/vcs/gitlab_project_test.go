@@ -113,3 +113,46 @@ func TestNewGitLabFetcherNeedsADriverAndACap(t *testing.T) {
 		t.Error("a zero cap accepted")
 	}
 }
+
+// An approver's authority is the author's: an active member with Developer
+// access or more. A 404 is an account that is not a member; any other
+// failure, or a reply about another account, is an error, never "no".
+func TestGitLabCanPush(t *testing.T) {
+	member := func(uid int64, state string, level int) func(int64) (int, any) {
+		return func(int64) (int, any) {
+			return 200, map[string]any{"id": uid, "username": "lead.dev", "state": state, "access_level": level}
+		}
+	}
+	for name, tc := range map[string]struct {
+		reply func(int64) (int, any)
+		want  bool
+		err   bool
+	}{
+		"developer":  {reply: member(7, "active", 30), want: true},
+		"owner":      {reply: member(7, "active", 50), want: true},
+		"reporter":   {reply: member(7, "active", 20)},
+		"blocked":    {reply: member(7, "blocked", 40)},
+		"not member": {reply: func(int64) (int, any) { return 404, map[string]string{"message": "404 Not found"} }},
+		"server err": {reply: func(int64) (int, any) { return 500, map[string]string{"message": "boom"} }, err: true},
+		"other id":   {reply: member(8, "active", 40), err: true},
+	} {
+		f := newGLFake(t)
+		f.others = tc.reply
+		got, err := f.client(t, nil).CanPush(context.Background(), glProject, 7)
+		if got != tc.want || (err != nil) != tc.err {
+			t.Errorf("%s: CanPush = %v, %v; want %v, error %v", name, got, err, tc.want, tc.err)
+		}
+	}
+	f := newGLFake(t)
+	for _, tc := range []struct {
+		project string
+		id      int64
+	}{{"", 7}, {"acme/app", 7}, {"15", 0}, {"15", -1}} {
+		if ok, err := f.client(t, nil).CanPush(context.Background(), tc.project, tc.id); ok || err == nil {
+			t.Errorf("CanPush(%q, %d) = %v, %v; want an error", tc.project, tc.id, ok, err)
+		}
+	}
+	if f.called() != "" {
+		t.Errorf("a call was made for an invalid handle: %s", f.called())
+	}
+}

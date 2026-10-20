@@ -145,3 +145,25 @@ func TestSeqAtIsTheDeliverySequenceScale(t *testing.T) {
 		t.Errorf("one tick apart: %d, %d", a, b)
 	}
 }
+
+// The store keeps a project path in 140 bytes and a login in 39: what it
+// cannot hold is refused where it enters, never as a storage error later.
+func TestGitLabStoreLimits(t *testing.T) {
+	long := strings.Repeat("a", 69) + "/" + strings.Repeat("b", 70) // 140 bytes
+	if err := GitLabProjectPath(long); err != nil {
+		t.Errorf("a 140-byte path refused: %v", err)
+	}
+	if err := GitLabProjectPath(long + "c"); err == nil {
+		t.Error("a 141-byte path accepted")
+	}
+	if _, err := ParseGitLabApprovers("acme/app:" + strings.Repeat("u", 39) + "#7"); err != nil {
+		t.Errorf("a 39-byte login refused: %v", err)
+	}
+	if _, err := ParseGitLabApprovers("acme/app:" + strings.Repeat("u", 40) + "#7"); err == nil {
+		t.Error("a 40-byte approver login accepted")
+	}
+	// An event's sender is not stored: a long username is a valid username.
+	if err := GitLabUsername(strings.Repeat("u", 40)); err != nil {
+		t.Errorf("a 40-byte username refused: %v", err)
+	}
+}

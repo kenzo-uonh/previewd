@@ -35,7 +35,7 @@ type forge struct {
 func newForge(cfg *config.Config, approvals orchestrator.Approvals, logger *slog.Logger) (forge, error) {
 	switch cfg.VCSProvider {
 	case vcs.ProviderGitLab:
-		return newGitLabForge(cfg, logger)
+		return newGitLabForge(cfg, approvals, logger)
 	case vcs.ProviderGitHub:
 		return newGitHubForge(cfg, approvals, logger)
 	}
@@ -80,9 +80,10 @@ func newGitHubForge(cfg *config.Config, approvals orchestrator.Approvals, logger
 
 // newGitLabForge wires GitLab Self-Managed: the access token from its systemd
 // credential, held in memory only, the deploy gate reading merge requests
-// from GitLab, and the project archive as the source. Only merge requests of
-// the project whose author can push deploy; approvals are not recorded yet.
-func newGitLabForge(cfg *config.Config, logger *slog.Logger) (forge, error) {
+// and their approvals from GitLab, and the project archive as the source. A
+// merge request of the project whose author can push deploys; any other
+// needs the approval of a PREVIEWD_APPROVERS account.
+func newGitLabForge(cfg *config.Config, approvals orchestrator.Approvals, logger *slog.Logger) (forge, error) {
 	token, err := secrets.Credential(cfg.GitLabTokenCredential)
 	if err != nil {
 		return forge{}, fmt.Errorf("GitLab token: %w", err)
@@ -98,7 +99,17 @@ func newGitLabForge(cfg *config.Config, logger *slog.Logger) (forge, error) {
 	if err != nil {
 		return forge{}, fmt.Errorf("GitLab client (%s): %w", cfg.GitLabURL, err)
 	}
-	authorizer, err := orchestrator.NewGitLabAuthorizer(gitlab, logger)
+	if len(cfg.FullSecretsRepos) > 0 {
+		logger.Error("Opt-in active: approved untrusted deploys of these projects receive the trusted secret section",
+			"opt_in", "PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS", "projects", slices.Sorted(maps.Keys(cfg.FullSecretsRepos)))
+	}
+	authorizer, err := orchestrator.NewGitLabAuthorizer(orchestrator.GitLabAuthorizerConfig{
+		MergeRequests:    gitlab,
+		Approvals:        approvals,
+		Approvers:        cfg.Approvers,
+		FullSecretsRepos: cfg.FullSecretsRepos,
+		Logger:           logger,
+	})
 	if err != nil {
 		return forge{}, fmt.Errorf("authorizer: %w", err)
 	}
@@ -107,7 +118,5 @@ func newGitLabForge(cfg *config.Config, logger *slog.Logger) (forge, error) {
 		return forge{}, fmt.Errorf("source fetcher: %w", err)
 	}
 	logger.Info("Source fetch armed", "forge", vcs.ProviderGitLab, "gitlab_url", cfg.GitLabURL, "max_bytes", cfg.MaxBuildContextBytes)
-	logger.Warn("GitLab approvals are not recorded yet: only merge requests of the project, authored by a member with Developer access or more, deploy",
-		"forge", vcs.ProviderGitLab)
 	return forge{provider: vcs.ProviderGitLab, authorizer: authorizer, fetch: fetcher.Fetch, options: []api.Option{api.WithProvider(gitlab)}}, nil
 }

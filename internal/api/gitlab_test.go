@@ -1,7 +1,9 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -319,22 +321,200 @@ func TestGitLabWebhookSignedWindow(t *testing.T) {
 	}
 }
 
-// Approvals are not recorded yet: the event is acknowledged, loudly, and no
-// environment is authorized by it. An untrusted merge request therefore
-// cannot deploy: the fail-closed side.
-func TestGitLabWebhookApprovalsAreNotRecordedYet(t *testing.T) {
-	for _, action := range []string{"approved", "approval", "unapproved", "unapproval"} {
-		var logs strings.Builder
+// glTruth is the GitLab the handler reads in the step that records an
+// approval or a revocation: the merge request as it stands.
+type glTruth struct {
+	vcs.Provider
+	state *vcs.MRState
+	err   error
+	reads []string
+}
+
+func (g *glTruth) GetMRState(_ context.Context, projectID, mrIID string) (*vcs.MRState, error) {
+	g.reads = append(g.reads, projectID+"!"+mrIID)
+	if g.err != nil {
+		return nil, g.err
+	}
+	st := *g.state
+	return &st, nil
+}
+
+// withTruth makes the harness's GitLab answer with st.
+func (h *glHarness) withTruth(st vcs.MRState) *glTruth {
+	t := &glTruth{Provider: h.provider, state: &st}
+	h.provider = t
+	return t
+}
+
+// glBodyBy is glBody as sent by account id (login): who approves, who
+// withdraws.
+func glBodyBy(t *testing.T, action, updatedAt string, id int64, login string, edit func(attrs map[string]any)) string {
+	t.Helper()
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(glBody(t, action, updatedAt, edit)), &doc); err != nil {
+		t.Fatal(err)
+	}
+	doc["user"] = map[string]any{"id": id, "username": login}
+	b, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func openHeadState() vcs.MRState {
+	return vcs.MRState{Open: true, HeadSHA: headSHA, HeadProject: "88", Author: vcs.Account{Login: "forker", ID: 4242}}
+}
+
+// An approver's approval is a grant of the head its hook named, bound to the
+// approver's account ID, recorded with GitLab's truth read in the same step.
+func TestGitLabApprovalIsRecordedAsAGrantOfTheHead(t *testing.T) {
+	for _, action := range []string{"approved", "approval"} {
 		h := newGLHarness(t)
-		h.logs = &logs
-		rec := h.send(t, glBody(t, action, glSignedAt, nil), nil)
-		if rec.Code != http.StatusAccepted || !strings.Contains(rec.Body.String(), `"status":"unsupported"`) ||
-			h.q.recorded() != 0 || h.w.n != 0 {
-			t.Errorf("%s: reply %d %s, recorded %d", action, rec.Code, rec.Body, h.q.recorded())
+		gl := h.withTruth(openHeadState())
+		body := glBodyBy(t, action, glSignedAt, 7, "lead.dev", nil)
+		rec := h.send(t, body, nil)
+		if rec.Code != http.StatusAccepted || !strings.Contains(rec.Body.String(), `"status":"queued"`) || h.w.n != 1 {
+			t.Fatalf("%s: reply %d %s, notified %d", action, rec.Code, rec.Body, h.w.n)
 		}
-		if !strings.Contains(logs.String(), `"level":"WARN"`) || !strings.Contains(logs.String(), "not recorded") {
-			t.Errorf("%s: no warning logged: %s", action, logs.String())
+		if len(h.q.grants) != 1 || len(h.q.got) != 0 || len(h.q.revokes) != 0 {
+			t.Fatalf("%s: recorded %d grants, %d deliveries, %d revocations", action, len(h.q.grants), len(h.q.got), len(h.q.revokes))
 		}
+		want := store.Grant{
+			DeliveryID: glUUID, PayloadSHA256: sha(body), EnvID: glEnv,
+			Source: store.Source{Repo: glPath, PRNumber: 7, OpenerLogin: "gitlab-user-4242", OpenerID: 4242,
+				HeadRepo: glPath, CommitSHA: headSHA, CloneURL: glCloneURL},
+			Seq: validate.SeqAt(v1Time), ApproverLogin: "lead.dev", ApproverID: 7, Via: store.ApprovalViaMR, ReviewID: 0,
+			Trusted: false, OpenHead: true,
+		}
+		if h.q.grants[0] != want {
+			t.Errorf("%s: grant = %+v\nwant    %+v", action, h.q.grants[0], want)
+		}
+		if a := h.q.audits[0]; a.Kind != store.AuditApprovalGranted || a.Detail != "approval" || a.ActorID != 7 || a.ActorLogin != "lead.dev" || a.CommitSHA != headSHA {
+			t.Errorf("%s: audit = %+v", action, a)
+		}
+		if len(gl.reads) != 1 || gl.reads[0] != "15!7" {
+			t.Errorf("%s: GitLab read %v, want the merge request by project ID", action, gl.reads)
+		}
+	}
+}
+
+// Fails closed: GitLab's truth that cannot be read, or that does not match,
+// queues no deploy; AuthorizeDeploy reads it again before anything runs.
+func TestGitLabApprovalWithoutTruthQueuesNoDeploy(t *testing.T) {
+	moved := openHeadState()
+	moved.HeadSHA = oldSHA
+	closed := openHeadState()
+	closed.Open = false
+	for name, tc := range map[string]struct {
+		truth func(*glTruth)
+	}{
+		"unreadable": {func(g *glTruth) { g.err = errors.New("connection refused") }},
+		"head moved": {func(g *glTruth) { g.state = &moved }},
+		"closed":     {func(g *glTruth) { g.state = &closed }},
+	} {
+		h := newGLHarness(t)
+		tc.truth(h.withTruth(openHeadState()))
+		if rec := h.send(t, glBodyBy(t, "approved", glSignedAt, 7, "lead.dev", nil), nil); rec.Code != http.StatusAccepted {
+			t.Fatalf("%s: reply %d %s", name, rec.Code, rec.Body)
+		}
+		if len(h.q.grants) != 1 || h.q.grants[0].OpenHead || h.q.grants[0].Trusted {
+			t.Errorf("%s: grants %+v; want one with no open head and not trusted", name, h.q.grants)
+		}
+	}
+}
+
+func TestGitLabApprovalByAnyoneButAnApproverIsIgnored(t *testing.T) {
+	for name, tc := range map[string]struct {
+		id    int64
+		login string
+		edit  func(map[string]any)
+	}{
+		"not in PREVIEWD_APPROVERS": {99, "someone", nil},
+		"right name, other account": {8, "lead.dev", nil},
+		// Self-approval: GitLab can allow it, GitHub cannot. Never a second pair of eyes.
+		"the author": {7, "lead.dev", func(a map[string]any) { a["author_id"] = 7 }},
+	} {
+		h := newGLHarness(t)
+		h.withTruth(openHeadState())
+		rec := h.send(t, glBodyBy(t, "approved", glSignedAt, tc.id, tc.login, tc.edit), nil)
+		if rec.Code != http.StatusAccepted || !strings.Contains(rec.Body.String(), `"status":"ignored"`) || h.q.recorded() != 0 || h.w.n != 0 {
+			t.Errorf("%s: reply %d %s, recorded %d", name, rec.Code, rec.Body, h.q.recorded())
+		}
+	}
+}
+
+func TestGitLabApproverKeepsTheirIDWhenRenamed(t *testing.T) {
+	h := newGLHarness(t)
+	h.withTruth(openHeadState())
+	long := strings.Repeat("renamed-", 6) // 48 bytes: more than the trail keeps
+	rec := h.send(t, glBodyBy(t, "approved", glSignedAt, 7, long, nil), nil)
+	if rec.Code != http.StatusAccepted || len(h.q.grants) != 1 {
+		t.Fatalf("reply %d %s, grants %d", rec.Code, rec.Body, len(h.q.grants))
+	}
+	if g := h.q.grants[0]; g.ApproverID != 7 || g.ApproverLogin != "lead.dev" {
+		t.Errorf("grant approver %s#%d; want the configured login of account 7", g.ApproverLogin, g.ApproverID)
+	}
+
+	h = newGLHarness(t)
+	h.withTruth(openHeadState())
+	if rec := h.send(t, glBodyBy(t, "approved", glSignedAt, 7, "lead.renamed", nil), nil); rec.Code != http.StatusAccepted ||
+		len(h.q.grants) != 1 || h.q.grants[0].ApproverLogin != "lead.renamed" {
+		t.Errorf("renamed account: reply %d, grants %+v; want the login GitLab reports", rec.Code, h.q.grants)
+	}
+}
+
+// V1-I7: an approval received long after the time its body carries is not a
+// new grant; a withdrawal is processed anyway, it only restricts.
+func TestGitLabApprovalSignedWindow(t *testing.T) {
+	stale := "2014-04-25 11:00:00 UTC"
+	h := newGLHarness(t)
+	h.withTruth(openHeadState())
+	if rec := h.send(t, glBodyBy(t, "approved", stale, 7, "lead.dev", nil), nil); rec.Code != http.StatusBadRequest || h.q.recorded() != 0 {
+		t.Errorf("late approval: reply %d, recorded %d", rec.Code, h.q.recorded())
+	}
+	h = newGLHarness(t)
+	h.withTruth(openHeadState())
+	if rec := h.send(t, glBodyBy(t, "unapproved", stale, 7, "lead.dev", nil), nil); rec.Code != http.StatusAccepted || len(h.q.revokes) != 1 {
+		t.Errorf("late withdrawal: reply %d, revocations %d", rec.Code, len(h.q.revokes))
+	}
+}
+
+func TestGitLabUnapprovalRevokesTheCommit(t *testing.T) {
+	for _, action := range []string{"unapproved", "unapproval"} {
+		h := newGLHarness(t)
+		h.withTruth(openHeadState())
+		body := glBodyBy(t, action, glSignedAt, 7, "lead.dev", nil)
+		rec := h.send(t, body, nil)
+		if rec.Code != http.StatusAccepted || len(h.q.revokes) != 1 || len(h.q.grants) != 0 {
+			t.Fatalf("%s: reply %d %s, revocations %d, grants %d", action, rec.Code, rec.Body, len(h.q.revokes), len(h.q.grants))
+		}
+		want := store.Revoke{DeliveryID: glUUID, PayloadSHA256: sha(body), EnvID: glEnv, Repo: glPath, PRNumber: 7,
+			CommitSHA: headSHA, Seq: validate.SeqAt(v1Time), Reason: store.RevokedDismissed}
+		if h.q.revokes[0] != want {
+			t.Errorf("%s: revocation = %+v\nwant         %+v", action, h.q.revokes[0], want)
+		}
+		if a := h.q.audits[0]; a.Kind != store.AuditApprovalRevoked || a.Detail != "dismissed" || a.ActorID != 7 {
+			t.Errorf("%s: audit = %+v", action, a)
+		}
+	}
+
+	// Only an approver's withdrawal counts: anyone else's never was a grant.
+	h := newGLHarness(t)
+	h.withTruth(openHeadState())
+	if rec := h.send(t, glBodyBy(t, "unapproved", glSignedAt, 99, "someone", nil), nil); rec.Code != http.StatusAccepted ||
+		!strings.Contains(rec.Body.String(), `"status":"ignored"`) || h.q.recorded() != 0 {
+		t.Errorf("withdrawal by a stranger: reply %d %s, recorded %d", rec.Code, rec.Body, h.q.recorded())
+	}
+}
+
+func TestGitLabApprovalReplayIsDuplicate(t *testing.T) {
+	h := newGLHarness(t)
+	h.withTruth(openHeadState())
+	h.q.verdict = store.VerdictReplay
+	rec := h.send(t, glBodyBy(t, "approved", glSignedAt, 7, "lead.dev", nil), nil)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"status":"duplicate"`) || h.w.n != 0 {
+		t.Errorf("replay: reply %d %s, notified %d", rec.Code, rec.Body, h.w.n)
 	}
 }
 

@@ -88,6 +88,9 @@ type PullRequest struct {
 	SenderLogin string
 	SenderID    int64
 	Label       string // labeled and unlabeled only
+	// ProjectID is the handle the forge's API is addressed by when it is not
+	// Repo: GitLab's numeric project ID. "" for GitHub.
+	ProjectID string
 }
 
 // accountWire is a GitHub account object.

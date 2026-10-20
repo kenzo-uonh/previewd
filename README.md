@@ -96,7 +96,7 @@ On this page: [Codebase Structure](#codebase-structure) · [Development & Execut
 │   │   ├── injector.go            # Loads the secrets file into memory.
 │   │   └── stager*.go             # ramfs staging: fs-type, owner and mode checks, one file per key.
 │   ├── store/
-│   │   ├── db.go                  # modernc.org/sqlite pool (No CGO): WAL, busy_timeout, IMMEDIATE transactions, forward-only migrations (schema 3), incremental auto_vacuum.
+│   │   ├── db.go                  # modernc.org/sqlite pool (No CGO): WAL, busy_timeout, IMMEDIATE transactions, forward-only migrations (schema 4), incremental auto_vacuum.
 │   │   ├── jobs.go                # Durable job queue: replay protection, stale deliveries, leases, startup sweep (TLA+ model).
 │   │   ├── approvals.go           # Approval grants and revocations (order-independent), classification, park, internal teardowns.
 │   │   ├── audit.go               # Append-only, hash-chained audit trail.

@@ -283,6 +283,8 @@ type glFake struct {
 
 	mr     func() any
 	member func() (int, any)
+	// others answers a membership read for an account other than the author.
+	others func(uid int64) (int, any)
 	// project answers GET /projects/:path-or-id for a project path.
 	project   func(path string) (int, any)
 	approvals func() any
@@ -302,6 +304,9 @@ func newGLFake(t *testing.T) *glFake {
 			map[string]any{"user": map[string]any{"id": 7, "username": "lead.dev"}},
 			map[string]any{"user": map[string]any{"id": 8, "username": "second"}},
 		}}
+	}
+	f.others = func(uid int64) (int, any) {
+		return http.StatusOK, map[string]any{"id": uid, "username": "lead.dev", "state": "active", "access_level": 40}
 	}
 	f.project = func(path string) (int, any) {
 		if path != glPath {
@@ -331,10 +336,14 @@ func newGLFake(t *testing.T) *glFake {
 		writeJSON(w, http.StatusOK, f.mr())
 	}))
 	mux.HandleFunc("GET /api/v4/projects/15/members/all/{uid}", guard(func(w http.ResponseWriter, r *http.Request) {
-		if r.PathValue("uid") != fmt.Sprint(glAuthorID) {
-			t.Errorf("membership read for %s, want the author", r.PathValue("uid"))
+		if r.PathValue("uid") == fmt.Sprint(glAuthorID) {
+			code, body := f.member()
+			writeJSON(w, code, body)
+			return
 		}
-		code, body := f.member()
+		var uid int64
+		_, _ = fmt.Sscan(r.PathValue("uid"), &uid)
+		code, body := f.others(uid)
 		writeJSON(w, code, body)
 	}))
 	mux.HandleFunc("GET /api/v4/projects/15/merge_requests/7/approvals", guard(func(w http.ResponseWriter, r *http.Request) {

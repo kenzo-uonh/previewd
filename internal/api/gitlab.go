@@ -15,8 +15,11 @@ package api
 //   - The opener is known by ID only: the login is a placeholder, identity
 //     is the ID.
 //
-// Approvals (approved, unapproved) are acknowledged and not recorded yet:
-// an untrusted merge request does not deploy, which is the fail-closed side.
+// An approval (approved) of an approver is a grant of the head its hook
+// named, an unapproval (unapproved) a revocation of it (handleGitLabApproval).
+// GitLab binds an approval to no commit and keeps it across a push, so the
+// commit is the one the hook recorded: a new push revokes it in the store
+// and the merge request needs a new approval.
 
 import (
 	"crypto/sha256"
@@ -26,9 +29,17 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/kenzo-uonh/previewd/internal/envid"
+	"github.com/kenzo-uonh/previewd/internal/store"
 	"github.com/kenzo-uonh/previewd/internal/validate"
 	"github.com/kenzo-uonh/previewd/internal/vcs"
 )
+
+// maxRecordedLogin is the longest login the audit trail keeps
+// (store.maxLoginLen). A GitLab username can be longer than that; PREVIEWD_
+// APPROVERS never lists one, and an approver renamed to one is recorded under
+// the login configured for the account: the account ID is the identity.
+const maxRecordedLogin = 39
 
 const (
 	gitlabEventHeader = "X-Gitlab-Event"
@@ -82,10 +93,7 @@ func (s *Server) handleGitLabWebhook() http.HandlerFunc {
 			receivedAt:    received,
 		}
 		if ev.Action == vcs.ActionApproved || ev.Action == vcs.ActionUnapproved {
-			s.logger.Warn("GitLab approval event not recorded: approvals are not supported for GitLab yet, the merge request is not authorized by it",
-				"delivery_id", id, "repository", ev.Project, "mr_iid", ev.IID, "action", ev.Action,
-				"approver", ev.Sender.Login, "approver_id", ev.Sender.ID)
-			s.respond(w, http.StatusAccepted, reply{Status: "unsupported"})
+			s.handleGitLabApproval(w, r, in, ev)
 			return
 		}
 		s.processPullRequest(w, r, in, pullRequestOf(ev))
@@ -105,9 +113,50 @@ func gitlabDeliveryID(header, digest string) (string, error) {
 func pullRequestOf(ev *vcs.Event) validate.PullRequest {
 	return validate.PullRequest{
 		Action: ev.Action, Number: ev.IID, Repo: ev.Project, HeadRef: ev.HeadRef, HeadSHA: ev.HeadSHA,
-		CloneURL: ev.CloneURL, HeadRepo: ev.HeadProject,
+		CloneURL: ev.CloneURL, HeadRepo: ev.HeadProject, ProjectID: ev.ProjectID,
 		// A hook names its author by ID only; the ID is the identity.
 		OpenerLogin: "gitlab-user-" + strconv.FormatInt(ev.Author.ID, 10), OpenerID: ev.Author.ID,
 		UpdatedAt: ev.UpdatedAt, SenderLogin: ev.Sender.Login, SenderID: ev.Sender.ID,
 	}
+}
+
+// handleGitLabApproval records an approval or its withdrawal. Only an
+// approver's counts, and never the author's own: GitLab can allow a merge
+// request to approve itself, GitHub cannot, and an approval is a second pair
+// of eyes. An approval is a grant of the head the hook named, with GitLab's
+// truth read in the same step (trusted, open head); a withdrawal revokes
+// that commit, by anyone listed, however late (it only restricts).
+func (s *Server) handleGitLabApproval(w http.ResponseWriter, r *http.Request, in inbound, ev *vcs.Event) {
+	pr := pullRequestOf(ev)
+	envID := envid.Generate(pr.Repo, pr.HeadRef, uint64(pr.Number))
+	log := s.logger.With("delivery_id", in.delivery.ID, "delivery_time", in.delivery.Time, "environment_id", envID,
+		"repository", pr.Repo, "pr_number", pr.Number, "action", ev.Action, "commit_sha", ev.HeadSHA,
+		"approver", ev.Sender.Login, "approver_id", ev.Sender.ID)
+
+	approver, ok := s.approver(log, ev.Project, ev.Sender.ID, ev.Sender.Login)
+	if !ok {
+		log.Info("Approval event by an account that is not an approver of the project: ignored")
+		s.respond(w, http.StatusAccepted, reply{Status: "ignored", EnvironmentID: envID})
+		return
+	}
+	login := ev.Sender.Login
+	if len(login) > maxRecordedLogin {
+		login = approver.Login
+	}
+	if ev.Action == vcs.ActionUnapproved {
+		if !s.signedWindow(w, log, in, ev.UpdatedAt, true) {
+			return
+		}
+		s.revoke(w, r, in, log, envID, pr, ev.HeadSHA, store.RevokedDismissed, ev.Sender.ID, login)
+		return
+	}
+	if ev.Author.ID == ev.Sender.ID {
+		log.Warn("Approval by the author of the merge request: ignored")
+		s.respond(w, http.StatusAccepted, reply{Status: "ignored", EnvironmentID: envID})
+		return
+	}
+	if !s.signedWindow(w, log, in, ev.UpdatedAt, false) {
+		return
+	}
+	s.grant(w, r, in, log, envID, pr, ev.HeadSHA, store.ApprovalViaMR, 0, approver.ID, login)
 }

@@ -317,6 +317,63 @@ var migrations = []string{
 	CREATE TRIGGER audit_events_no_delete BEFORE DELETE ON audit_events
 		BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;
 	PRAGMA user_version = 3;`,
+
+	// 4: GitLab merge request approvals (V1.1 spec 3.1). SQLite cannot alter
+	// a CHECK, so approvals (via admits 'approval', which carries no review
+	// ID) and audit_events (detail admits 'approval') are rebuilt and their
+	// rows copied as they are. The audit trail is hash-chained: ids, hashes
+	// and every column are copied verbatim, so the chain still verifies, and
+	// the triggers that make it append-only are created again.
+	`CREATE TABLE approvals_v4 (
+		id INTEGER PRIMARY KEY,
+		preview_id TEXT NOT NULL CHECK (length(preview_id) BETWEEN 1 AND 63),
+		repo TEXT NOT NULL CHECK (length(repo) BETWEEN 3 AND 140),
+		pr_number INTEGER NOT NULL CHECK (pr_number > 0),
+		commit_sha TEXT NOT NULL CHECK (length(commit_sha) IN (40, 64)),
+		approver_login TEXT NOT NULL CHECK (length(approver_login) BETWEEN 1 AND 39),
+		approver_id INTEGER NOT NULL CHECK (approver_id > 0),
+		via TEXT NOT NULL CHECK (via IN ('review', 'label', 'approval')),
+		review_id INTEGER NOT NULL DEFAULT 0 CHECK (review_id >= 0),
+		granted_seq INTEGER NOT NULL CHECK (granted_seq > 0),
+		granted_at INTEGER NOT NULL CHECK (granted_at > 0),
+		UNIQUE (preview_id, commit_sha, approver_id, via),
+		CHECK ((via = 'review') = (review_id > 0))
+	);
+	INSERT INTO approvals_v4 (id, preview_id, repo, pr_number, commit_sha, approver_login, approver_id, via, review_id, granted_seq, granted_at)
+	SELECT id, preview_id, repo, pr_number, commit_sha, approver_login, approver_id, via, review_id, granted_seq, granted_at FROM approvals;
+	DROP TABLE approvals;
+	ALTER TABLE approvals_v4 RENAME TO approvals;
+
+	CREATE TABLE audit_events_v4 (
+		id INTEGER PRIMARY KEY CHECK (id > 0),
+		at INTEGER NOT NULL CHECK (at > 0),
+		kind TEXT NOT NULL CHECK (kind IN ('trusted_deploy', 'untrusted_deploy', 'approval_granted',
+			'approval_revoked', 'deploy_refused', 'teardown', 'ttl_expired', 'full_secrets_opt_in')),
+		preview_id TEXT NOT NULL CHECK (length(preview_id) BETWEEN 1 AND 63),
+		repo TEXT NOT NULL CHECK (length(repo) BETWEEN 3 AND 140),
+		pr_number INTEGER NOT NULL CHECK (pr_number > 0),
+		commit_sha TEXT NOT NULL CHECK (length(commit_sha) IN (0, 40, 64)),
+		actor_login TEXT NOT NULL CHECK (length(actor_login) <= 39),
+		actor_id INTEGER NOT NULL CHECK (actor_id >= 0),
+		detail TEXT NOT NULL CHECK (detail IN ('write_access', 'review', 'label', 'approval', 'dismissed',
+			'changes_requested', 'unlabeled', 'new_head', 'approver_removed', 'permission_lost',
+			'revalidation_unavailable', 'pr_closed', 'not_approved', 'disk_floor', 'webhook', 'revocation',
+			'revalidation', 'ttl', 'opt_in')),
+		prev_hash TEXT NOT NULL CHECK (length(prev_hash) = 64),
+		hash TEXT NOT NULL UNIQUE CHECK (length(hash) = 64),
+		CHECK ((actor_id = 0) = (actor_login = ''))
+	);
+	DROP TRIGGER audit_events_no_update;
+	DROP TRIGGER audit_events_no_delete;
+	INSERT INTO audit_events_v4 (id, at, kind, preview_id, repo, pr_number, commit_sha, actor_login, actor_id, detail, prev_hash, hash)
+	SELECT id, at, kind, preview_id, repo, pr_number, commit_sha, actor_login, actor_id, detail, prev_hash, hash FROM audit_events ORDER BY id;
+	DROP TABLE audit_events;
+	ALTER TABLE audit_events_v4 RENAME TO audit_events;
+	CREATE TRIGGER audit_events_no_update BEFORE UPDATE ON audit_events
+		BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;
+	CREATE TRIGGER audit_events_no_delete BEFORE DELETE ON audit_events
+		BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;
+	PRAGMA user_version = 4;`,
 }
 
 // migrate applies every migration above the database's user_version, each in

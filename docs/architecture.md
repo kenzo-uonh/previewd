@@ -107,7 +107,7 @@ The target address is [`PREVIEWD_BUILD_PROBE_ADDR`](configuration.md#previewd_bu
 
 ### Persistence
 
-The database is at schema version 3. The first start of this version migrates a version-2 file in one transaction, then converts it once to incremental `auto_vacuum` with a `VACUUM` (temporary disk space up to the database size); the daemon refuses to start if either fails.
+The database is at schema version 4. The first start of this version migrates an older file one version at a time, each in its own transaction; from version 2 it then converts the file once to incremental `auto_vacuum` with a `VACUUM` (temporary disk space up to the database size); the daemon refuses to start if either fails. Version 4 (GitLab approvals) rebuilds `approvals` and `audit_events` to admit the `approval` path: every row of the hash-chained trail keeps its bytes and hash, and the append-only triggers are created again.
 
 ## Secret Staging
 
@@ -132,9 +132,9 @@ A forge is a `vcs.Provider` (`internal/vcs/vcs.go`): `Name`, `VerifyWebhook` (au
 | Order of intents | the delivery UUID's time | the instant the hook is received |
 | API credential | installation token per read, scoped, revoked | access token in `PRIVATE-TOKEN`, read only |
 | Trusted | head in the repository, opener can write | head in the project, author an active member with Developer or more |
-| Approval bound to a commit | yes (review `commit_id`) | no (`Approval.CommitSHA` is empty) |
+| Approval | a review (or label), bound to its `commit_id` | `approved` / `unapproved` hooks; bound to the head the hook named, confirmed on GitLab at each use (`Approval.CommitSHA` is empty) |
 
-GitLab ingestion shares the pull request path of GitHub from the decoded event on (signed window, environment ID, enqueue). `cmd/previewd/forge.go` wires the forge the daemon serves: `orchestrator.GitLabAuthorizer` is its deploy gate and `vcs.GitLabFetcher` its source fetch (the store keeps a project by path, GitLab is addressed by ID, so the path is resolved at each use). Approval events are not recorded yet; see [Configuration: GitLab](configuration.md#gitlab).
+GitLab ingestion shares the pull request path of GitHub from the decoded event on (signed window, environment ID, enqueue). `cmd/previewd/forge.go` wires the forge the daemon serves: `orchestrator.GitLabAuthorizer` is its deploy gate and `vcs.GitLabFetcher` its source fetch (the store keeps a project by path, GitLab is addressed by ID, so the path is resolved at each use). Approvals are recorded and confirmed as described in [Configuration: GitLab](configuration.md#gitlab).
 
 ## Webhook Ingestion
 
@@ -293,7 +293,7 @@ previewd audit export [-db PATH] > audit.jsonl   # verified first; a broken chai
 | The startup build probe fails closed: a non-loopback interface, a route, a reply from the probe address; a build cgroup with an unbounded limit or swap, busy before the probe, never holding the probe, or holding a process after it | `internal/hardening`, `internal/orchestrator`, `cmd/previewd` | table tests on fake cgroupfs and route tables, rig with a fake prober and cgroup, wire test of the probe request |
 | Leaves import no internal package; layering edges are explicit | `internal/validate` | `TestPackageLayering` |
 | Job queue equals the TLA+ model after every command (enqueue, replay, out-of-order delivery, acquire, deploy and teardown steps with Docker failures, daemon crash, host reboot, stale leases); lock integrity, monotonicity, no orphaned resources; every job completes and the host converges | `internal/store` | `rapid.StateMachine` (`TestJobStore_StateMachine`), scenario tests per deviation D1 to D3 |
-| V1 store (schema 3) equals the V1 reference model after every command: approvals and revocations in any order, park, classification, revocation, re-validation and TTL teardowns, pruning, crashes; every V1 safety and liveness property of `docs/formal/V1-model.md` holds | `internal/store` | `rapid.StateMachine` (`TestV1Store_StateMachine`, at most 500 runs under `make verify`), V1 mutants on the reference model (`TestV1Model_Mutants`) |
+| V1 store (the schema 3 model; schema 4 adds one approval path, covered by `TestMergeRequestApprovalGrantsTheCommitItNamed` and `TestMigrateSchema3ToGitLabApprovals`) equals the V1 reference model after every command: approvals and revocations in any order, park, classification, revocation, re-validation and TTL teardowns, pruning, crashes; every V1 safety and liveness property of `docs/formal/V1-model.md` holds | `internal/store` | `rapid.StateMachine` (`TestV1Store_StateMachine`, at most 500 runs under `make verify`), V1 mutants on the reference model (`TestV1Model_Mutants`) |
 | The audit trail is append-only and any changed, deleted, relinked or forged row breaks the hash chain | `internal/store` | append-only triggers, tamper tests with the triggers dropped |
 | Overlapping read/write transactions never surface `SQLITE_BUSY`, with `Prune` and its `incremental_vacuum` running in parallel | `internal/store` | 16 writers, 4 long readers on two pools and a pruner; controls prove the detector fires without the connection parameters |
 | Pruning keeps every verdict (V1-I6): a twin store that is never pruned gives every possible next delivery the same verdict, and every mirrored operation the same result; the latest job, unfinished jobs, host builders and the jobs newer than them survive; no transaction deletes more than the batch; freed pages go back to the file system | `internal/store` | `TestJobStore_StateMachine` with a pruned twin, scenario tests (`maintenance_test.go`), page count on a real file |
