@@ -49,7 +49,7 @@ Each step is detailed in [Webhook Ingestion](#webhook-ingestion) and [Reconcilia
 
 ## Architecture & Tech Stack
 
-- **Core Daemon:** Statically compiled Go 1.27.2+ binary (`CGO_ENABLED=0`) requiring zero external OS dependencies.
+- **Core Daemon:** Statically compiled Go 1.27.3+ binary (`CGO_ENABLED=0`) requiring zero external OS dependencies.
 - **Orchestration:** Docker API (`github.com/moby/moby/client`).
   - Each environment runs on its own internal bridge network (no default route, no egress), shared only with the Traefik container.
   - PR containers run with every capability dropped, `no-new-privileges`, a read-only root file system with no writable mount (no tmpfs), a memory limit without swap and a task limit.
