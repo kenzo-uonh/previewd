@@ -24,13 +24,17 @@ var triggerEnv = envid.Generate("acme/app", "feature/x", 7)
 
 // fakeHeads is the forge a trigger reads.
 type fakeHeads struct {
-	head  vcs.Head
-	err   error
-	reads int
+	head   vcs.Head
+	err    error
+	reads  int
+	onRead func() // runs while the forge answers
 }
 
 func (f *fakeHeads) PullRequestHead(_ context.Context, project string, number uint32) (vcs.Head, error) {
 	f.reads++
+	if f.onRead != nil {
+		f.onRead()
+	}
 	return f.head, f.err
 }
 
@@ -372,5 +376,111 @@ func TestTriggerSourceFilter(t *testing.T) {
 	srv.Routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusAccepted {
 		t.Errorf("runner address: reply %d %s", rec.Code, rec.Body)
+	}
+}
+
+func callFrom(t *testing.T, srv *Server, peer, auth string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/trigger", strings.NewReader(triggerBody))
+	req.RemoteAddr = peer
+	if auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	return rec
+}
+
+// The allowance is per peer: a stranger that floods the API with bad tokens
+// drains its own bucket, not the CI runner's.
+func TestTriggerRateLimitIsPerPeer(t *testing.T) {
+	h := newTriggerHarness()
+	srv := h.server(t)
+	for i := range triggerBurst {
+		if rec := callFrom(t, srv, "198.51.100.9:4000", "Bearer wrong"); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("stranger, request %d: reply %d", i, rec.Code)
+		}
+	}
+	if rec := callFrom(t, srv, "198.51.100.9:4001", "Bearer wrong"); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("stranger past the burst: reply %d", rec.Code)
+	}
+	// The same host over IPv4-mapped IPv6, and with another source port, is
+	// the same peer.
+	if rec := callFrom(t, srv, "[::ffff:198.51.100.9]:4002", "Bearer "+triggerToken); rec.Code != http.StatusTooManyRequests {
+		t.Errorf("the stranger as an IPv4-mapped address: reply %d", rec.Code)
+	}
+	// The runner is untouched.
+	if rec := callFrom(t, srv, "10.1.2.3:4444", "Bearer "+triggerToken); rec.Code != http.StatusAccepted {
+		t.Errorf("runner beside a flooding stranger: reply %d %s", rec.Code, rec.Body)
+	}
+	// A peer that is not an address shares one bucket and cannot dodge the limit.
+	for range triggerBurst {
+		callFrom(t, srv, "not-an-address", "Bearer wrong")
+	}
+	if rec := callFrom(t, srv, "also-not-one", "Bearer wrong"); rec.Code != http.StatusTooManyRequests {
+		t.Errorf("unreadable peers: reply %d", rec.Code)
+	}
+}
+
+// The table of peers is bounded and fails closed: when every remembered peer
+// is still drained, a new one is refused until a bucket refills.
+func TestPeerLimiterIsBoundedAndFailsClosed(t *testing.T) {
+	l := newPeerLimiter(1, time.Second)
+	now := v1Time
+	peer := func(i int) netip.Addr { return netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)}) }
+	for i := range maxLimitedPeers {
+		if !l.take(peer(i), now) {
+			t.Fatalf("peer %d refused", i)
+		}
+	}
+	if len(l.peers) != maxLimitedPeers {
+		t.Fatalf("%d peers remembered", len(l.peers))
+	}
+	if l.take(peer(maxLimitedPeers), now) {
+		t.Error("a new peer was accepted with the table full of drained peers")
+	}
+	if l.take(peer(0), now) {
+		t.Error("a drained peer was accepted again before its refill")
+	}
+	// After a refill the idle peers are forgotten and a new one fits.
+	now = now.Add(time.Second)
+	if !l.take(peer(maxLimitedPeers), now) {
+		t.Error("a new peer was refused although every bucket was full again")
+	}
+	if len(l.peers) > maxLimitedPeers {
+		t.Errorf("%d peers remembered, bound %d", len(l.peers), maxLimitedPeers)
+	}
+}
+
+// The intent is ordered by the instant it was received, before the forge is
+// read: a close that lands while the forge answers is ordered after it.
+func TestTriggerIsOrderedBeforeTheForgeIsRead(t *testing.T) {
+	h := newTriggerHarness()
+	h.heads.onRead = func() { h.now = h.now.Add(3 * time.Second) } // the forge is slow, or the PR closes
+	rec := call(t, h.server(t), http.MethodPost, "/api/v1/trigger", "Bearer "+triggerToken, triggerBody)
+	if rec.Code != http.StatusAccepted || len(h.q.got) != 1 {
+		t.Fatalf("reply %d %s, deliveries %d", rec.Code, rec.Body, len(h.q.got))
+	}
+	if d := h.q.got[0]; d.Seq != validate.SeqAt(v1Time) || !d.ReceivedAt.Equal(v1Time) {
+		t.Errorf("ordered at %v (seq %d), want the instant before the forge read, %v", d.ReceivedAt, d.Seq, v1Time)
+	}
+}
+
+// The source filter names what it refused and the setting that holds the
+// allowed addresses: the trigger's, not the webhook's.
+func TestTriggerSourceFilterNamesItsOwnSetting(t *testing.T) {
+	h := newTriggerHarness()
+	h.cfg.TriggerAllowedCIDRs = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
+	var logs strings.Builder
+	srv, err := NewServer(slog.New(slog.NewTextHandler(&logs, nil)), h.cfg, []byte(testSecret), h.q, h.w, h.gh,
+		WithTrigger([]byte(triggerToken), h.heads, h.envs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec := callFrom(t, srv, "192.0.2.1:4444", "Bearer "+triggerToken); rec.Code != http.StatusForbidden {
+		t.Fatalf("reply %d", rec.Code)
+	}
+	if got := logs.String(); !strings.Contains(got, "Trigger API request refused: source outside PREVIEWD_TRIGGER_ALLOWED_CIDRS") || strings.Contains(got, "WEBHOOK") {
+		t.Errorf("log = %q", got)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,12 +20,21 @@ type fakeCreds struct {
 	hidden   int // hideInput calls not yet restored
 	locked   bool
 	lockErr  error
+	noDumps  bool
+	coreErr  error
 	fail     error
 }
 
 func (f *fakeCreds) host() credentialsHost {
 	return credentialsHost{
-		lockMemory: func() error { f.locked = f.lockErr == nil; return f.lockErr },
+		noCoreDumps: func() error { f.noDumps = f.coreErr == nil; return f.coreErr },
+		lockMemory: func() error {
+			if !f.noDumps {
+				return errors.New("memory locked before core dumps were disabled")
+			}
+			f.locked = f.lockErr == nil
+			return f.lockErr
+		},
 		hideInput: func() (func() error, bool, error) {
 			if f.terminal {
 				f.hidden++
@@ -32,8 +42,8 @@ func (f *fakeCreds) host() credentialsHost {
 			return func() error { f.hidden--; return nil }, f.terminal, nil
 		},
 		encrypt: func(_ context.Context, args []string, secret []byte) error {
-			if !f.locked {
-				return errors.New("memory not locked before a secret was handled")
+			if !f.noDumps || !f.locked {
+				return errors.New("core dumps not disabled and memory not locked before a secret was handled")
 			}
 			if f.terminal && f.hidden != 0 {
 				return errors.New("the terminal echo was not restored before encrypting")
@@ -123,6 +133,7 @@ func TestSetupCredentialsFailsClosed(t *testing.T) {
 		"unknown key":        {&fakeCreds{}, "x", []string{"-dir", t.TempDir(), "-with-key", "null", "a"}},
 		"exists":             {&fakeCreds{}, "x", []string{"-dir", existing, "webhook_secret"}},
 		"memory not locked":  {&fakeCreds{lockErr: errors.New("EPERM")}, "x", []string{"-dir", t.TempDir(), "a"}},
+		"core dumps on":      {&fakeCreds{coreErr: errors.New("EPERM")}, "x", []string{"-dir", t.TempDir(), "a"}},
 		"empty secret":       {&fakeCreds{}, "\n\n", []string{"-dir", t.TempDir(), "a"}},
 		"two piped":          {&fakeCreds{}, "x", []string{"-dir", t.TempDir(), "a", "b"}},
 		"too large":          {&fakeCreds{}, strings.Repeat("x", maxSecretBytes+1), []string{"-dir", t.TempDir(), "a"}},
@@ -166,4 +177,90 @@ func TestSetupCredentialsFailsClosed(t *testing.T) {
 	if code, _, errOut := runCredsCmd(t, &fakeCreds{}, "new", "-dir", existing, "-force", "webhook_secret"); code != exitOK {
 		t.Errorf("-force: %d, %q", code, errOut)
 	}
+}
+
+// Fail closed: while the process could still write a core file, no secret is
+// read, not even the first byte of stdin, and nothing is encrypted.
+func TestSetupCredentialsRefusesWhileCoreDumpsAreOn(t *testing.T) {
+	f := &fakeCreds{coreErr: errors.New("prctl: operation not permitted")}
+	stdin := &countingReader{r: strings.NewReader("s3cret")}
+	var out, errOut bytes.Buffer
+	code := runSetupCredentials(context.Background(), []string{"-dir", t.TempDir(), "a"}, stdin, &out, &errOut, f.host())
+	if code != exitUsage || !strings.Contains(errOut.String(), "disable core dumps") || strings.Contains(errOut.String(), "s3cret") {
+		t.Errorf("exit %d, %q", code, errOut.String())
+	}
+	if stdin.reads != 0 || len(f.secrets) != 0 || f.locked {
+		t.Errorf("stdin read %d times, %d secrets encrypted, memory locked %v", stdin.reads, len(f.secrets), f.locked)
+	}
+}
+
+type countingReader struct {
+	r     *strings.Reader
+	reads int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	c.reads++
+	return c.r.Read(p)
+}
+
+// A piped secret is read into one buffer allocated up front: it is never
+// copied into a slice that grows, and wiping the buffers leaves no byte of
+// it anywhere.
+func TestSecretReaderKeepsOneBufferAndWipesIt(t *testing.T) {
+	secret := strings.Repeat("k", 40_000) + "\r\n"
+	in := &secretReader{r: strings.NewReader(secret)}
+	dst := newSecretBuf()
+	base := &dst.b[0]
+	if err := in.all(dst); err != nil {
+		t.Fatal(err)
+	}
+	if &dst.b[0] != base || len(dst.b) != maxSecretBytes+1 {
+		t.Error("the secret buffer was reallocated")
+	}
+	if got := bytes.TrimRight(dst.bytes(), "\r\n"); len(got) != 40_000 || got[0] != 'k' {
+		t.Fatalf("read %d bytes", len(got))
+	}
+	in.wipe()
+	dst.wipe()
+	for i, b := range dst.b {
+		if b != 0 {
+			t.Fatalf("byte %d of the secret buffer survives a wipe", i)
+		}
+	}
+	if !bytes.Equal(in.buf[:], make([]byte, len(in.buf))) {
+		t.Error("the input buffer survives a wipe")
+	}
+}
+
+func TestSecretReaderLines(t *testing.T) {
+	long := strings.Repeat("x", 10_000) // longer than the input buffer
+	in := &secretReader{r: strings.NewReader("one\r\ntwo\n" + long + "\nlast")}
+	dst := newSecretBuf()
+	for i, want := range []string{"one", "two", long, "last"} {
+		if err := in.line(dst); err != nil || string(dst.bytes()) != want {
+			t.Fatalf("line %d: %q, %v", i, truncate(dst.bytes()), err)
+		}
+	}
+	if err := in.line(dst); !errors.Is(err, io.EOF) {
+		t.Errorf("past the end: %v", err)
+	}
+
+	atMax := strings.Repeat("y", maxSecretBytes)
+	if err := (&secretReader{r: strings.NewReader(atMax + "\n")}).line(dst); err != nil || dst.n != maxSecretBytes {
+		t.Errorf("a secret of exactly %d bytes: %d, %v", maxSecretBytes, dst.n, err)
+	}
+	if err := (&secretReader{r: strings.NewReader(atMax + "y\n")}).line(dst); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("one byte more: %v", err)
+	}
+	if err := (&secretReader{r: strings.NewReader(atMax + "y")}).all(dst); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("piped, one byte more: %v", err)
+	}
+}
+
+func truncate(b []byte) string {
+	if len(b) > 20 {
+		return string(b[:20]) + "..."
+	}
+	return string(b)
 }

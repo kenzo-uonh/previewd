@@ -17,9 +17,10 @@ package api
 // names a commit, and a head already queued or running is not rebuilt.
 //
 // Both routes are off unless PREVIEWD_TRIGGER_API=1. Every request is rate
-// limited before it is authenticated (a token guessed at the rate the
-// bucket allows is guessed never), then authenticated by a bearer token from
-// a systemd credential, compared in constant time.
+// limited, per peer address, before it is authenticated (a token guessed at
+// the rate the bucket allows is guessed never, and a stranger drains only
+// its own allowance), then authenticated by a bearer token from a systemd
+// credential, compared in constant time.
 
 import (
 	"bytes"
@@ -33,6 +34,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,9 +49,12 @@ import (
 const (
 	// maxTriggerBody bounds a trigger request.
 	maxTriggerBody = 4 << 10
-	// Rate limits: a pipeline triggers once and polls every few seconds.
+	// Rate limits, per peer address: a pipeline triggers once and polls
+	// every few seconds.
 	triggerBurst, triggerEvery = 10, 6 * time.Second
 	statusBurst, statusEvery   = 120, 500 * time.Millisecond
+	// maxLimitedPeers bounds the peers a limiter remembers.
+	maxLimitedPeers = 4096
 )
 
 // Heads is the forge truth a trigger is built from: the request's head now
@@ -70,8 +75,8 @@ type trigger struct {
 	digest  [sha256.Size]byte
 	heads   Heads
 	envs    Environments
-	deploys *bucket
-	reads   *bucket
+	deploys *peerLimiter
+	reads   *peerLimiter
 }
 
 // WithTrigger enables the trigger API (PREVIEWD_TRIGGER_API=1) under token,
@@ -89,7 +94,7 @@ func WithTrigger(token []byte, heads Heads, envs Environments) Option {
 		s.triggerErr = err
 		s.trigger = &trigger{
 			digest: digest, heads: heads, envs: envs,
-			deploys: newBucket(triggerBurst, triggerEvery), reads: newBucket(statusBurst, statusEvery),
+			deploys: newPeerLimiter(triggerBurst, triggerEvery), reads: newPeerLimiter(statusBurst, statusEvery),
 		}
 	}
 }
@@ -106,28 +111,67 @@ func checkTriggerToken(token []byte) error {
 	return nil
 }
 
-// bucket is a token bucket: burst requests at once, one more every refill.
-// It starts full, at its first request.
-type bucket struct {
+// peerLimiter is a token bucket per peer address: each peer may make burst
+// requests at once, then one more every refill. A peer is the TCP peer
+// (nothing forwarded is believed), so a source that floods the API drains its
+// own bucket and nobody else's: the CI runner keeps its allowance while an
+// unauthenticated stranger is refused. A peer that is not an address shares
+// the zero address's bucket.
+//
+// The table is bounded. A peer whose bucket is full again is
+// indistinguishable from an unknown one and is forgotten; if maxLimitedPeers
+// peers are all still drained, a new peer is refused (fail closed) until one
+// of them refills.
+type peerLimiter struct {
 	mu     sync.Mutex
-	tokens float64
 	burst  float64
 	refill time.Duration
+	peers  map[netip.Addr]*peerBucket
+}
+
+type peerBucket struct {
+	tokens float64
 	last   time.Time
 }
 
-func newBucket(burst int, refill time.Duration) *bucket {
-	return &bucket{tokens: float64(burst), burst: float64(burst), refill: refill}
+func newPeerLimiter(burst int, refill time.Duration) *peerLimiter {
+	return &peerLimiter{burst: float64(burst), refill: refill, peers: map[netip.Addr]*peerBucket{}}
 }
 
-func (b *bucket) take(now time.Time) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.last.IsZero() {
-		b.last = now
+// peerOf is the address of the TCP peer of r, IPv4-mapped IPv6 unmapped; the
+// zero address when it cannot be read.
+func peerOf(r *http.Request) netip.Addr {
+	ap, err := netip.ParseAddrPort(r.RemoteAddr)
+	if err != nil {
+		return netip.Addr{}
 	}
+	return ap.Addr().Unmap()
+}
+
+// refilled is b's tokens at now, without storing them.
+func (l *peerLimiter) refilled(b *peerBucket, now time.Time) float64 {
 	if elapsed := now.Sub(b.last); elapsed > 0 {
-		b.tokens = min(b.burst, b.tokens+float64(elapsed)/float64(b.refill))
+		return min(l.burst, b.tokens+float64(elapsed)/float64(l.refill))
+	}
+	return b.tokens
+}
+
+func (l *peerLimiter) take(peer netip.Addr, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, known := l.peers[peer]
+	if !known {
+		if len(l.peers) >= maxLimitedPeers {
+			l.forgetIdle(now)
+		}
+		if len(l.peers) >= maxLimitedPeers {
+			return false
+		}
+		b = &peerBucket{tokens: l.burst, last: now}
+		l.peers[peer] = b
+	}
+	b.tokens = l.refilled(b, now)
+	if now.After(b.last) {
 		b.last = now
 	}
 	if b.tokens < 1 {
@@ -137,10 +181,19 @@ func (b *bucket) take(now time.Time) bool {
 	return true
 }
 
-// guarded rate-limits by b, then requires the trigger token.
-func (s *Server) guarded(b *bucket, next http.HandlerFunc) http.HandlerFunc {
+// forgetIdle drops every peer whose bucket is full again.
+func (l *peerLimiter) forgetIdle(now time.Time) {
+	for peer, b := range l.peers {
+		if l.refilled(b, now) >= l.burst {
+			delete(l.peers, peer)
+		}
+	}
+}
+
+// guarded rate-limits the peer by l, then requires the trigger token.
+func (s *Server) guarded(l *peerLimiter, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !b.take(s.now()) {
+		if !l.take(peerOf(r), s.now()) {
 			w.Header().Set("Retry-After", "10")
 			http.Error(w, "rate limited", http.StatusTooManyRequests)
 			return
@@ -221,6 +274,12 @@ func (s *Server) handleTrigger() http.HandlerFunc {
 		}
 		log := s.logger.With("origin", "trigger", "repository", req.Repository, "pr_number", req.PullRequest)
 
+		// The intent is ordered by the instant it was received, before the
+		// forge is read: a close that lands between that read and the
+		// enqueue carries a later instant, so its teardown supersedes this
+		// deploy (or, enqueued first, makes this one stale).
+		received := s.now()
+
 		ctx, cancel := context.WithTimeout(r.Context(), ghesTimeout)
 		head, err := s.trigger.heads.PullRequestHead(ctx, req.Repository, req.PullRequest)
 		cancel()
@@ -253,7 +312,7 @@ func (s *Server) handleTrigger() http.HandlerFunc {
 			return
 		}
 
-		d, err := s.triggerDelivery(req.Repository, req.PullRequest, envID, head, body)
+		d, err := s.triggerDelivery(req.Repository, req.PullRequest, envID, head, body, received)
 		if err != nil {
 			log.Error("Trigger refused", "error", err)
 			s.answer(w, http.StatusInternalServerError, triggerReply{Status: "error"})
@@ -292,7 +351,7 @@ func intends(latest store.Job, commit string) bool {
 // by the time this host received the request (validate.SeqAt), under a
 // delivery ID and a payload digest of its own (a random nonce: two triggers
 // are two intents, never replays of each other).
-func (s *Server) triggerDelivery(repo string, number uint32, envID string, head vcs.Head, body []byte) (store.Delivery, error) {
+func (s *Server) triggerDelivery(repo string, number uint32, envID string, head vcs.Head, body []byte, received time.Time) (store.Delivery, error) {
 	var nonce [16]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return store.Delivery{}, err
@@ -302,7 +361,6 @@ func (s *Server) triggerDelivery(repo string, number uint32, envID string, head 
 	if len(opener) > maxRecordedLogin {
 		opener = "user-" + strconv.FormatInt(head.Author.ID, 10)
 	}
-	received := s.now()
 	return store.Delivery{
 		ID: "trigger-" + hex.EncodeToString(nonce[:]), PayloadSHA256: hex.EncodeToString(sum[:]), EnvID: envID,
 		Type: store.JobDeploy, Seq: validate.SeqAt(received), ReceivedAt: received,
@@ -351,7 +409,7 @@ func (s *Server) triggerRoutes(mux *http.ServeMux, logger *slog.Logger) {
 	if s.trigger == nil {
 		return
 	}
-	source := SourceFilter(s.cfg.TriggerAllowedCIDRs, logger)
+	source := SourceFilter(s.cfg.TriggerAllowedCIDRs, logger, "Trigger API request", "PREVIEWD_TRIGGER_ALLOWED_CIDRS")
 	mux.Handle("POST /api/v1/trigger", source(s.guarded(s.trigger.deploys, s.handleTrigger())))
 	mux.Handle("GET /api/v1/status/{envid}", source(s.guarded(s.trigger.reads, s.handleStatus())))
 }

@@ -99,10 +99,11 @@ func TLSConfig(r *CertReloader) *tls.Config {
 }
 
 // SourceFilter refuses, with 403 and before the body is read, a peer whose
-// address is not in allowed (PREVIEWD_WEBHOOK_ALLOWED_CIDRS). No prefix
-// allows every source. The peer is the TCP peer: no forwarding header is
-// believed.
-func SourceFilter(allowed []netip.Prefix, logger *slog.Logger) func(http.Handler) http.Handler {
+// address is not in allowed. No prefix allows every source. The peer is the
+// TCP peer: no forwarding header is believed. what names the guarded
+// requests and key the setting that holds allowed, for the log line
+// ("Webhook", "PREVIEWD_WEBHOOK_ALLOWED_CIDRS").
+func SourceFilter(allowed []netip.Prefix, logger *slog.Logger, what, key string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		if len(allowed) == 0 {
 			return next
@@ -113,7 +114,7 @@ func SourceFilter(allowed []netip.Prefix, logger *slog.Logger) func(http.Handler
 				next.ServeHTTP(w, r)
 				return
 			}
-			logger.Error("Webhook refused: source outside PREVIEWD_WEBHOOK_ALLOWED_CIDRS", "remote_addr", r.RemoteAddr)
+			logger.Error(what+" refused: source outside "+key, "remote_addr", r.RemoteAddr)
 			// Close the connection: the unread body is never consumed.
 			w.Header().Set("Connection", "close")
 			http.Error(w, "source not allowed", http.StatusForbidden)

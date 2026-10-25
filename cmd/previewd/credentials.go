@@ -11,7 +11,6 @@ package main
 // $CREDENTIALS_DIRECTORY at start.
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -61,7 +60,9 @@ const credentialsUsage = `usage:
 // credentialsHost is what setup-credentials asks of the machine. Tests
 // supply their own.
 type credentialsHost struct {
-	lockMemory func() error
+	// noCoreDumps makes the process undumpable (hardening.DisableCoreDumps).
+	noCoreDumps func() error
+	lockMemory  func() error
 	// hideInput turns off stdin's echo when it is a terminal.
 	hideInput func() (restore func() error, terminal bool, err error)
 	// encrypt runs systemd-creds with args, secret on its standard input.
@@ -70,6 +71,7 @@ type credentialsHost struct {
 
 func newCredentialsHost() credentialsHost {
 	return credentialsHost{
+		noCoreDumps: hardening.DisableCoreDumps,
 		lockMemory: func() error {
 			if err := raiseMemlock(); err != nil {
 				return err
@@ -143,7 +145,11 @@ func credentialsCommand(ctx context.Context, args []string, stdin io.Reader, out
 			return fail("%v", err)
 		}
 	}
-	// Secrets are about to be read: memory is locked first, as the daemon's.
+	// Secrets are about to be read: no core file may hold one, and memory is
+	// locked first, as the daemon's.
+	if err := host.noCoreDumps(); err != nil {
+		return fail("disable core dumps: %v", err)
+	}
 	if err := host.lockMemory(); err != nil {
 		return fail("lock memory (run as root): %v", err)
 	}
@@ -165,24 +171,31 @@ func credentialsCommand(ctx context.Context, args []string, stdin io.Reader, out
 	if !terminal && len(names) != 1 {
 		return fail("a piped secret is read to its end: name one credential per run")
 	}
-	in := bufio.NewReaderSize(stdin, 4096)
+	// One input buffer and two secret buffers, allocated once and wiped on
+	// every way out: no copy of a secret is left behind by a growing slice.
+	in := &secretReader{r: stdin}
+	first, second := newSecretBuf(), newSecretBuf()
+	defer func() {
+		in.wipe()
+		first.wipe()
+		second.wipe()
+	}()
 	for i, name := range names {
 		if terminal && i > 0 {
 			if restore, _, err = host.hideInput(); err != nil {
 				return fail("%v", err)
 			}
 		}
-		secret, err := readSecret(in, terminal, name, diag)
+		err := readSecret(in, first, second, terminal, name, diag)
 		if terminal {
 			// The echo is back before anything else runs.
 			err = errors.Join(err, restore())
 		}
 		if err != nil {
-			clear(secret)
 			return fail("%s: %v", name, err)
 		}
-		err = encryptOne(ctx, host, *dir, name, *withKey, secret)
-		clear(secret)
+		err = encryptOne(ctx, host, *dir, name, *withKey, first.bytes())
+		first.wipe()
 		if err != nil {
 			return fail("%s: %v", name, err)
 		}
@@ -195,66 +208,136 @@ func credentialsCommand(ctx context.Context, args []string, stdin io.Reader, out
 	return exitOK
 }
 
-// readSecret reads one secret: on a terminal, a line typed twice (both must
-// match), without echo; from a pipe, everything up to its end. Empty is
-// refused, and so is more than maxSecretBytes.
-func readSecret(in *bufio.Reader, terminal bool, name string, diag *console) ([]byte, error) {
-	if !terminal {
-		data, err := io.ReadAll(io.LimitReader(in, maxSecretBytes+1))
-		switch {
-		case err != nil:
-			clear(data)
-			return nil, fmt.Errorf("read the secret: %w", err)
-		case len(data) > maxSecretBytes:
-			clear(data)
-			return nil, fmt.Errorf("the secret exceeds %d bytes", maxSecretBytes)
-		}
-		secret := bytes.TrimRight(data, "\r\n")
-		if len(secret) == 0 {
-			clear(data)
-			return nil, errors.New("the secret is empty")
-		}
-		return secret, nil
-	}
-	diag.printf("%s (input hidden): ", name)
-	first, err := readLine(in)
-	diag.printf("\n%s again: ", name)
-	if err != nil {
-		return nil, err
-	}
-	second, err := readLine(in)
-	diag.printf("\n")
-	defer clear(second)
-	switch {
-	case err != nil:
-		clear(first)
-		return nil, err
-	case len(first) == 0:
-		return nil, errors.New("the secret is empty")
-	case !bytes.Equal(first, second):
-		clear(first)
-		return nil, errors.New("the two entries differ")
-	}
-	return first, nil
+// secretBuf holds one secret in a buffer allocated once, with room for
+// maxSecretBytes and one byte more (to tell a secret that is too large).
+type secretBuf struct {
+	b []byte
+	n int
 }
 
-// readLine reads one line without its line break, bounded.
-func readLine(in *bufio.Reader) ([]byte, error) {
-	var line []byte
+func newSecretBuf() *secretBuf { return &secretBuf{b: make([]byte, maxSecretBytes+1)} }
+
+func (s *secretBuf) bytes() []byte { return s.b[:s.n] }
+
+// wipe clears the whole buffer, not only the secret's length.
+func (s *secretBuf) wipe() {
+	clear(s.b)
+	s.n = 0
+}
+
+// secretReader reads the secrets from r through one fixed buffer that wipe
+// clears (a bufio.Reader's buffer cannot be).
+type secretReader struct {
+	r        io.Reader
+	buf      [4096]byte
+	off, end int
+}
+
+func (s *secretReader) wipe() {
+	clear(s.buf[:])
+	s.off, s.end = 0, 0
+}
+
+func (s *secretReader) fill() error {
+	n, err := s.r.Read(s.buf[:])
+	s.off, s.end = 0, n
+	switch {
+	case n > 0:
+		return nil
+	case err != nil:
+		return err
+	}
+	return io.ErrNoProgress
+}
+
+// line reads one line into dst without its line break, bounded.
+func (s *secretReader) line(dst *secretBuf) error {
+	dst.n = 0
 	for {
-		chunk, isPrefix, err := in.ReadLine()
-		line = append(line, chunk...)
+		if s.off == s.end {
+			if err := s.fill(); err != nil {
+				if errors.Is(err, io.EOF) && dst.n > 0 {
+					return nil
+				}
+				return fmt.Errorf("read the secret: %w", err)
+			}
+		}
+		chunk := s.buf[s.off:s.end]
+		i := bytes.IndexByte(chunk, '\n')
+		if i >= 0 {
+			chunk = chunk[:i]
+		}
+		if dst.n+len(chunk) > maxSecretBytes {
+			return fmt.Errorf("the secret exceeds %d bytes", maxSecretBytes)
+		}
+		dst.n += copy(dst.b[dst.n:], chunk)
+		if i >= 0 {
+			s.off += i + 1
+			dst.n = len(bytes.TrimRight(dst.bytes(), "\r"))
+			return nil
+		}
+		s.off = s.end
+	}
+}
+
+// all reads everything up to the end of r into dst.
+func (s *secretReader) all(dst *secretBuf) error {
+	dst.n = copy(dst.b, s.buf[s.off:s.end])
+	s.off = s.end
+	for dst.n <= maxSecretBytes {
+		n, err := s.r.Read(dst.b[dst.n:])
+		dst.n += n
 		switch {
+		case errors.Is(err, io.EOF):
+			if dst.n > maxSecretBytes {
+				return fmt.Errorf("the secret exceeds %d bytes", maxSecretBytes)
+			}
+			return nil
 		case err != nil:
-			clear(line)
-			return nil, fmt.Errorf("read the secret: %w", err)
-		case len(line) > maxSecretBytes:
-			clear(line)
-			return nil, fmt.Errorf("the secret exceeds %d bytes", maxSecretBytes)
-		case !isPrefix:
-			return line, nil
+			return fmt.Errorf("read the secret: %w", err)
 		}
 	}
+	return fmt.Errorf("the secret exceeds %d bytes", maxSecretBytes)
+}
+
+// readSecret reads one secret into first: on a terminal, a line typed twice
+// (both must match, the second goes through second), without echo; from a
+// pipe, everything up to its end. Empty is refused, and so is more than
+// maxSecretBytes. On any error first is wiped.
+func readSecret(in *secretReader, first, second *secretBuf, terminal bool, name string, diag *console) error {
+	if !terminal {
+		if err := in.all(first); err != nil {
+			first.wipe()
+			return err
+		}
+		first.n = len(bytes.TrimRight(first.bytes(), "\r\n"))
+		if first.n == 0 {
+			first.wipe()
+			return errors.New("the secret is empty")
+		}
+		return nil
+	}
+	diag.printf("%s (input hidden): ", name)
+	err := in.line(first)
+	diag.printf("\n%s again: ", name)
+	if err != nil {
+		first.wipe()
+		return err
+	}
+	err = in.line(second)
+	diag.printf("\n")
+	defer second.wipe()
+	switch {
+	case err != nil:
+		first.wipe()
+		return err
+	case first.n == 0:
+		return errors.New("the secret is empty")
+	case !bytes.Equal(first.bytes(), second.bytes()):
+		first.wipe()
+		return errors.New("the two entries differ")
+	}
+	return nil
 }
 
 // encryptOne encrypts secret into dir/name through a temporary file in dir,

@@ -152,7 +152,7 @@ func TestSecretsMountUnitIsRamfs(t *testing.T) {
 
 func TestDaemonUnitIsOrderedAfterWhatItVerifies(t *testing.T) {
 	unit := deploymentFile(t, "previewd.service")
-	for _, want := range []string{"RequiresMountsFor=/run/previewd/secrets", "LimitMEMLOCK=infinity"} {
+	for _, want := range []string{"RequiresMountsFor=/run/previewd/secrets", "LimitMEMLOCK=infinity", "LimitCORE=0"} {
 		found := false
 		for _, d := range directives(unit) {
 			found = found || d == want

@@ -133,7 +133,7 @@ func (s *Server) Routes() http.Handler {
 	// daemon: the other's route does not exist.
 	s.triggerRoutes(mux, s.logger)
 
-	source := SourceFilter(s.cfg.WebhookAllowedCIDRs, s.logger)
+	source := SourceFilter(s.cfg.WebhookAllowedCIDRs, s.logger, "Webhook", "PREVIEWD_WEBHOOK_ALLOWED_CIDRS")
 	switch s.cfg.VCSProvider {
 	case vcs.ProviderGitLab:
 		mux.Handle("POST /webhooks/gitlab", source(VerifyWebhook(s.provider, s.secret)(http.HandlerFunc(s.handleGitLabWebhook()))))

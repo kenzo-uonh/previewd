@@ -72,6 +72,13 @@ func main() {
 		"docker_host", cfg.DockerHost,
 	)
 
+	// No core file may ever hold a secret: refused unless verified, before
+	// any secret is read (the unit also sets LimitCORE=0).
+	if err := hardening.DisableCoreDumps(); err != nil {
+		logger.Error("Core dump suppression refused", "error", err)
+		os.Exit(1)
+	}
+
 	// Lock memory before any secret is read into it.
 	if err := hardening.LockMemory(); err != nil {
 		if !cfg.AllowUnlockedMemory {

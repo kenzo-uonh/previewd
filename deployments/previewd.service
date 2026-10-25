@@ -54,6 +54,10 @@ RestartSec=5s
 # The daemon locks all memory before reading any secret and refuses to start
 # unless RLIMIT_MEMLOCK is unlimited.
 LimitMEMLOCK=infinity
+# No core file: a crash must not write the secrets held in memory to disk.
+# The daemon also sets RLIMIT_CORE and the dumpable flag itself and refuses
+# to start unless it can verify both.
+LimitCORE=0
 
 # Read by name from $CREDENTIALS_DIRECTORY, never from the environment.
 LoadCredentialEncrypted=webhook_secret:/etc/credstore.encrypted/webhook_secret

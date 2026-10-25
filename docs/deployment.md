@@ -131,6 +131,7 @@ PREVIEWD_BUILDKIT_CGROUP=/sys/fs/cgroup/previewd.slice/previewd-builds.slice
 
 - Seal the webhook secret, the GitHub App key and the listener's TLS key as systemd credentials and pass them to the unit by name: see [Credentials](configuration.md#credentials). None of them is ever read from the environment or a configured path. `deployments/previewd.service` loads `webhook_secret` and `github-app-key` from `/etc/credstore.encrypted/`, and systemd refuses to start it while either file is missing; add the TLS key credential in the drop-in, it has no default name.
 - Set `LimitMEMLOCK=infinity` in the unit (`deployments/previewd.service` does). The daemon locks all current and future memory before reading any secret and refuses to start unless `RLIMIT_MEMLOCK` is unlimited ([`PREVIEWD_ALLOW_UNLOCKED_MEMORY`](configuration.md#previewd_allow_unlocked_memory)).
+- No core file may hold a secret. The unit sets `LimitCORE=0`; the daemon, and `previewd setup-credentials`, also set `RLIMIT_CORE` to 0 (soft and hard) and the process undumpable (`PR_SET_DUMPABLE`) before reading any secret, read both back, and refuse to start (or to run) unless they hold. There is no opt-in.
 
 ## 7. GitHub Enterprise Server
 
