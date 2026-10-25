@@ -452,7 +452,9 @@ func containerSpec(env Environment, limits Limits) (*container.Config, *containe
 	}
 	if env.Compose != nil {
 		// Non-secret settings of the PR's compose file: its secrets travel by
-		// the ramfs mount only.
+		// the ramfs mount only. parseEnv admits literal KEY=value pairs only:
+		// no interpolation, no host inheritance, no env_file.
+		// nosemgrep: semgrep.previewd-no-container-env
 		cfg.Env = slices.Clone(env.Compose.Primary.Env)
 		cfg.Cmd = slices.Clone(env.Compose.Primary.Command)
 		hostCfg.Mounts = append(hostCfg.Mounts, volumeMounts(env.ID, env.Compose.Primary.Mounts)...)
@@ -512,6 +514,9 @@ func sidecarSpec(env Environment, svc ComposeService, imageID string, limits Lim
 		return nil, nil, fmt.Errorf("environment %s: %w", env.ID, err)
 	}
 	pids := limits.Pids
+	// Env holds the literal, non-secret settings of the PR's compose file (see
+	// parseEnv); a sidecar gets no secrets mount.
+	// nosemgrep: semgrep.previewd-no-container-env
 	cfg := &container.Config{
 		Image: imageID,
 		Env:   slices.Clone(svc.Env),
