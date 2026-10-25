@@ -93,6 +93,15 @@ type Config struct {
 	ComposeEnabled     bool
 	ComposeMaxServices int
 
+	// HTTP ingress activity sensing (V1.2 spec 3.3). ActivitySensing is
+	// PREVIEWD_ACTIVITY_SENSING (on unless exactly 0): the daemon reads
+	// Traefik's per-router request counters at TraefikMetricsAddr,
+	// PREVIEWD_TRAEFIK_METRICS_ADDR (default 172.30.255.2:8082, the metrics
+	// entry point of deployments/traefik.yml), and records when each
+	// environment last served a request.
+	ActivitySensing    bool
+	TraefikMetricsAddr netip.AddrPort
+
 	// WebhookSecretCredential names the systemd credential holding the
 	// webhook HMAC secret: read from $CREDENTIALS_DIRECTORY, never from the
 	// environment or a configured path.
@@ -191,6 +200,10 @@ const defaultRoutesDir = "/var/lib/previewd/routes"
 
 // defaultTraefikContainer is the container_name in deployments/docker-compose.yml.
 const defaultTraefikContainer = "traefik-proxy"
+
+// defaultTraefikMetricsAddr is the metrics entry point of
+// deployments/traefik.yml: the proxy's address on previewd-proxy.
+const defaultTraefikMetricsAddr = "172.30.255.2:8082"
 
 // Defaults `previewd doctor` applies to the keys it reads without loading
 // the whole configuration. DefaultBuildCgroup is the subtree of
@@ -396,6 +409,14 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	activity, err := onUnlessZero("PREVIEWD_ACTIVITY_SENSING")
+	if err != nil {
+		return nil, err
+	}
+	metricsAddr, err := addrPort("PREVIEWD_TRAEFIK_METRICS_ADDR", defaultTraefikMetricsAddr)
+	if err != nil {
+		return nil, err
+	}
 	if os.Getenv("PREVIEWD_ENV_TTL") != "0" {
 		if envTTL, err = boundedDuration("PREVIEWD_ENV_TTL", defaultEnvTTL, minEnvTTL, maxEnvTTL); err != nil {
 			return nil, fmt.Errorf("%w (or 0 to disable)", err)
@@ -501,6 +522,9 @@ func Load() (*Config, error) {
 
 		ComposeEnabled:     composeEnabled,
 		ComposeMaxServices: composeServices,
+
+		ActivitySensing:    activity,
+		TraefikMetricsAddr: metricsAddr,
 
 		WebhookSecretCredential: webhookSecretCred,
 		VCSProvider:             provider,
@@ -633,15 +657,33 @@ func boundedCount(name string, def, lo, hi int) (int, error) {
 // non-empty value is a configuration error.
 // feedbackSwitch reads PREVIEWD_FEEDBACK: on when unset or 1, off when
 // exactly 0, an error otherwise.
-func feedbackSwitch() (bool, error) {
-	switch v := os.Getenv("PREVIEWD_FEEDBACK"); v {
+func feedbackSwitch() (bool, error) { return onUnlessZero("PREVIEWD_FEEDBACK") }
+
+// onUnlessZero reads a switch that is on by default: on when unset or 1,
+// off when exactly 0, an error otherwise.
+func onUnlessZero(name string) (bool, error) {
+	switch v := os.Getenv(name); v {
 	case "", "1":
 		return true, nil
 	case "0":
 		return false, nil
 	default:
-		return false, fmt.Errorf("invalid PREVIEWD_FEEDBACK %q: set exactly 0 or 1, or leave unset", v)
+		return false, fmt.Errorf("invalid %s %q: set exactly 0 or 1, or leave unset", name, v)
 	}
+}
+
+// addrPort reads an IP:PORT literal, def when unset: an IP address (no host
+// name, no zone, not unspecified) and a non-zero port.
+func addrPort(name, def string) (netip.AddrPort, error) {
+	v := os.Getenv(name)
+	if v == "" {
+		v = def
+	}
+	a, err := netip.ParseAddrPort(v)
+	if err != nil || a.Port() == 0 || a.Addr().IsUnspecified() || a.Addr().Zone() != "" {
+		return netip.AddrPort{}, fmt.Errorf("invalid %s %q: want IP:PORT, an IP literal and a non-zero port", name, v)
+	}
+	return a, nil
 }
 
 // previewScheme reads PREVIEWD_PREVIEW_URL_SCHEME: http (default) or https.

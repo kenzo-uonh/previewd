@@ -168,9 +168,11 @@ func subcommand() (code int, ran bool) {
 		return runBackup(context.Background(), os.Args[2:], os.Stdout, os.Stderr), true
 	case "restore":
 		return runRestore(context.Background(), os.Args[2:], os.Stdout, os.Stderr), true
+	case "list", "status":
+		return runStatus(context.Background(), os.Args[1], os.Args[2:], os.Stdout, os.Stderr, time.Now), true
 	default:
 		diag := &console{w: os.Stderr}
-		diag.printf("previewd: unknown command %q (run without arguments to start the daemon)\n%s%s%s%s", os.Args[1], auditUsage, buildProbeUsage, doctorUsage, backupUsage)
+		diag.printf("previewd: unknown command %q (run without arguments to start the daemon)\n%s%s%s%s%s", os.Args[1], auditUsage, buildProbeUsage, doctorUsage, backupUsage, statusUsage)
 		return exitUsage, true
 	}
 }

@@ -39,6 +39,11 @@ const (
 	defaultProbePort  = 9
 	// freeDiskTimeout bounds the startup read of the free-disk floor.
 	freeDiskTimeout = 10 * time.Second
+	// activityReadInterval is how often Traefik's request counters are read;
+	// activityFlushTick how often the tap looks for activity to write (each
+	// environment is written at most once a minute whatever these are).
+	activityReadInterval = 15 * time.Second
+	activityFlushTick    = 5 * time.Second
 )
 
 func main() {
@@ -291,6 +296,28 @@ func main() {
 	}
 	logger.Info("Maintenance loop running", "interval", cfg.PruneInterval, "retention", cfg.Retention, "batch", cfg.PruneBatch,
 		"env_ttl", cfg.EnvTTL)
+	// Ingress activity sensing (V1.2 spec 3.3): Traefik's per-router request
+	// counters, read on a timer, coalesced into at most one write per
+	// environment per minute. Information for operators, not a control: a
+	// proxy whose metrics cannot be read is logged, and nothing else changes.
+	if cfg.ActivitySensing {
+		tap, err := proxy.NewActivityTap(db, func(err error) bool { return errors.Is(err, store.ErrNoJob) }, logger)
+		if err != nil {
+			logger.Error("Activity tap refused", "error", err)
+			os.Exit(1)
+		}
+		counters, err := proxy.NewTraefikMetrics(cfg.TraefikMetricsAddr, tap, logger)
+		if err != nil {
+			logger.Error("Traefik metrics refused", "metrics_addr", cfg.TraefikMetricsAddr, "error", err)
+			os.Exit(1)
+		}
+		background.Go(func() { tap.Run(ctx, activityFlushTick) })
+		background.Go(func() { counters.Run(ctx, activityReadInterval) })
+		logger.Info("Ingress activity sensing armed", "metrics_addr", cfg.TraefikMetricsAddr,
+			"read_interval", activityReadInterval, "write_interval", proxy.ActivityFlushInterval)
+	} else {
+		logger.Info("Ingress activity sensing off", "setting", "PREVIEWD_ACTIVITY_SENSING=0")
+	}
 	apiServer, err := api.NewServer(logger, cfg, webhookSecret, db, reconciler, vcsForge.github, vcsForge.options...)
 	if err != nil {
 		logger.Error("API server refused", "error", err)

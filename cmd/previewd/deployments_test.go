@@ -69,6 +69,18 @@ func TestProxyUnitMatchesTheComposeProxy(t *testing.T) {
 	if !strings.Contains(traefik, `"172.30.255.2:80"`) {
 		t.Error("traefik.yml no longer binds the address the unit gives the container")
 	}
+	// The metrics entry point (ingress activity sensing) binds the proxy's
+	// address too, carries router labels, and is published nowhere.
+	for _, want := range []string{`address: "172.30.255.2:8082"`, "entryPoint: metrics", "addRoutersLabels: true"} {
+		if !strings.Contains(traefik, want) {
+			t.Errorf("traefik.yml lacks %s", want)
+		}
+	}
+	for name, file := range map[string]string{"previewd-proxy.service": unit, "docker-compose.yml": compose} {
+		if strings.Contains(file, "8082") {
+			t.Errorf("%s publishes the metrics entry point", name)
+		}
+	}
 }
 
 func TestProxyUnitIsolation(t *testing.T) {
@@ -164,5 +176,22 @@ func TestSysctlDropIn(t *testing.T) {
 	settings := directives(deploymentFile(t, "99-previewd.conf"))
 	if len(settings) != 1 || settings[0] != "-kernel.unprivileged_userns_clone = 1" {
 		t.Errorf("settings = %q; want only the (failure-tolerant) userns knob", settings)
+	}
+}
+
+// The daemon's egress filter stays closed but for loopback and the proxy's
+// one address (its metrics entry point): never the proxy network, never
+// any.
+func TestDaemonUnitEgressAllowsOnlyTheProxyAddress(t *testing.T) {
+	var allowed []string
+	denyAny := false
+	for _, d := range directives(deploymentFile(t, "previewd.service")) {
+		if v, ok := strings.CutPrefix(d, "IPAddressAllow="); ok {
+			allowed = append(allowed, v)
+		}
+		denyAny = denyAny || d == "IPAddressDeny=any"
+	}
+	if !denyAny || strings.Join(allowed, ",") != "localhost,172.30.255.2/32" {
+		t.Errorf("deny any %v, allowed %v; want deny any, then localhost and 172.30.255.2/32 only", denyAny, allowed)
 	}
 }

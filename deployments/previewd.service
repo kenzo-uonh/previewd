@@ -66,8 +66,12 @@ LoadCredentialEncrypted=github-app-key:/etc/credstore.encrypted/github-app-key
 #   [Service]
 #   IPAddressAllow=10.20.0.10/32
 # The Engine API is a Unix socket and is unaffected. Needs cgroup v2.
+# 172.30.255.2 is the proxy on previewd-proxy (docker-compose.yml,
+# previewd-proxy.service): the daemon reads Traefik's request counters
+# there (PREVIEWD_TRAEFIK_METRICS_ADDR, V1.2 ingress activity sensing).
 IPAddressDeny=any
 IPAddressAllow=localhost
+IPAddressAllow=172.30.255.2/32
 
 NoNewPrivileges=yes
 PrivateTmp=yes
