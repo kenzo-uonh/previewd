@@ -203,6 +203,7 @@ func FuzzPreflight(f *testing.F) {
 		"FROM " + pinned + "\nRUN true\n",
 		"ARG B=" + pinned + "\nFROM $B AS b\nFROM b\nCOPY --from=b / /\n",
 		"FROM " + pinned + "\nADD https://example.invalid/x /x\n",
+		"FROM scratch\nADD app ://\n",
 		"# syntax=x\nFROM " + pinned + "\n",
 		"FROM " + pinned + "\nRUN --network=host true\n",
 		"FROM ${TARGETARCH:-" + pinned + "}\n",
@@ -241,9 +242,15 @@ func FuzzPreflight(f *testing.F) {
 					}
 				}
 			case "add":
+				// The last argument is the destination, a path in the image:
+				// only the sources are fetched.
+				var args []string
 				for a := n.Next; a != nil; a = a.Next {
-					if strings.Contains(a.Value, "://") {
-						t.Fatalf("accepted ADD %q", a.Value)
+					args = append(args, a.Value)
+				}
+				for _, src := range args[:max(len(args)-1, 0)] {
+					if strings.Contains(src, "://") {
+						t.Fatalf("accepted ADD %q", src)
 					}
 				}
 			}
