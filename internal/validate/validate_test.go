@@ -39,3 +39,16 @@ func TestQuoteEscapesAndBounds(t *testing.T) {
 		t.Fatalf("Quote output does not report the input size: %s", got)
 	}
 }
+
+func TestEnvName(t *testing.T) {
+	for _, ok := range []string{"A", "_A", "DATABASE_URL", "pg_host2", strings.Repeat("A", 128)} {
+		if err := EnvName(ok); err != nil {
+			t.Errorf("EnvName(%q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "1A", "A B", "A=B", "A-B", "A\x00", "É", strings.Repeat("A", 129), "A\n"} {
+		if err := EnvName(bad); err == nil {
+			t.Errorf("EnvName(%q) accepted", bad)
+		}
+	}
+}

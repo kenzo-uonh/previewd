@@ -60,8 +60,8 @@ var schemaAllowlist = map[string]map[string]string{
 		"commit_sha":     "TEXT",    // approved commit (40 or 64 hex)
 		"approver_login": "TEXT",    // approver's GitHub login, audit only (matched on approver_id)
 		"approver_id":    "INTEGER", // approver's numeric GitHub ID
-		"via":            "TEXT",    // review or label (CHECK)
-		"review_id":      "INTEGER", // GitHub review ID; 0 for a label approval
+		"via":            "TEXT",    // review, label or approval (CHECK)
+		"review_id":      "INTEGER", // GitHub review ID; 0 for a label or a merge request approval
 		"granted_seq":    "INTEGER", // delivery order of the newest grant
 		"granted_at":     "INTEGER", // Unix milliseconds, audit only
 	},

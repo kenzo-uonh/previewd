@@ -60,7 +60,7 @@ func auditDetails(kind AuditKind) (details []string, ok bool) {
 	case AuditTrustedDeploy:
 		return []string{auditDetailWriteAccess}, true
 	case AuditUntrustedDeploy, AuditApprovalGranted:
-		return []string{string(ApprovalViaReview), string(ApprovalViaLabel)}, true
+		return []string{string(ApprovalViaReview), string(ApprovalViaLabel), string(ApprovalViaMR)}, true
 	case AuditApprovalRevoked:
 		return []string{string(RevokedDismissed), string(RevokedChangesRequested), string(RevokedUnlabeled),
 			string(RevokedNewHead), string(RevokedApproverRemoved), string(RevokedPermissionLost),

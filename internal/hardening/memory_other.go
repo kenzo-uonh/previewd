@@ -13,3 +13,8 @@ func LockMemory() error {
 func LockedMemoryKB() (int64, error) {
 	return 0, errors.New("memory locking requires Linux")
 }
+
+// ProbeMlockall fails closed: memory locking is verified on Linux only.
+func ProbeMlockall() error {
+	return errors.New("memory locking requires Linux")
+}

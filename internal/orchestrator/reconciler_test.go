@@ -61,6 +61,8 @@ type hostEngine struct {
 	cache int
 	// free is what FreeDisk reports.
 	free int64
+	// deployed is the Environment of each Deploy call, in order.
+	deployed []Environment
 }
 
 func newHostEngine() *hostEngine {
@@ -179,6 +181,9 @@ func (h *hostEngine) Deploy(_ context.Context, e Environment) (netip.AddrPort, e
 	if err := h.step("deploy"); err != nil {
 		return netip.AddrPort{}, err
 	}
+	h.mu.Lock()
+	h.deployed = append(h.deployed, e)
+	h.mu.Unlock()
 	h.set(e.ID, func(st *EngineState) { st.Running, st.Containers, st.JobID = true, 1, e.JobID })
 	return netip.MustParseAddrPort("172.31.0.2:8080"), nil
 }
@@ -309,11 +314,26 @@ type rig struct {
 	maxBuilds     int
 	buildTimeout  time.Duration
 	pruneInterval time.Duration
+	// clock, when set, replaces the fixed now as the reconciler's clock.
+	clock func() time.Time
 	// Auto-cleanup (V1 F5); 0 for the defaults. buildDir is the rig's own.
 	minFreeDisk int64
 	envTTL      time.Duration
 	disableTTL  bool
 	buildDir    string
+	// Developer feedback (V1.1 spec 3.3); nil is off.
+	feedback        Feedback
+	feedbackTimeout time.Duration
+	previewScheme   string
+	// Compose sidecars (V1.1 phase 4): what the fake fetch writes as the
+	// compose file ("" for none, named composeName, default previewd.compose.yml),
+	// whether the feature is on, its service bound (0 for the default), and
+	// the allowlist (testBases when nil).
+	composeFile    string
+	composeName    string
+	composeEnabled bool
+	composeMax     int
+	bases          map[string]bool
 }
 
 func newRig(t *testing.T) *rig {
@@ -365,12 +385,21 @@ func (r *rig) crash() {
 
 func (r *rig) reconciler() *Reconciler {
 	r.t.Helper()
-	rec, err := NewReconciler(ReconcilerConfig{
+	rec, err := NewReconciler(r.config())
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	return rec
+}
+
+func (r *rig) config() ReconcilerConfig {
+	return ReconcilerConfig{
 		Queue: r.queue, Engine: r.engine, Routes: r.routes, Stager: r.stager,
 		Secrets: sectionSecrets{}, Authorizer: r.auth,
 		RevalidateInterval: r.interval, RevalidateGrace: r.grace, AuthorizeMaxAttempts: r.maxAttempts,
 		MaxConcurrentBuilds: r.maxBuilds, BuildTimeout: r.buildTimeout, PruneInterval: r.pruneInterval, PruneBatch: 2,
 		MinFreeDiskBytes: r.minFreeDisk, EnvTTL: r.envTTL, DisableTTL: r.disableTTL, BuildDir: r.buildDir,
+		Feedback: r.feedback, FeedbackTimeout: r.feedbackTimeout, PreviewScheme: r.previewScheme,
 		Fetch: func(_ context.Context, repo, _, _, dest string) error {
 			if r.fetchErr != nil {
 				return r.fetchErr
@@ -378,16 +407,32 @@ func (r *rig) reconciler() *Reconciler {
 			if repo != "acme/app" {
 				return fmt.Errorf("fetch of repository %q, want the job's acme/app", repo)
 			}
-			return writeCheckout(dest, cmp.Or(r.dockerfile, testDockerfile))
+			if err := writeCheckout(dest, cmp.Or(r.dockerfile, testDockerfile)); err != nil {
+				return err
+			}
+			if r.composeFile == "" {
+				return nil
+			}
+			return os.WriteFile(filepath.Join(dest, cmp.Or(r.composeName, composeFileName)), []byte(r.composeFile), 0o600)
 		},
-		AllowedBaseImages: testBases, MaxBuildContextBytes: 1 << 20,
+		ComposeEnabled: r.composeEnabled, ComposeMaxServices: r.composeMax,
+		AllowedBaseImages: r.allowedBases(), MaxBuildContextBytes: 1 << 20,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Domain: "local.previewd", AppPort: 8080,
-		Now: func() time.Time { return r.now }, PollInterval: 5 * time.Millisecond,
-	})
-	if err != nil {
-		r.t.Fatal(err)
+		Now: func() time.Time {
+			if r.clock != nil {
+				return r.clock()
+			}
+			return r.now
+		}, PollInterval: 5 * time.Millisecond,
 	}
-	return rec
+}
+
+// allowedBases is the allowlist of the rig's reconciler.
+func (r *rig) allowedBases() map[string]bool {
+	if r.bases != nil {
+		return r.bases
+	}
+	return testBases
 }
 
 func (r *rig) enqueue(typ store.JobType) {
@@ -828,6 +873,63 @@ func (r *rig) running() bool {
 	r.engine.mu.Lock()
 	defer r.engine.mu.Unlock()
 	return r.engine.envs[testEnv].Running
+}
+
+// E2b: a teardown (an urgent one: a closed PR, a revoked approval) never
+// waits behind a build. Every build slot is taken and the only worker leases
+// a deploy first: the deploy goes back to the queue, still unclassified and
+// untouched on the host, and the same worker then runs the teardown.
+func TestReconciler_TeardownNotBlockedBySaturatedBuildSlots(t *testing.T) {
+	r := newRig(t)
+	r.maxBuilds = 2
+	rec := r.started()
+	for range cap(rec.builds) {
+		rec.builds <- struct{}{} // every slot is taken by a build in flight
+	}
+	const deployEnv = "pr-8-0b0b0b0b0b"
+	r.enqueueEnv(deployEnv) // seq 1: the worker leases it first
+	r.enqueue(store.JobTeardown)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		rec.Run(ctx, 1)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	var jobs []store.Job
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		jobs = r.jobs()
+		if i := slices.IndexFunc(jobs, func(j store.Job) bool { return j.Type == store.JobTeardown }); i >= 0 && jobs[i].Status == store.StatusSuccess {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	var deploy, teardown store.Job
+	for _, j := range jobs {
+		if j.Type == store.JobDeploy {
+			deploy = j
+		} else {
+			teardown = j
+		}
+	}
+	if teardown.Status != store.StatusSuccess {
+		t.Fatalf("teardown %+v, want SUCCESS while every build slot is taken", teardown)
+	}
+	if deploy.Status != store.StatusQueued || deploy.Attempts != 1 || deploy.NotBefore <= r.now.UnixMilli() || deploy.Trust != store.TrustUnclassified {
+		t.Fatalf("deploy %+v, want QUEUED, unclassified, requeued once with a not_before in the future", deploy)
+	}
+	if r.built() {
+		t.Fatal("the engine was asked to build without a slot")
+	}
+	if len(rec.builds) != cap(rec.builds) {
+		t.Fatalf("%d of %d slots taken, want the test's own %d untouched", len(rec.builds), cap(rec.builds), cap(rec.builds))
+	}
 }
 
 // V1-I2: each deploy stages the secret section of its own trust; an

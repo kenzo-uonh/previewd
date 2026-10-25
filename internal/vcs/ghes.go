@@ -152,26 +152,14 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
-	if cfg.CAPEM != nil {
-		if tlsCfg.RootCAs, err = CertPool(cfg.CAPEM); err != nil {
-			return nil, fmt.Errorf("GHES CA bundle: %w", err)
-		}
+	transport, err := newTransport(cfg.CAPEM, "GHES")
+	if err != nil {
+		return nil, err
 	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	transport := &http.Transport{
-		Proxy:               nil, // never HTTP(S)_PROXY from the environment
-		DialContext:         (&net.Dialer{Timeout: callTimeout}).DialContext,
-		TLSClientConfig:     tlsCfg,
-		TLSHandshakeTimeout: callTimeout,
-		ForceAttemptHTTP2:   true,
-		MaxIdleConns:        4,
-		IdleConnTimeout:     90 * time.Second,
-	}
-	noRedirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &Client{
 		api:   base + apiPrefix,
 		appID: cfg.AppID,
@@ -182,6 +170,32 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		dl:     &http.Client{Transport: transport, CheckRedirect: noRedirect},
 		logger: logger,
 		now:    time.Now,
+	}, nil
+}
+
+// noRedirect hands a redirect back to the caller: an API call follows none,
+// and a source fetch checks the one it expects by hand.
+func noRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+// newTransport is the transport of a forge client: TLS 1.2 or later against
+// the site CA bundle caPEM (the system roots when nil), no proxy from the
+// environment, bounded dial and handshake. what names the forge in errors.
+func newTransport(caPEM []byte, what string) (*http.Transport, error) {
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	if caPEM != nil {
+		var err error
+		if tlsCfg.RootCAs, err = CertPool(caPEM); err != nil {
+			return nil, fmt.Errorf("%s CA bundle: %w", what, err)
+		}
+	}
+	return &http.Transport{
+		Proxy:               nil, // never HTTP(S)_PROXY from the environment
+		DialContext:         (&net.Dialer{Timeout: callTimeout}).DialContext,
+		TLSClientConfig:     tlsCfg,
+		TLSHandshakeTimeout: callTimeout,
+		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        4,
+		IdleConnTimeout:     90 * time.Second,
 	}, nil
 }
 
@@ -302,6 +316,14 @@ func (c *Client) call(ctx context.Context, method, bearer, path string, body []b
 	if err != nil {
 		return fmt.Errorf("%s %s: %w", method, path, err)
 	}
+	return decodeReply(resp, method, path, want, limit, v)
+}
+
+// decodeReply closes resp, requires status want and decodes at most limit
+// bytes of JSON into v (nothing when v is nil). A larger reply is an error,
+// never truncated. An error document is quoted bounded: it never carries a
+// token.
+func decodeReply(resp *http.Response, method, path string, want int, limit int64, v any) error {
 	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if closeErr := resp.Body.Close(); readErr == nil {
 		readErr = closeErr
@@ -310,7 +332,6 @@ func (c *Client) call(ctx context.Context, method, bearer, path string, body []b
 	case readErr != nil:
 		return fmt.Errorf("%s %s: read reply: %w", method, path, readErr)
 	case resp.StatusCode != want:
-		// An error document: it never carries a token.
 		return fmt.Errorf("%s %s: HTTP %d: %q", method, path, resp.StatusCode,
 			textutil.Truncate(strings.TrimSpace(string(raw)), maxQuotedReply))
 	case int64(len(raw)) > limit:
@@ -358,9 +379,10 @@ func validToken(t string) bool {
 	return true
 }
 
-// mint returns an installation token for repo with read access to perms,
-// and nothing else: a reply that grants another permission, another
-// repository, or a lifetime outside (0, 2 h] is revoked and refused.
+// mint returns an installation token for repo with the access perms name
+// ("pull_requests" is read, "statuses:write" is write), and nothing else: a
+// reply that grants another permission, another level, another repository,
+// or a lifetime outside (0, 2 h] is revoked and refused.
 func (c *Client) mint(ctx context.Context, repo string, perms ...string) (token, error) {
 	path, err := repoPath(repo)
 	if err != nil {
@@ -382,7 +404,11 @@ func (c *Client) mint(ctx context.Context, repo string, perms ...string) (token,
 	_, name, _ := strings.Cut(repo, "/")
 	want := map[string]string{}
 	for _, p := range perms {
-		want[p] = "read"
+		name, level, ok := strings.Cut(p, ":")
+		if !ok {
+			level = "read"
+		}
+		want[name] = level
 	}
 	body, err := json.Marshal(tokenRequest{Repositories: []string{name}, Permissions: want})
 	if err != nil {
@@ -421,8 +447,17 @@ func checkGrant(r tokenReply, repo string, want map[string]string, now time.Time
 		return errors.New("the reply names no permission")
 	}
 	for p, level := range r.Permissions {
-		if level != "read" || (want[p] == "" && p != "metadata") {
-			return fmt.Errorf("granted %s:%s, beyond the read access requested", textutil.Truncate(p, 32), textutil.Truncate(level, 16))
+		asked, ok := want[p]
+		if p == "metadata" && !ok {
+			asked, ok = "read", true // GitHub adds it to every installation token
+		}
+		if !ok || level != asked {
+			return fmt.Errorf("granted %s:%s, beyond the %s access requested", textutil.Truncate(p, 32), textutil.Truncate(level, 16), asked)
+		}
+	}
+	for p, asked := range want {
+		if r.Permissions[p] != asked {
+			return fmt.Errorf("granted %s:%s, not the %s access requested", textutil.Truncate(p, 32), textutil.Truncate(r.Permissions[p], 16), asked)
 		}
 	}
 	return nil
@@ -704,4 +739,98 @@ func (r reviewReply) state() (ReviewState, error) {
 		}
 	}
 	return rs, nil
+}
+
+// Provider (V1.1 spec 3.1): the GitHub App client is the GitHub driver. The
+// webhook secret is a parameter, the App key stays in Client, and the
+// pull_request_review and label deliveries keep their own path in
+// internal/api until the handler is provider-neutral: ParseEvent decodes
+// pull_request deliveries only.
+
+// Name implements Provider.
+func (c *Client) Name() string { return ProviderGitHub }
+
+// VerifyWebhook implements Provider: the exact HMAC-SHA256 of the body in
+// X-Hub-Signature-256.
+func (c *Client) VerifyWebhook(req *http.Request, secret []byte) ([]byte, error) {
+	body, err := readWebhookBody(req)
+	if err != nil {
+		return nil, err
+	}
+	if err := validate.VerifySignature(secret, body, req.Header.Get(validate.SignatureHeader)); err != nil {
+		return nil, err
+	}
+	restoreBody(req, body)
+	return body, nil
+}
+
+// ParseEvent implements Provider for a pull_request delivery.
+func (c *Client) ParseEvent(payload []byte) (*Event, error) {
+	pr, err := validate.ParsePullRequest(payload)
+	if err != nil {
+		return nil, err
+	}
+	return &Event{
+		Action: pr.Action, ProjectID: pr.Repo, Project: pr.Repo, IID: pr.Number,
+		HeadRef: pr.HeadRef, HeadSHA: pr.HeadSHA, HeadProject: pr.HeadRepo, CloneURL: pr.CloneURL,
+		Author:    Account{Login: pr.OpenerLogin, ID: pr.OpenerID},
+		Sender:    Account{Login: pr.SenderLogin, ID: pr.SenderID},
+		UpdatedAt: pr.UpdatedAt, Label: pr.Label,
+	}, nil
+}
+
+// GetMRState implements Provider: projectID is owner/repo, mrIID the pull
+// request number.
+func (c *Client) GetMRState(ctx context.Context, projectID, mrIID string) (*MRState, error) {
+	number, err := validate.MergeRequestIID(mrIID)
+	if err != nil {
+		return nil, err
+	}
+	pr, err := c.PullRequest(ctx, projectID, number)
+	if err != nil {
+		return nil, err
+	}
+	return &MRState{
+		Open: pr.Open, HeadSHA: pr.HeadSHA, HeadProject: pr.HeadRepo, Author: pr.Opener,
+		Trusted: Trusted(pr, projectID), Labels: pr.Labels,
+	}, nil
+}
+
+// GetApprovals implements Provider: the approvals still standing in the
+// request's reviews, each on the commit it was given on.
+func (c *Client) GetApprovals(ctx context.Context, projectID, mrIID string) ([]Approval, error) {
+	number, err := validate.MergeRequestIID(mrIID)
+	if err != nil {
+		return nil, err
+	}
+	reviews, err := c.Reviews(ctx, projectID, number)
+	if err != nil {
+		return nil, err
+	}
+	return standingApprovals(reviews), nil
+}
+
+// standingApprovals keeps the accounts whose latest review, oldest first as
+// Reviews returns them, is an approval. A comment changes nothing; a change
+// request or a dismissal withdraws, and a pending review was never
+// submitted.
+func standingApprovals(reviews []ReviewState) []Approval {
+	latest := map[int64]ReviewState{}
+	var order []int64
+	for _, r := range reviews {
+		switch r.State {
+		case "APPROVED", "CHANGES_REQUESTED", "DISMISSED":
+			if _, seen := latest[r.User.ID]; !seen {
+				order = append(order, r.User.ID)
+			}
+			latest[r.User.ID] = r
+		}
+	}
+	var out []Approval
+	for _, id := range order {
+		if r := latest[id]; r.State == "APPROVED" {
+			out = append(out, Approval{User: r.User, CommitSHA: r.CommitID})
+		}
+	}
+	return out
 }

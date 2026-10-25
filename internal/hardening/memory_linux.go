@@ -59,3 +59,18 @@ func LockedMemoryKB() (int64, error) {
 	}
 	return 0, errors.New("VmLck not found in /proc/self/status")
 }
+
+// ProbeMlockall asks the kernel whether this process may lock its memory:
+// mlockall(MCL_CURRENT), then munlockall. EPERM or ENOMEM is the limit
+// (RLIMIT_MEMLOCK) or a missing CAP_IPC_LOCK. It locks nothing for good
+// and is not LockMemory: it never sets MCL_FUTURE and does not require an
+// unlimited limit.
+func ProbeMlockall() error {
+	if err := unix.Mlockall(unix.MCL_CURRENT); err != nil {
+		return fmt.Errorf("mlockall: %w", err)
+	}
+	if err := unix.Munlockall(); err != nil {
+		return fmt.Errorf("munlockall: %w", err)
+	}
+	return nil
+}

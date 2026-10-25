@@ -86,6 +86,7 @@ func TestBuildsShareTheConcurrencyLimit(t *testing.T) {
 		t.Run(fmt.Sprint(tc.slots), func(t *testing.T) {
 			r := newRig(t)
 			r.maxBuilds = tc.slots
+			r.fastClock() // a deploy that finds the slot taken is requeued
 			o := newOverlap()
 			r.engine.buildHook = o.build
 			rec := r.started()
@@ -170,24 +171,58 @@ func TestBuildPastTheTimeoutNeverSucceeds(t *testing.T) {
 	}
 }
 
-// The build helper on its own: the timeout error names the control, and a
-// shutdown while waiting for a slot builds nothing.
-func TestBuildWaitsForASlot(t *testing.T) {
+// fastClock runs 1,000 times faster than the wall clock from the rig's now,
+// so a deploy requeued with a backoff of seconds is due again within
+// milliseconds. Read-only after creation: safe for every worker.
+func (r *rig) fastClock() {
+	start, base := time.Now(), r.now
+	r.clock = func() time.Time { return base.Add(time.Since(start) * 1000) }
+}
+
+// A deploy that finds every slot taken is requeued unclassified, nothing of
+// it reaching the engine (E2b); once a slot frees it is leased again, builds
+// and succeeds, and its slot is released at the end.
+func TestDeployRequeuedOnSaturatedSlotsRunsWhenASlotFrees(t *testing.T) {
 	r := newRig(t)
-	r.buildTimeout = time.Minute
-	rec := r.reconciler()
+	r.fastClock()
+	rec := r.started()
 	rec.builds <- struct{}{} // the only slot is taken
+	r.enqueue(store.JobDeploy)
+
 	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
 	go func() {
-		time.Sleep(20 * time.Millisecond)
-		cancel()
+		rec.Run(ctx, 1)
+		close(done)
 	}()
-	err := rec.build(ctx, BuildSpec{}, rec.cfg.Logger)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("build while every slot is taken = %v, want the cancellation", err)
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for r.jobs()[0].Attempts < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("deploy %+v, want it requeued again and again while the slot is taken", r.jobs()[0])
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	if r.built() {
-		t.Fatal("the engine was asked to build without a slot")
+	r.auth.mu.Lock()
+	authorized := r.auth.authorized
+	r.auth.mu.Unlock()
+	if j := r.jobs()[0]; j.Status == store.StatusSuccess || r.built() || authorized != 0 {
+		t.Fatalf("deploy %+v built %v authorized %d times without a slot", j, r.built(), authorized)
+	}
+
+	<-rec.builds // the build in flight ends
+	for r.jobs()[0].Status != store.StatusSuccess {
+		if time.Now().After(deadline) {
+			t.Fatalf("deploy %+v, want SUCCESS once a slot is free", r.jobs()[0])
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := len(rec.builds); n != 0 {
+		t.Fatalf("%d build slots taken after the deploy, want 0", n)
 	}
 }
 

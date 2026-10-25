@@ -162,9 +162,15 @@ func subcommand() (code int, ran bool) {
 		return runAudit(context.Background(), os.Args[2:], os.Stdout, os.Stderr), true
 	case "build-probe":
 		return runBuildProbe(context.Background(), os.Args[2:], os.Stdout, os.Stderr, hardening.ProbeNoNetwork), true
+	case "doctor":
+		return runDoctor(context.Background(), os.Args[2:], os.Getenv, os.Stdout, os.Stderr, newDoctorHost()), true
+	case "backup":
+		return runBackup(context.Background(), os.Args[2:], os.Stdout, os.Stderr), true
+	case "restore":
+		return runRestore(context.Background(), os.Args[2:], os.Stdout, os.Stderr), true
 	default:
 		diag := &console{w: os.Stderr}
-		diag.printf("previewd: unknown command %q (run without arguments to start the daemon)\n%s%s", os.Args[1], auditUsage, buildProbeUsage)
+		diag.printf("previewd: unknown command %q (run without arguments to start the daemon)\n%s%s%s%s", os.Args[1], auditUsage, buildProbeUsage, doctorUsage, backupUsage)
 		return exitUsage, true
 	}
 }

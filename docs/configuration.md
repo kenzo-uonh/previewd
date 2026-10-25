@@ -14,9 +14,10 @@ Every value is validated at start: a malformed value refuses to start. Each `PRE
 - [Approvals and trust](#approvals-and-trust)
 - [Secrets and memory](#secrets-and-memory)
 - [Builds](#builds)
-- [Workers and containers](#workers-and-containers)
+- [Workers and containers](#workers-and-containers) (including [Compose sidecars](#compose-sidecars-previewd_compose_enabled-and-previewd_compose_max_services))
 - [Routing](#routing)
 - [Storage, retention and cleanup](#storage-retention-and-cleanup)
+- [Operator commands](#operator-commands) (`doctor`, `backup`, `restore`)
 
 ## Quick reference
 
@@ -29,10 +30,15 @@ Every value is validated at start: a malformed value refuses to start. Each `PRE
 | [`PREVIEWD_WEBHOOK_ALLOWED_CIDRS`](#previewd_webhook_allowed_cidrs) | unset (any source) | comma-separated prefixes |
 | [`PREVIEWD_WEBHOOK_SECRET_CREDENTIAL`](#previewd_webhook_secret_credential) | `webhook_secret` | credential name; **required credential** |
 | [`PREVIEWD_DELIVERY_MAX_AGE`](#previewd_delivery_max_age) | `15m` | `1m`..`2h` |
-| [`PREVIEWD_GHES_URL`](#previewd_ghes_url) | — | **required**, `https://host[:port]` |
+| [`PREVIEWD_VCS_PROVIDER`](#previewd_vcs_provider) | `github` | `github` or `gitlab` |
+| [`PREVIEWD_GHES_URL`](#previewd_ghes_url) | — | **required** with `github`, `https://host[:port]` |
 | [`PREVIEWD_GHES_CA_FILE`](#previewd_ghes_ca_file) | unset (system roots) | PEM bundle path |
-| [`PREVIEWD_GITHUB_APP_ID`](#previewd_github_app_id-and-previewd_github_app_key_credential) | — | **required** |
+| [`PREVIEWD_GITHUB_APP_ID`](#previewd_github_app_id-and-previewd_github_app_key_credential) | — | **required** with `github` |
 | [`PREVIEWD_GITHUB_APP_KEY_CREDENTIAL`](#previewd_github_app_id-and-previewd_github_app_key_credential) | `github-app-key` | credential name |
+| [`PREVIEWD_GITLAB_URL`](#gitlab) | — | **required** with `gitlab`, `https://host[:port]` |
+| [`PREVIEWD_GITLAB_CA_FILE`](#gitlab) | unset (system roots) | clean absolute PEM bundle path |
+| [`PREVIEWD_GITLAB_TOKEN_CREDENTIAL`](#gitlab) | `gitlab-api-token` | credential name |
+| [`PREVIEWD_GITLAB_WEBHOOK_SECRET_CREDENTIAL`](#gitlab) | `gitlab-webhook-secret` | credential name |
 | [`PREVIEWD_APPROVERS`](#previewd_approvers) | unset (no approver) | `owner/repo:login#id`, comma-separated |
 | [`PREVIEWD_LABEL_APPROVAL`](#previewd_label_approval) | unset | exactly `1` |
 | [`PREVIEWD_APPROVAL_LABEL`](#previewd_approval_label) | `previewd-approved` | 1 to 50 bytes |
@@ -53,12 +59,16 @@ Every value is validated at start: a malformed value refuses to start. Each `PRE
 | [`PREVIEWD_MAX_BUILDS`](#previewd_max_builds) | `2` | `1`..`64` |
 | [`PREVIEWD_CONTAINER_MEMORY_MIB`](#previewd_container_memory_mib) | `512` | `1`..`2^40` |
 | [`PREVIEWD_CONTAINER_PIDS`](#previewd_container_pids) | `256` | `1`..`2^40` |
+| [`PREVIEWD_COMPOSE_ENABLED`](#compose-sidecars-previewd_compose_enabled-and-previewd_compose_max_services) | off | exactly `1` |
+| [`PREVIEWD_COMPOSE_MAX_SERVICES`](#compose-sidecars-previewd_compose_enabled-and-previewd_compose_max_services) | `3` | `1`..`8` |
 | [`PREVIEWD_TRAEFIK_DOMAIN`](#previewd_traefik_domain) | `local.previewd` | domain |
 | [`PREVIEWD_ROUTES_DIR`](#previewd_routes_dir) | `/var/lib/previewd/routes` | existing absolute directory |
 | [`PREVIEWD_TRAEFIK_CONTAINER`](#previewd_traefik_container) | `traefik-proxy` | container name |
 | [`PREVIEWD_DB_PATH`](#previewd_db_path) | `previewd.sqlite` | path |
 | [`PREVIEWD_RETENTION`](#previewd_retention) | `720h` | at least `24h` |
 | [`PREVIEWD_ENV_TTL`](#previewd_env_ttl) | `168h` | at least `1h`, or exactly `0` |
+| [`PREVIEWD_FEEDBACK`](#developer-feedback-previewd_feedback-and-previewd_preview_url_scheme) | on | `0` or `1` |
+| [`PREVIEWD_PREVIEW_URL_SCHEME`](#developer-feedback-previewd_feedback-and-previewd_preview_url_scheme) | `http` | `http` or `https` |
 | [`PREVIEWD_MIN_FREE_DISK_MIB`](#previewd_min_free_disk_mib) | `10240` | at least `1024` |
 | [`PREVIEWD_DOCKER_DATA_ROOT`](#previewd_docker_data_root) | the daemon's `DockerRootDir` | clean absolute path |
 | [`PREVIEWD_PRUNE_INTERVAL`](#previewd_prune_interval-and-previewd_prune_batch) | `1h` | `1m`..`24h` |
@@ -77,6 +87,7 @@ Each of these is logged as an error at every start. Use them only where the reas
 | `PREVIEWD_LABEL_APPROVAL=1` | Lets an approver approve by labeling the pull request |
 | `PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS` | Gives approved untrusted deploys the trusted secret section (also logged at every such deploy and audited) |
 | `PREVIEWD_ENV_TTL=0` | Disables the environment TTL |
+| `PREVIEWD_FEEDBACK=0` | Posts no commit status and no comment on the pull or merge request |
 
 ## Webhook listener
 
@@ -113,6 +124,14 @@ Default `webhook_secret`. Name of the systemd credential holding the HMAC secret
 
 How long after its signed time a delivery is still accepted (default: `15m`, a Go duration in 1m..2h; see V1-I7, step 5 of [Webhook Ingestion](architecture.md#webhook-ingestion)).
 
+## Forge
+
+### `PREVIEWD_VCS_PROVIDER`
+
+`github` (the default: GHES and github.com) or `gitlab` (GitLab Self-Managed CE/EE and gitlab.com). Exactly those two spellings: anything else, case and padding included, refuses to start. One forge per daemon: only that forge's webhook route exists (`/webhooks/github` or `/webhooks/gitlab`).
+
+The keys of the other forge are a contradiction, refused at start whatever their value: a stale `PREVIEWD_GHES_URL` in a GitLab deployment (or `PREVIEWD_GITLAB_URL` in a GitHub one) is never ignored. With `gitlab`, `PREVIEWD_WEBHOOK_SECRET_CREDENTIAL` is refused too: the webhook secret is the credential of `PREVIEWD_GITLAB_WEBHOOK_SECRET_CREDENTIAL`. `PREVIEWD_APPROVERS` and `PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS` name projects as the forge spells them (see [Approvals and trust](#approvals-and-trust)); `PREVIEWD_LABEL_APPROVAL` is refused with `gitlab`.
+
 ## GitHub Enterprise Server
 
 ### `PREVIEWD_GHES_URL`
@@ -129,6 +148,30 @@ PEM bundle of the site CA that signs the GHES certificate. When set, it is the o
 
 - The App needs **Pull requests: read**, **Contents: read** (source tarballs, H2) and the default **Metadata: read**, installed on the repositories previewd serves.
 - Each read mints a token scoped to one repository, read only, with the one permission it needs, and revokes it before returning.
+- [Developer feedback](#developer-feedback-previewd_feedback-and-previewd_preview_url_scheme) adds **Commit statuses: write** and **Pull requests: write**. Each write mints a token scoped to one repository and to that one permission at write level, and revokes it before returning. An App without them still deploys: the write is refused and logged at warn.
+
+## GitLab
+
+With `PREVIEWD_VCS_PROVIDER=gitlab` (V1.1 spec 3.1). The driver speaks REST API v4 over net/http only, through no proxy, following no redirect (the token cannot be carried to another host).
+
+- `PREVIEWD_GITLAB_URL` is **required**: `https://host[:port]`, no path, user info, query or fragment.
+- `PREVIEWD_GITLAB_CA_FILE` is the PEM bundle of the site CA that signs the GitLab certificate: a clean absolute path; when set it is the only trust; every block must be a certificate.
+- `PREVIEWD_GITLAB_TOKEN_CREDENTIAL` (default `gitlab-api-token`) names the credential holding a **Project or Group Access Token** with `read_api` and `read_repository`, role Developer or more. The `api` scope instead of `read_api` also lets previewd write the commit status and the merge request note ([developer feedback](#developer-feedback-previewd_feedback-and-previewd_preview_url_scheme)); with `read_api` those writes are refused and logged at warn, and the deploy is not affected. previewd writes nothing else. It is sent in `PRIVATE-TOKEN` to the configured host only, kept in memory, never logged or quoted.
+- `PREVIEWD_GITLAB_WEBHOOK_SECRET_CREDENTIAL` (default `gitlab-webhook-secret`) names the credential holding the secret token of the project or group hook. Every hook must carry exactly one `X-Gitlab-Token` equal to it (constant-time comparison); enable only **Merge request events**. GitLab does not sign the body, so keep the listener on TLS.
+- `PREVIEWD_GITLAB_TOKEN` and `PREVIEWD_GITLAB_WEBHOOK_SECRET` (the secrets themselves) refuse to start whatever their value, as `PREVIEWD_WEBHOOK_SECRET` does.
+
+Hooks: `open`, `reopen`, `update` (only when the head moved: a title or label edit builds nothing), `close` and `merge` (teardown). Ordering is by the instant the hook is received; the replay keys are `X-Gitlab-Event-UUID` and the body's digest. A trusted merge request is one whose head lives in the target project and whose author is an active member with Developer access or more.
+
+The deploy gate (`orchestrator.GitLabAuthorizer`) reads GitLab again before anything is fetched or built, and again on every re-validation: the project is resolved from its path to its numeric ID (the reply must name exactly that path), then the merge request. It deploys only an **open** merge request that is **trusted**; a read that fails requeues the deploy (nothing runs), and a project, an author or a state that cannot be confirmed refuses it. The source is the project's archive at the exact commit (`GET /projects/:id/repository/archive.tar.gz?sha=`), extracted under the same bounds as a GHES tarball; git never runs for a merge request.
+
+**Approvals.** A merge request that is not trusted (a fork, a deleted head project, an author who cannot push) deploys only on the approval of an account listed in `PREVIEWD_APPROVERS` for its project (`group[/subgroup]/project:username#id`, the login at most 39 bytes):
+
+- An `approved` hook of that account is a grant of **the head the hook named**. GitLab binds an approval to no commit and keeps it across a push, so the commit is the store's: a new push revokes every other commit (`new_head`) and the merge request needs a new approval. An `unapproved` hook of that account revokes the commit (`dismissed`), however late it arrives. A hook of any other account is ignored (`202 ignored`).
+- The author's own approval counts for nothing (GitLab can allow it, GitHub cannot): ignored at the hook, refused again by the gate.
+- Before anything is fetched or built, and on every re-validation, the gate confirms on GitLab that the head is still that commit, that the approver still approves the merge request (`/merge_requests/:iid/approvals`), is still in `PREVIEWD_APPROVERS` (by account ID) and is still an active member with Developer access or more. A read that fails requeues the deploy; anything else refuses it and, on re-validation, tears the environment down.
+- Recorded as `approval_granted` / `untrusted_deploy` with detail `approval` (schema 4). `PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS` applies as for GitHub. `PREVIEWD_LABEL_APPROVAL` is GitHub's and is refused at start with `gitlab`.
+
+The merge request's opener is stored as `gitlab-user-<id>` (a hook names its author by ID only); the ID is the identity. A project path is at most 140 bytes (what the queue keeps); a longer one is refused at the hook.
 
 ## Credentials
 
@@ -151,13 +194,15 @@ In GHES, enable SSL verification on the webhook and make the listener certificat
 |------------|----------|-------|
 | `webhook_secret` | `PREVIEWD_WEBHOOK_SECRET_CREDENTIAL` | HMAC secret of the GitHub webhook |
 | `github-app-key` | `PREVIEWD_GITHUB_APP_KEY_CREDENTIAL` | GitHub App private key |
+| `gitlab-api-token` | `PREVIEWD_GITLAB_TOKEN_CREDENTIAL` | GitLab Project or Group Access Token (`gitlab` provider) |
+| `gitlab-webhook-secret` | `PREVIEWD_GITLAB_WEBHOOK_SECRET_CREDENTIAL` | Secret token of the GitLab hook (`gitlab` provider) |
 | (no default name) | `PREVIEWD_TLS_KEY_CREDENTIAL` | Webhook listener's TLS key |
 
 ## Approvals and trust
 
 ### `PREVIEWD_APPROVERS`
 
-Accounts whose review approves untrusted code, as comma-separated `owner/repo:login#id` entries (repository spelled as GitHub spells it).
+Accounts whose review approves untrusted code, as comma-separated `owner/repo:login#id` entries (repository spelled as GitHub spells it; with `gitlab`, `group[/subgroup]/project:username#id`, the numeric user ID mandatory as well).
 
 - The numeric account ID is mandatory and is the identity; the login is for logs and the audit trail.
 - Any malformed entry, or an account listed twice for a repository, refuses to start.
@@ -237,7 +282,7 @@ Set exactly `1` to skip the cgroup checks of the startup probe (dev hosts, cgrou
 
 ### `PREVIEWD_MAX_CONCURRENT_BUILDS`
 
-Builds in flight at once across every worker, 1..16 (default: 1). Every build shares the BuildKit cgroup's limits (D-V1-4), so a value above 1 needs `previewd-builds.slice` scaled; it is logged at every start. A worker waits for a free slot before it builds.
+Builds in flight at once across every worker, 1..16 (default: 1). Every build shares the BuildKit cgroup's limits (D-V1-4), so a value above 1 needs `previewd-builds.slice` scaled; it is logged at every start. A deploy takes a slot, without waiting, before it is authorized and holds it until it ends; with every slot taken it returns to the queue (retried after 5 s) and its worker takes the next job, so a teardown never waits behind a build. Each such return counts as an attempt of the deploy.
 
 ### `PREVIEWD_BUILD_TIMEOUT`
 
@@ -261,6 +306,17 @@ Memory limit of each PR container, swap disabled (default: 512). Must be an inte
 
 Task limit of each PR container (default: 256). Same validation.
 
+### Compose sidecars: `PREVIEWD_COMPOSE_ENABLED` and `PREVIEWD_COMPOSE_MAX_SERVICES`
+
+Off unless `PREVIEWD_COMPOSE_ENABLED=1`, exactly; any other value refuses to start. When on, a `previewd.compose.yml` (preferred) or else a `docker-compose.yml` at the root of the checkout adds ephemeral sidecars (a database, a cache) to the environment. With the feature off the files are never read.
+
+- `PREVIEWD_COMPOSE_MAX_SERVICES` bounds the services of one environment, the application included (default `3`, at most `8`). A file above it fails the deploy (`failure = 'preflight'`). It is validated even when the feature is off.
+- **Sidecar images are the allowlisted ones.** A sidecar's `image` must be one of [`PREVIEWD_ALLOWED_BASE_IMAGES`](#previewd_allowed_base_images), written `name:tag@sha256:<digest>`. It must already be on the host: the deploy fails if it is not, or if the local `name:tag` is another image. previewd never pulls.
+- **Limits are per container.** `PREVIEWD_CONTAINER_MEMORY_MIB` and `PREVIEWD_CONTAINER_PIDS` apply to each container of an environment: three services can use three times the memory limit.
+- **Values in the compose file are not secrets.** `environment` values (for example `POSTGRES_PASSWORD`) come from the PR, are visible in `docker inspect` and are passed literally, without interpolation. Use them for the throwaway credentials of an ephemeral database only. The application's real secrets keep reaching it as files under `/run/secrets`; no sidecar gets that mount.
+
+The accepted subset of the compose file is in [Compose sidecars](architecture.md#compose-sidecars-v11-spec-33).
+
 ## Routing
 
 ### `PREVIEWD_TRAEFIK_DOMAIN`
@@ -279,7 +335,7 @@ Name of the Traefik container, joined to each environment network (default: `tra
 
 ### `PREVIEWD_DB_PATH`
 
-SQLite database path (default: previewd.sqlite).
+SQLite database path (default: previewd.sqlite; `previewd.service` sets `/var/lib/previewd/previewd.sqlite`). `previewd audit`, `backup` and `restore` default their `-db` flag to it.
 
 ### `PREVIEWD_RETENTION`
 
@@ -288,6 +344,16 @@ Age past which finished jobs, approval grants no longer live and deliveries are 
 ### `PREVIEWD_ENV_TTL`
 
 Age, at least `1h` (default: `168h`), after which an environment whose running version has not been replaced is torn down, and a deploy parked for an approval since its creation is dropped: each maintenance pass queues an internal teardown (`origin = 'ttl'`, audited `ttl_expired`) pinned to that job's commit, which supersedes a parked job. A later push, or an approval of the open head, deploys it again. `0`, exactly, disables the TTL and is logged as an error at every start.
+
+### Developer feedback: `PREVIEWD_FEEDBACK` and `PREVIEWD_PREVIEW_URL_SCHEME`
+
+On by default (V1.1 spec 3.3); `PREVIEWD_FEEDBACK=0`, exactly, turns it off, any other value than `0` or `1` refuses to start.
+
+- **Commit status** `previewd`: `pending` when the deploy is authorized and starts, `success` with the preview URL when the environment runs, `failure` naming the step (`fetch`, `preflight`, `build`, `stage`, `start`, `route`, `commit`, or `setup`) once the rollback is done. GitLab spells it `failed`.
+- **One sticky comment** per pull or merge request, found by its first line `<!-- previewd-status -->` and updated in place, never duplicated: 🟢 with the preview URL, the short commit, who authorized the deploy (the trusted author, or `login#id` of the approver) and the expiry from `PREVIEWD_ENV_TTL`; 🔴 with the failed step. Only a comment written by previewd's own credential (the GitHub App, the GitLab token's account) is ever taken for it or edited; a comment of anyone else carrying the marker is ignored. The search reads at most 10 pages of 100.
+- **It fails open.** An error or a hang of the forge is logged at warn and dropped; each call is bounded to 10 s and runs after the state it reports is recorded. No deploy fails, waits or rolls back because of it.
+- `PREVIEWD_PREVIEW_URL_SCHEME` is the scheme of the URL in the status and the comment (`http` by default: the shipped Traefik entrypoint `web` serves plain HTTP on port 80). Set `https` only where a TLS entrypoint fronts it.
+- Titles, branch names and descriptions of the request are never copied into either: the text is previewd's own, built from validated identifiers, and a URL or a name that does not validate is not posted.
 
 ### `PREVIEWD_MIN_FREE_DISK_MIB`
 
@@ -307,3 +373,15 @@ The maintenance loop runs a pass at start, then every interval, 1m..24h (default
 - A pass reads the host's environments first and never prunes the job that built one, nor any job newer than it; if the engine cannot be read the pass prunes nothing.
 - Never pruned: a job not finished, the latest job of an environment, watermarks, revocations and new-head records, the newest 100 boot epochs, and the audit trail.
 - Each pass first queues the TTL teardowns (`PREVIEWD_ENV_TTL`) and ends with an image prune (see [Disk](architecture.md#disk-v1-f5-v1-i9)).
+
+## Operator commands
+
+`previewd doctor`, `backup` and `restore` read no credential and need no complete configuration ([Day-2 in deployment.md](deployment.md#9-day-2-doctor-backup-and-restore)).
+
+| Command | Reads |
+|---------|-------|
+| `previewd doctor [-conf PATH] [-user NAME]` | The `PREVIEWD_*` lines of `PATH` (default `/etc/previewd/previewd.conf`, the unit's `EnvironmentFile=`; it must exist when `-conf` is given), then the environment, then the defaults: [`PREVIEWD_VCS_PROVIDER`](#previewd_vcs_provider), `PREVIEWD_GHES_URL`, `PREVIEWD_GHES_CA_FILE`, `PREVIEWD_GITLAB_URL`, `PREVIEWD_GITLAB_CA_FILE`, [`PREVIEWD_BUILDKIT_CGROUP`](#previewd_buildkit_cgroup) (default `/sys/fs/cgroup/previewd.slice/previewd-builds.slice`), [`PREVIEWD_SECRETS_STAGING_DIR`](#previewd_secrets_staging_dir), [`PREVIEWD_TRAEFIK_CONTAINER`](#previewd_traefik_container). `NAME` is the service user whose uid must own the staging directory (default `previewd`). |
+| `previewd backup [-db PATH] -out FILE` | [`PREVIEWD_DB_PATH`](#previewd_db_path) when `-db` is not given. |
+| `previewd restore -in FILE [-db PATH] [-force]` | [`PREVIEWD_DB_PATH`](#previewd_db_path) when `-db` is not given. |
+
+A line of the conf file that is not `KEY=VALUE` (optionally quoted), a comment or empty, an unterminated quote and a line continuation are errors (exit 2): half a configuration is not read.

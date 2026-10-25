@@ -10,6 +10,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 
 	"github.com/kenzo-uonh/previewd/internal/envid"
 	"github.com/kenzo-uonh/previewd/internal/store"
@@ -33,20 +34,28 @@ func (s *Server) approver(log *slog.Logger, repo string, id int64, login string)
 	return validate.Approver{}, false
 }
 
-// truth reads GHES in the step that records an approval or a revocation:
-// whether the environment is trusted, and whether commit is the open head.
-// On any failed read both are false: no approval queues a deploy, and a
-// revocation is judged as for an untrusted environment. AuthorizeDeploy
-// reads GHES again before anything runs.
-func (s *Server) truth(r *http.Request, log *slog.Logger, repo string, number uint32, commit string) (trusted, openHead bool) {
+// truth reads the forge in the step that records an approval or a
+// revocation: whether the environment is trusted, and whether commit is the
+// open head. On any failed read both are false: no approval queues a deploy,
+// and a revocation is judged as for an untrusted environment.
+// AuthorizeDeploy reads the forge again before anything runs.
+func (s *Server) truth(r *http.Request, log *slog.Logger, pr validate.PullRequest, commit string) (trusted, openHead bool) {
 	ctx, cancel := context.WithTimeout(r.Context(), ghesTimeout)
 	defer cancel()
-	pr, err := s.github.PullRequest(ctx, repo, number)
+	if s.provider != nil {
+		st, err := s.provider.GetMRState(ctx, pr.ProjectID, strconv.FormatUint(uint64(pr.Number), 10))
+		if err != nil {
+			log.Warn("GitLab unavailable: approval judged without GitLab truth (fail closed)", "error", err)
+			return false, false
+		}
+		return st.Trusted, st.Open && st.HeadSHA == commit
+	}
+	state, err := s.github.PullRequest(ctx, pr.Repo, pr.Number)
 	if err != nil {
 		log.Warn("GHES unavailable: approval judged without GitHub truth (fail closed)", "error", err)
 		return false, false
 	}
-	return vcs.Trusted(pr, repo), pr.Open && pr.HeadSHA == commit
+	return vcs.Trusted(state, pr.Repo), state.Open && state.HeadSHA == commit
 }
 
 func (s *Server) handleReview(w http.ResponseWriter, r *http.Request, in inbound, body []byte) {
@@ -137,7 +146,7 @@ func (s *Server) handleLabel(w http.ResponseWriter, r *http.Request, in inbound,
 // grant records an approval of commit by approverID (login as it is now).
 func (s *Server) grant(w http.ResponseWriter, r *http.Request, in inbound, log *slog.Logger, envID string,
 	pr validate.PullRequest, commit string, via store.ApprovalVia, reviewID, approverID int64, login string) {
-	trusted, openHead := s.truth(r, log, pr.Repo, pr.Number, commit)
+	trusted, openHead := s.truth(r, log, pr, commit)
 	g := store.Grant{
 		DeliveryID: in.delivery.ID, PayloadSHA256: in.payloadSHA256, EnvID: envID, Source: source(pr, commit),
 		Seq: in.delivery.Seq, ApproverLogin: login, ApproverID: approverID, Via: via, ReviewID: reviewID,
@@ -154,7 +163,7 @@ func (s *Server) grant(w http.ResponseWriter, r *http.Request, in inbound, log *
 // revoke records a revocation of commit, attributed to actorID.
 func (s *Server) revoke(w http.ResponseWriter, r *http.Request, in inbound, log *slog.Logger, envID string,
 	pr validate.PullRequest, commit string, reason store.RevocationReason, actorID int64, login string) {
-	trusted, _ := s.truth(r, log, pr.Repo, pr.Number, commit)
+	trusted, _ := s.truth(r, log, pr, commit)
 	rv := store.Revoke{
 		DeliveryID: in.delivery.ID, PayloadSHA256: in.payloadSHA256, EnvID: envID, Repo: pr.Repo,
 		PRNumber: int64(pr.Number), CommitSHA: commit, Seq: in.delivery.Seq, Reason: reason, Trusted: trusted,

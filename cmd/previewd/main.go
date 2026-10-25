@@ -162,6 +162,10 @@ func main() {
 	logger.Info("Build preflight armed",
 		"allowed_base_images", slices.Sorted(maps.Keys(cfg.AllowedBaseImages)),
 		"max_build_context_bytes", cfg.MaxBuildContextBytes)
+	if cfg.ComposeEnabled {
+		// Sidecar images are the allowlisted ones, verified above.
+		logger.Info("Compose sidecars enabled", "max_services", cfg.ComposeMaxServices)
+	}
 
 	// Free-disk floor (V1 F5, V1-I9): the data root must be measurable, or
 	// no deploy could ever start. Below the floor the daemon still starts,
@@ -212,44 +216,13 @@ func main() {
 	}
 	logger.Info("Startup build probe passed", "probe_addr", probeAddr, "build_cgroup", cfg.BuildKitCgroup)
 
-	// Approval gating (V1 F1): GHES truth through the GitHub App (C3),
-	// judged by the deploy gate (D4) before any build.
-	ghes, err := newGHESClient(cfg, logger)
+	// The forge: the deploy gate (V1 F1, D4) and the source fetch (H2,
+	// V1-I11) of the one forge PREVIEWD_VCS_PROVIDER selects.
+	vcsForge, err := newForge(cfg, db, logger)
 	if err != nil {
-		logger.Error("GHES client refused", "ghes_url", cfg.GHESURL, "error", err)
+		logger.Error("Forge refused", "provider", cfg.VCSProvider, "error", err)
 		os.Exit(1)
 	}
-	if cfg.LabelApproval {
-		logger.Error("Opt-in active: an approver's label approves untrusted code",
-			"opt_in", "PREVIEWD_LABEL_APPROVAL", "label", cfg.ApprovalLabel)
-	}
-	if len(cfg.FullSecretsRepos) > 0 {
-		logger.Error("Opt-in active: approved untrusted deploys of these repositories receive the trusted secret section",
-			"opt_in", "PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS", "repositories", slices.Sorted(maps.Keys(cfg.FullSecretsRepos)))
-	}
-	authorizer, err := orchestrator.NewAuthorizer(orchestrator.AuthorizerConfig{
-		GitHub:           ghes,
-		Approvals:        db,
-		Approvers:        cfg.Approvers,
-		LabelApproval:    cfg.LabelApproval,
-		ApprovalLabel:    cfg.ApprovalLabel,
-		FullSecretsRepos: cfg.FullSecretsRepos,
-		Logger:           logger,
-	})
-	if err != nil {
-		logger.Error("Authorizer initialization failure", "error", err)
-		os.Exit(1)
-	}
-
-	// Source fetch (H2, V1-I11): the commit tarball from GHES through the
-	// GitHub App, extracted under bounds; git fetch --depth=1 only without
-	// an App, which this daemon always has.
-	fetcher, err := vcs.NewFetcher(ghes, cfg.MaxBuildContextBytes)
-	if err != nil {
-		logger.Error("Source fetcher refused", "error", err)
-		os.Exit(1)
-	}
-	logger.Info("Source fetch armed", "ghes_tarball", fetcher.Tarball(), "max_bytes", cfg.MaxBuildContextBytes)
 
 	reconciler, err := orchestrator.NewReconciler(orchestrator.ReconcilerConfig{
 		Queue:                db,
@@ -257,8 +230,8 @@ func main() {
 		Routes:               routes,
 		Stager:               stager,
 		Secrets:              injector,
-		Authorizer:           authorizer,
-		Fetch:                fetcher.Fetch,
+		Authorizer:           vcsForge.authorizer,
+		Fetch:                vcsForge.fetch,
 		Logger:               logger,
 		Domain:               cfg.TraefikDomain,
 		AppPort:              appPort,
@@ -275,6 +248,10 @@ func main() {
 		MinFreeDiskBytes:     cfg.MinFreeDiskBytes,
 		EnvTTL:               cfg.EnvTTL,
 		DisableTTL:           cfg.EnvTTL == 0,
+		Feedback:             vcsForge.feedback,
+		PreviewScheme:        cfg.PreviewScheme,
+		ComposeEnabled:       cfg.ComposeEnabled,
+		ComposeMaxServices:   cfg.ComposeMaxServices,
 	})
 	if err != nil {
 		logger.Error("Reconciler initialization failure", "error", err)
@@ -314,7 +291,7 @@ func main() {
 	}
 	logger.Info("Maintenance loop running", "interval", cfg.PruneInterval, "retention", cfg.Retention, "batch", cfg.PruneBatch,
 		"env_ttl", cfg.EnvTTL)
-	apiServer, err := api.NewServer(logger, cfg, webhookSecret, db, reconciler, ghes)
+	apiServer, err := api.NewServer(logger, cfg, webhookSecret, db, reconciler, vcsForge.github, vcsForge.options...)
 	if err != nil {
 		logger.Error("API server refused", "error", err)
 		os.Exit(1)
@@ -324,7 +301,7 @@ func main() {
 		Handler:           apiServer.Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second, // an approval reads GHES before it answers
+		WriteTimeout:      30 * time.Second, // an approval reads the forge before it answers
 		IdleTimeout:       60 * time.Second,
 	}
 
@@ -407,7 +384,7 @@ func newGHESClient(cfg *config.Config, logger *slog.Logger) (*vcs.Client, error)
 }
 
 func readBounded(path string, limit int64) (data []byte, err error) {
-	f, err := os.Open(path) // #nosec G304 -- the operator's PREVIEWD_GHES_CA_FILE
+	f, err := os.Open(path) // #nosec G304 -- the operator's CA bundle (PREVIEWD_GHES_CA_FILE, PREVIEWD_GITLAB_CA_FILE)
 	if err != nil {
 		return nil, err
 	}

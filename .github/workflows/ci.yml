@@ -2,7 +2,8 @@
 #
 # Stage 1: static guardrails, in parallel
 #   semgrep : project rules (.semgrep/), offline container, rule self-test first
-#   codeql  : Go taint analysis, security-extended + security-and-quality
+#   codeql  : Go taint analysis, security-extended + security-and-quality,
+#             .github/codeql/codeql-config.yml (go/log-injection: slog-aware variant)
 # Stage 2: air-gapped verification
 #   Phase 1 (networked): deps-check, go mod vendor, pinned tools, vulndb mirror
 #   Phase 2 (air-gapped): make check + make verify inside an unprivileged
@@ -120,7 +121,7 @@ jobs:
         with:
           languages: go
           build-mode: manual
-          queries: security-extended,security-and-quality
+          config-file: ./.github/codeql/codeql-config.yml
 
       - name: Build for extraction
         run: go build ./...

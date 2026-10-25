@@ -144,6 +144,21 @@ type ReconcilerConfig struct {
 	// approvals changed during the read): the last one parks the deploy
 	// instead of requeuing it (default 10).
 	AuthorizeMaxAttempts int64
+	// Feedback, when set, gives the developer the commit status and the
+	// sticky comment of each deploy (PREVIEWD_FEEDBACK). FeedbackTimeout
+	// bounds each call (default 10 s, at most 1 m); PreviewScheme is the
+	// scheme of the preview URL in them, http or https (default http, the
+	// shipped Traefik entrypoint).
+	Feedback        Feedback
+	FeedbackTimeout time.Duration
+	PreviewScheme   string
+	// ComposeEnabled is PREVIEWD_COMPOSE_ENABLED (off by default): a
+	// previewd.compose.yml, else docker-compose.yml, at the root of the
+	// checkout adds ephemeral sidecars to the environment (ParseCompose).
+	// ComposeMaxServices is PREVIEWD_COMPOSE_MAX_SERVICES, the services of an
+	// environment, primary included (default 3, at most 8).
+	ComposeEnabled     bool
+	ComposeMaxServices int
 	// Now and PollInterval default to time.Now and 2 s.
 	Now          func() time.Time
 	PollInterval time.Duration
@@ -181,6 +196,10 @@ const (
 	// them forever.
 	pruneTimeout = 5 * time.Minute
 )
+
+// buildSlotBackoff is the wait before a deploy that found every build slot
+// taken is leased again.
+const buildSlotBackoff = 5 * time.Second
 
 // ErrBuildTimeout fails a build still running at PREVIEWD_BUILD_TIMEOUT.
 var ErrBuildTimeout = errors.New("build cancelled at PREVIEWD_BUILD_TIMEOUT")
@@ -270,6 +289,18 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 			return nil, fmt.Errorf("reconciler: TTL %s is shorter than %s", cfg.EnvTTL, minEnvTTL)
 		}
 	}
+	if cfg.FeedbackTimeout < 0 || cfg.FeedbackTimeout > maxFeedbackTimeout {
+		return nil, fmt.Errorf("reconciler: feedback timeout %s is outside (0, %s]", cfg.FeedbackTimeout, maxFeedbackTimeout)
+	}
+	cfg.FeedbackTimeout = cmp.Or(cfg.FeedbackTimeout, defaultFeedbackTimeout)
+	cfg.PreviewScheme = cmp.Or(cfg.PreviewScheme, defaultPreviewScheme)
+	if cfg.PreviewScheme != "http" && cfg.PreviewScheme != "https" {
+		return nil, fmt.Errorf("reconciler: preview scheme %q is not http or https", cfg.PreviewScheme)
+	}
+	if cfg.ComposeMaxServices < 0 || cfg.ComposeMaxServices > maxComposeServices {
+		return nil, fmt.Errorf("reconciler: compose service bound %d is outside 1..%d", cfg.ComposeMaxServices, maxComposeServices)
+	}
+	cfg.ComposeMaxServices = cmp.Or(cfg.ComposeMaxServices, defaultComposeServices)
 	cfg.BuildDir = cmp.Or(cfg.BuildDir, os.TempDir())
 	if !filepath.IsAbs(cfg.BuildDir) {
 		return nil, fmt.Errorf("reconciler: build directory %q is not absolute", cfg.BuildDir)
@@ -473,19 +504,36 @@ func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 }
 
+// deploy takes a build slot before anything else, without waiting: a worker
+// never blocks on a build while teardowns and revocations sit in the queue
+// (E2b). With every slot taken the deploy goes back to the queue, still
+// unclassified, and the worker is free for the next job. The slot is taken
+// that early because only an unclassified deploy can be requeued
+// (store.ErrDeployCannotRetry): once AuthorizeDeploy recorded its verdict
+// the deploy runs or fails. It is held until the deploy ends, so deploys in
+// flight, preparing or building, never exceed MaxConcurrentBuilds.
 func (r *Reconciler) deploy(ctx context.Context, l store.Lease, log *slog.Logger) {
+	select {
+	case r.builds <- struct{}{}:
+		defer func() { <-r.builds }()
+	default:
+		r.requeueForBuildSlot(ctx, l, log)
+		return
+	}
 	d, ok := r.authorizeDeploy(ctx, l, log)
 	if !ok {
 		return
 	}
 	log = log.With("trust", string(d.Trust))
 	log.Info("Deploying environment")
+	r.notify(ctx, log, "begin", func(c context.Context) error { return r.cfg.Feedback.Begin(c, r.status(l, d)) })
 	err := r.runDeploy(ctx, l, d, log)
 	cctx, cancel := cleanupContext(ctx)
 	defer cancel()
 	if err == nil {
 		if err = r.cfg.Queue.Finish(cctx, l, store.StatusSuccess, r.cfg.Now()); err == nil {
 			log.Info("Environment deployed")
+			r.notify(ctx, log, "succeed", func(c context.Context) error { return r.cfg.Feedback.Succeed(c, r.status(l, d)) })
 			return
 		}
 		err = failAt(store.FailureCommit, fmt.Errorf("commit deploy: %w", err))
@@ -509,6 +557,23 @@ func (r *Reconciler) deploy(ctx context.Context, l store.Lease, log *slog.Logger
 	}
 	if fErr != nil {
 		log.Error("Could not record the failed deploy", "error", fErr)
+	}
+	r.notify(ctx, log, "fail", func(c context.Context) error {
+		s := r.status(l, d)
+		s.Failure = cmp.Or(string(failure), failureSetup)
+		return r.cfg.Feedback.Fail(c, s)
+	})
+}
+
+// requeueForBuildSlot releases the lease of a deploy that found every build
+// slot taken. Nothing of it reached the host.
+func (r *Reconciler) requeueForBuildSlot(ctx context.Context, l store.Lease, log *slog.Logger) {
+	cctx, cancel := cleanupContext(ctx)
+	defer cancel()
+	notBefore := r.cfg.Now().Add(buildSlotBackoff)
+	log.Info("Every build slot is taken: deploy requeued", "build_slots", cap(r.builds), "not_before", notBefore)
+	if err := r.cfg.Queue.Requeue(cctx, l, notBefore); err != nil {
+		log.Error("Could not requeue the deploy: the next startup sweep requeues it", "error", err)
 	}
 }
 
@@ -568,6 +633,10 @@ func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, l
 			log.Error("Could not close the build context", "error", cErr)
 		}
 	}()
+	compose, err := r.loadCompose(srcDir, log)
+	if err != nil {
+		return failAt(store.FailurePreflight, fmt.Errorf("compose: %w", err))
+	}
 	if err := r.cfg.Engine.ProvisionNetwork(ctx, env); err != nil {
 		return fmt.Errorf("network: %w", err)
 	}
@@ -586,6 +655,7 @@ func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, l
 	// StartContainer.
 	backend, err := r.cfg.Engine.Deploy(ctx, Environment{
 		ID: env, Image: tag, Port: r.cfg.AppPort, Domain: r.cfg.Domain, JobID: l.JobID, SecretsDir: secretsDir,
+		Compose: compose,
 	})
 	if err != nil {
 		return failAt(store.FailureStart, fmt.Errorf("start container: %w", err))
@@ -598,9 +668,33 @@ func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, l
 	return nil
 }
 
-// build runs one build within the build bounds (D-V1-4, V1-I12): it waits
-// for one of MaxConcurrentBuilds slots, shared by every worker because
-// every build shares the daemon-level BuildKit limits, and its request is
+// loadCompose reads and validates the checkout's compose file: nil when the
+// feature is off (the file is then never read) or the checkout has none. The
+// sidecar images must be on the allowlist of the build preflight. A refusal
+// fails the deploy before anything reaches the engine.
+func (r *Reconciler) loadCompose(srcDir string, log *slog.Logger) (*ComposeSpec, error) {
+	if !r.cfg.ComposeEnabled {
+		return nil, nil
+	}
+	data, name, err := LoadCompose(srcDir)
+	if err != nil || data == nil {
+		return nil, err
+	}
+	spec, err := ParseCompose(data, r.cfg.AllowedBaseImages, r.cfg.ComposeMaxServices)
+	if err != nil {
+		return nil, err
+	}
+	ignored := spec.Primary.IgnoredPorts
+	for _, sc := range spec.Sidecars {
+		ignored += sc.IgnoredPorts
+	}
+	log.Info("Compose sidecars", "file", name, "services", 1+len(spec.Sidecars), "volumes", len(spec.Volumes), "ports_ignored", ignored)
+	return spec, nil
+}
+
+// build runs one build within the build bounds (D-V1-4, V1-I12): its caller
+// holds one of MaxConcurrentBuilds slots (deploy), shared by every worker
+// because every build shares the daemon-level BuildKit limits, and its request is
 // cancelled at BuildTimeout (E0: closing the request stops the solve and
 // its RUN processes). A build whose deadline passed fails even when the
 // engine reports success: a cancelled build is never read as one.
@@ -610,12 +704,6 @@ func (r *Reconciler) runDeploy(ctx context.Context, l store.Lease, d Decision, l
 // the free-disk floor (ErrDiskFloor); the build cache is pruned after the
 // build, whatever its outcome, before the slot is released.
 func (r *Reconciler) build(ctx context.Context, spec BuildSpec, log *slog.Logger) error {
-	select {
-	case r.builds <- struct{}{}:
-	case <-ctx.Done():
-		return fmt.Errorf("wait for a build slot: %w", context.Cause(ctx))
-	}
-	defer func() { <-r.builds }()
 	if err := r.cleanBuildCache(ctx, log); err != nil {
 		return err
 	}

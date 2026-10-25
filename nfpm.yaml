@@ -32,6 +32,33 @@ contents:
     dst: /usr/lib/systemd/system/docker.service.d/previewd-builds.conf
     file_info:
       mode: 0644
+  # The ramfs secrets staging root and Traefik as systemd units. Installed,
+  # never enabled or started: the site decides (docs/deployment.md).
+  - src: deployments/run-previewd-secrets.mount
+    dst: /usr/lib/systemd/system/run-previewd-secrets.mount
+    file_info:
+      mode: 0644
+  - src: deployments/previewd-proxy.service
+    dst: /usr/lib/systemd/system/previewd-proxy.service
+    file_info:
+      mode: 0644
+  # Site-editable files: an upgrade keeps the operator's copy (conffile on
+  # deb, %config(noreplace) on rpm) and never overwrites it.
+  - src: deployments/traefik.yml
+    dst: /etc/previewd/traefik.yml
+    type: config|noreplace
+    file_info:
+      mode: 0644
+  - src: deployments/99-previewd.conf
+    dst: /etc/sysctl.d/99-previewd.conf
+    type: config|noreplace
+    file_info:
+      mode: 0644
 
 scripts:
+  # Refuses the install, before anything is unpacked, on a host without
+  # Docker Engine or cgroup v2.
+  preinstall: scripts/preinstall.sh
   postinstall: scripts/postinstall.sh
+  # On removal (not on upgrade): stops the units, discards staged secrets.
+  preremove: scripts/preremove.sh

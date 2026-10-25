@@ -699,3 +699,63 @@ func TestRunningAndRunningVersion(t *testing.T) {
 		t.Fatal("RunningVersion of an invalid environment accepted")
 	}
 }
+
+// A GitLab approval (V1.1 spec 3.1) is a grant of the head its hook named,
+// with no review ID: it unparks the deploy of that exact commit, is revoked
+// like any grant, and is the actor of the untrusted_deploy row.
+func TestMergeRequestApprovalGrantsTheCommitItNamed(t *testing.T) {
+	s, _ := sweptStore(t)
+	ctx := context.Background()
+	mr := func(commit string, seq int64) Grant {
+		g := grantOf(commit, seq)
+		g.Via, g.ReviewID, g.ApproverLogin, g.OpenHead = ApprovalViaMR, 0, "lead.dev", false
+		return g
+	}
+
+	for name, bad := range map[string]Grant{
+		"with a review ID": func() Grant { g := mr(commitA, 11); g.ReviewID = 99; return g }(),
+		"unknown path":     func() Grant { g := mr(commitA, 11); g.Via = "gitlab"; return g }(),
+	} {
+		if _, _, err := s.Approve(ctx, bad, t0, grantAudit(bad)); !errors.Is(err, ErrInvalidGrant) {
+			t.Errorf("%s: Approve = %v, want ErrInvalidGrant", name, err)
+		}
+	}
+	if g := grantOf(commitA, 11); g.Via != ApprovalViaReview {
+		t.Fatal("fixture")
+	} else {
+		g.ReviewID = 0
+		if _, _, err := s.Approve(ctx, g, t0, grantAudit(g)); !errors.Is(err, ErrInvalidGrant) {
+			t.Errorf("a review without an ID: Approve = %v, want ErrInvalidGrant", err)
+		}
+	}
+
+	enqueueAt(t, s, "d1", JobDeploy, 10, commitA)
+	l := acquire(t, s)
+	if err := s.Park(ctx, l); err != nil {
+		t.Fatal(err)
+	}
+	if id := approve(t, s, mr(commitB, 12)); id != 0 {
+		t.Errorf("an approval of another commit queued job %d", id)
+	}
+	if id := approve(t, s, mr(commitA, 13)); id != l.JobID {
+		t.Errorf("approval of the parked commit unparked job %d, want %d", id, l.JobID)
+	}
+	l = acquire(t, s)
+	confirmed, live, err := s.LiveApproval(ctx, envA, commitA)
+	if err != nil || !live || confirmed.Via != ApprovalViaMR || confirmed.ReviewID != 0 || confirmed.ApproverLogin != "lead.dev" {
+		t.Fatalf("LiveApproval = %+v, %v, %v", confirmed, live, err)
+	}
+	if err := s.Classify(ctx, l, Classification{Trust: TrustUntrusted, Approval: &confirmed}); err != nil {
+		t.Fatalf("Classify on a merge request approval: %v", err)
+	}
+	var actor, detail string
+	if err := s.db.QueryRowContext(ctx, `SELECT actor_login, detail FROM audit_events WHERE kind = 'untrusted_deploy'`).Scan(&actor, &detail); err != nil ||
+		actor != "lead.dev" || detail != "approval" {
+		t.Fatalf("untrusted_deploy row = %q, %q (%v)", actor, detail, err)
+	}
+
+	revoke(t, s, commitA, 14)
+	if live, err := s.ApprovalLive(ctx, envA, commitA); err != nil || live {
+		t.Errorf("approval live after revocation: %v, %v", live, err)
+	}
+}

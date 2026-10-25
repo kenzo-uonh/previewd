@@ -25,7 +25,7 @@ The package installs the binary (`/usr/bin/previewd`), the systemd unit, the bui
 1. **A developer opens a pull request** on the organization's GitHub Enterprise Server. GHES sends a signed webhook to previewd; nothing else is contacted.
 2. **previewd decides whether the code may run.** A branch of the same repository pushed by someone with write access deploys at once. A fork or an outside contributor waits until an approver listed in `PREVIEWD_APPROVERS` approves that exact commit; every decision goes to the audit trail.
 3. **previewd builds and runs it.** It fetches the commit's tarball from GHES with a repository-scoped GitHub App token revoked after use, builds the image without network inside the bounded `previewd-builds.slice` cgroup, and starts the environment on its own private network with its secrets as read-only in-memory files.
-4. **The preview gets its own address.** Traefik serves it at `http://pr-<number>-<hash>.<PREVIEWD_TRAEFIK_DOMAIN>`; the route file of the same name in `PREVIEWD_ROUTES_DIR` shows it. previewd posts nothing back to the pull request: PR status feedback is an Enterprise edition feature. Each new push rebuilds the preview (from a fork, once the new commit is approved).
+4. **The preview gets its own address.** Traefik serves it at `http://pr-<number>-<hash>.<PREVIEWD_TRAEFIK_DOMAIN>`; previewd automatically posts a status comment and commit status check with the live preview link directly back to the pull request (or GitLab merge request). Each new push rebuilds the preview (from a fork, once the new commit is approved).
 5. **The preview is destroyed** when the pull request is closed, when its approval is withdrawn (dismissed review, requested changes, label removed), or when its running version reaches the TTL with no newer push (`PREVIEWD_ENV_TTL`, default 7 days). Teardown removes the container, network, image, route and staged secrets.
 
 ## Why it exists
@@ -58,12 +58,17 @@ On this page: [Codebase Structure](#codebase-structure) · [Development & Execut
 │   └── previewd/
 │       ├── main.go                # Single binary entry point initializing config, store, and HTTP server.
 │       ├── audit.go               # `previewd audit verify|export`: read-only check and JSON Lines export of the audit trail.
-│       └── buildprobe.go          # `previewd build-probe`: the network check run inside the startup probe's BuildKit RUN step.
+│       ├── buildprobe.go          # `previewd build-probe`: the network check run inside the startup probe's BuildKit RUN step.
+│       ├── doctor.go              # `previewd doctor`: host pre-flight (build cgroup, dockerd egress, ramfs staging, memory lock, clock skew, Traefik isolation), [PASS]/[FAIL], exit 0/1.
+│       └── backup.go              # `previewd backup|restore`: online SQLite snapshot beside the daemon, verified audit chain; restore from a verified snapshot, 0600.
 ├── deployments/
 │   ├── docker-compose.yml         # Traefik: digest-pinned, read-only, no socket, routes dir mounted read-only, cgroup parent system.slice.
 │   ├── docker.service.d/
 │   │   └── previewd-builds.conf   # dockerd drop-in: default cgroup parent previewd-builds.slice (BuildKit RUN steps), egress filter (IPAddressDeny).
 │   ├── previewd.service           # Daemon unit (packages): User previewd, Group docker, LimitMEMLOCK, credentials, IPAddressDeny.
+│   ├── previewd-proxy.service     # Traefik run by systemd with `docker run` (no compose, no socket mounted, read-only, routes read-only); opt-in.
+│   ├── run-previewd-secrets.mount # ramfs at /run/previewd/secrets (mode 0700) at boot.
+│   ├── 99-previewd.conf           # /etc/sysctl.d drop-in: unprivileged user namespaces.
 │   ├── previewd-builds.slice      # Bounded subtree of every build: MemoryMax 4G, MemorySwapMax 0, CPUQuota 200%, TasksMax 2048 (D-V1-4).
 │   └── traefik.yml                # Traefik static configuration: file provider only, no API, no telemetry.
 ├── docs/
@@ -78,7 +83,7 @@ On this page: [Codebase Structure](#codebase-structure) · [Development & Execut
 │   ├── config/
 │   │   └── config.go              # Air-gapped environment configuration loading.
 │   ├── envid/                     # Environment ID: pr-<n>-<hash(repo, branch)>, a DNS label (leaf).
-│   ├── hardening/                 # mlockall checks; build probe network checks; build cgroup limits and processes; free disk (statfs) (leaf, _linux/_other).
+│   ├── hardening/                 # mlockall checks and probe; build probe network checks; build cgroup limits and processes; free disk (statfs); dockerd egress filter and unit memlock (systemctl show); ramfs staging mount; forge clock skew (leaf, _linux/_other).
 │   ├── orchestrator/
 │   │   ├── buildprobe.go          # Startup build probe: probe image, isolation verification, bridge gateway.
 │   │   ├── authorizer.go          # D4 deploy gate: trusted/untrusted from GHES, approvals re-read (review, approver ID and write access).
@@ -96,7 +101,7 @@ On this page: [Codebase Structure](#codebase-structure) · [Development & Execut
 │   │   ├── injector.go            # Loads the secrets file into memory.
 │   │   └── stager*.go             # ramfs staging: fs-type, owner and mode checks, one file per key.
 │   ├── store/
-│   │   ├── db.go                  # modernc.org/sqlite pool (No CGO): WAL, busy_timeout, IMMEDIATE transactions, forward-only migrations (schema 3), incremental auto_vacuum.
+│   │   ├── db.go                  # modernc.org/sqlite pool (No CGO): WAL, busy_timeout, IMMEDIATE transactions, forward-only migrations (schema 4), incremental auto_vacuum.
 │   │   ├── jobs.go                # Durable job queue: replay protection, stale deliveries, leases, startup sweep (TLA+ model).
 │   │   ├── approvals.go           # Approval grants and revocations (order-independent), classification, park, internal teardowns.
 │   │   ├── audit.go               # Append-only, hash-chained audit trail.
@@ -112,8 +117,10 @@ On this page: [Codebase Structure](#codebase-structure) · [Development & Execut
 ├── test/e2e/                      # E2E tools, e2e build tag: fakegithub (fake GHES, tarballs), exfil (E3 listener), dockerapi (G1 on the real engine).
 ├── scripts/
 │   ├── build.sh                   # Static binary compilation script.
-│   ├── check-package-install.sh   # `make test-packages`: user, group and installed files after a package install.
+│   ├── check-package-install.sh   # `make test-packages`: refused without Docker, user, group, files and conffiles after install, staged secret gone after removal.
+│   ├── preinstall.sh              # Package pre-install: aborts the apt/dnf transaction without Docker Engine or cgroup v2.
 │   ├── postinstall.sh             # Package post-install: previewd system user (no shell, no home) in group docker.
+│   ├── preremove.sh               # Package pre-remove: stops the units, unmounts and empties the ramfs staging root (removal only, not upgrade).
 │   ├── verify-buildkit.sh         # E0 engine probe: BuildKit network isolation, stream errors, cache, pulls, cgroup placement and bounds, cancellation.
 │   └── verify-e2e.sh              # Local, air-gapped end-to-end integration validation.
 ├── Makefile                       # Build, test, and infrastructure automation targets.
@@ -266,7 +273,7 @@ Property-based tests (`pgregory.net/rapid`, `-rapid.checks=$(RAPID_CHECKS)`, def
 | Stage | Job | What it enforces |
 |-------|-----|------------------|
 | 1 | `semgrep` | Project rules in `.semgrep/previewd-rules.yaml`: no `container.Config.Env`, secret mounts memory-backed and read-only, no `context.Background()`/`TODO()` in orchestrator/store; and `.semgrep/previewd-no-container-output.yaml` (H1, V1-I10): no `ContainerLogs`, `ContainerAttach` or `ContainerExecAttach` outside tests. Each rule file's self-test (`semgrep --test` on its fixture) runs first, so a rule that stops matching fails CI. The scan runs with `--strict --timeout 0`: a rule that timed out on a file would otherwise report no finding there. Digest-pinned image, `--network none --metrics=off`; `make semgrep` runs the same locally (image loaded, never pulled). |
-| 1 | `codeql` | Go taint analysis with the `security-extended` and `security-and-quality` suites. |
+| 1 | `codeql` | Go taint analysis with the `security-extended` and `security-and-quality` suites (`.github/codeql/codeql-config.yml`). `go/log-injection` is replaced by `previewd/log-injection` (`.github/codeql/queries/LogInjection.ql`): the stock query, except that `log/slog` arguments are not sinks while every slog handler of the program is a standard-library one (`slog.NewJSONHandler`/`NewTextHandler`, which escape control characters). A program-declared `slog.Handler`, or a `slog.New` whose handler is not built directly from a standard one, switches the exemption off and the alerts return; any other logger (`log`, `fmt`) is still checked. |
 | 2 | `airgapped` | **Networked phase:** `make deps-check`, `go mod vendor`, pinned tool install (golangci-lint, gosec, govulncheck), offline copy of `vuln.go.dev/vulndb.zip`. **Air-gapped phase:** `make check` and `make verify` (on a pull request or push at `RAPID_CHECKS=100` and `FUZZTIME=10s`; on a manual run at the full 10000 and 60s) under `scripts/airgap-exec.sh` with `GOFLAGS=-mod=vendor`, `GOPROXY=off`, `GOTOOLCHAIN=local` and an empty read-only `GOMODCACHE`, so every dependency must resolve from `vendor/`. |
 | 3 | `build` | Runs only after stages 1 and 2 pass. Builds the static binary air-gapped from `vendor/` and uploads it with its SHA-256. |
 

@@ -70,6 +70,11 @@ type fakeGHES struct {
 	prRedirect  bool // answer the PR read with a redirect to a valid document
 	// archive serves the tarball API and the archive host (H2), when set.
 	archive *fakeArchive
+	// feedback: the statuses and the comments of acme/app#7 (feedback_github_test.go).
+	statuses []ghStatus
+	comments []*ghComment
+	// commentPages caps a listing page; 0 is 100.
+	commentPage int
 }
 
 func newFakeGHES(t *testing.T) *fakeGHES {
@@ -162,6 +167,7 @@ func newFakeGHES(t *testing.T) *fakeGHES {
 	mux.HandleFunc("GET /_redirect", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/_codeload/acme/app/legacy.tar.gz/x?token="+r.URL.Query().Get("token"), http.StatusFound)
 	})
+	f.feedbackRoutes(mux)
 	f.srv = httptest.NewTLSServer(mux)
 	t.Cleanup(f.srv.Close)
 	return f
@@ -300,9 +306,10 @@ func TestMintRefusesExcessiveGrants(t *testing.T) {
 		"extra permission": func(m map[string]any) {
 			m["permissions"] = map[string]string{"pull_requests": "read", "contents": "read"}
 		},
-		"no permissions":   func(m map[string]any) { delete(m, "permissions") },
-		"all repositories": func(m map[string]any) { delete(m, "repositories") },
-		"other repository": func(m map[string]any) { m["repositories"] = []map[string]string{{"full_name": "acme/other"}} },
+		"no permissions":           func(m map[string]any) { delete(m, "permissions") },
+		"not the permission asked": func(m map[string]any) { m["permissions"] = map[string]string{"metadata": "read"} },
+		"all repositories":         func(m map[string]any) { delete(m, "repositories") },
+		"other repository":         func(m map[string]any) { m["repositories"] = []map[string]string{{"full_name": "acme/other"}} },
 		"two repositories": func(m map[string]any) {
 			m["repositories"] = []map[string]string{{"full_name": testRepo}, {"full_name": "acme/x"}}
 		},

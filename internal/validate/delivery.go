@@ -92,3 +92,10 @@ func hexValue(s string) uint64 {
 	}
 	return v
 }
+
+// SeqAt is t on the scale of DeliveryID.Seq: 100-nanosecond intervals since
+// the UUID epoch. A forge whose deliveries carry no time-based ID orders its
+// intents by the instant it received them.
+func SeqAt(t time.Time) int64 {
+	return t.UnixNano()/100 + uuidEpochOffset
+}

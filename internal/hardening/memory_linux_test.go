@@ -42,6 +42,23 @@ func TestHelperProcess(t *testing.T) {
 		err := LockMemory()
 		kb, kbErr := LockedMemoryKB()
 		fmt.Printf("HELPER-RESULT err=%v vmlck=%d kbErr=%v\n", err != nil, kb, kbErr)
+	case "probe-finite":
+		rl.Cur = 64 << 10
+		if err := unix.Setrlimit(unix.RLIMIT_MEMLOCK, &rl); err != nil {
+			fmt.Println("HELPER-ERR setrlimit:", err)
+			os.Exit(2)
+		}
+		err := ProbeMlockall()
+		fmt.Printf("HELPER-RESULT refused=%v\n", err != nil)
+	case "probe-unlimited":
+		rl.Cur = rl.Max
+		if err := unix.Setrlimit(unix.RLIMIT_MEMLOCK, &rl); err != nil {
+			fmt.Println("HELPER-ERR setrlimit:", err)
+			os.Exit(2)
+		}
+		err := ProbeMlockall()
+		kb, kbErr := LockedMemoryKB()
+		fmt.Printf("HELPER-RESULT err=%v vmlck=%d kbErr=%v\n", err, kb, kbErr)
 	case "unlimited":
 		rl.Cur = rl.Max
 		if err := unix.Setrlimit(unix.RLIMIT_MEMLOCK, &rl); err != nil {
@@ -132,5 +149,45 @@ func TestLockMemoryLocksCurrentAndFuturePages(t *testing.T) {
 func TestLockedMemoryKBReadsProcStatus(t *testing.T) {
 	if _, err := LockedMemoryKB(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A finite RLIMIT_MEMLOCK makes mlockall fail for an unprivileged process:
+// the probe reports it. A process with CAP_IPC_LOCK (root) is not bound by
+// the limit, so the denial cannot be provoked there.
+func TestProbeMlockallReportsAFiniteLimit(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root holds CAP_IPC_LOCK: RLIMIT_MEMLOCK does not bind it")
+	}
+	out, err := runHelper(t, "probe-finite")
+	if err != nil {
+		t.Fatalf("helper: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "HELPER-RESULT refused=true") {
+		t.Fatalf("finite limit: want the probe to fail, got:\n%s", out)
+	}
+}
+
+// The probe leaves nothing locked behind: it asks the kernel, then undoes it.
+func TestProbeMlockallLeavesNothingLocked(t *testing.T) {
+	var rl unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_MEMLOCK, &rl); err != nil {
+		t.Fatal(err)
+	}
+	if rl.Max != unix.RLIM_INFINITY && os.Geteuid() != 0 {
+		t.Skipf("hard RLIMIT_MEMLOCK is %d bytes and the process is not privileged", rl.Max)
+	}
+	out, err := runHelper(t, "probe-unlimited")
+	if err != nil {
+		t.Fatalf("helper: %v\n%s", err, out)
+	}
+	if rl.Max != unix.RLIM_INFINITY && strings.Contains(out, "HELPER-RESULT err=mlockall: cannot allocate memory vmlck=0 kbErr=<nil>") {
+		// Root in a user namespace (the CI air gap) is not root for
+		// CAP_IPC_LOCK: the finite hard limit binds it and mlockall is
+		// refused. Nothing was left locked, which is what this test is for.
+		t.Skipf("hard RLIMIT_MEMLOCK is %d bytes and euid 0 is root only inside a user namespace; the probe was refused and left VmLck 0", rl.Max)
+	}
+	if !strings.Contains(out, "HELPER-RESULT err=<nil> vmlck=0 kbErr=<nil>") {
+		t.Fatalf("want a passing probe and VmLck 0 afterwards, got:\n%s", out)
 	}
 }

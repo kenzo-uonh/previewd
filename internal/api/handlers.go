@@ -64,23 +64,42 @@ type Waker interface {
 
 // Server encapsulates dependencies for ingress routing and orchestration triggers.
 type Server struct {
-	logger *slog.Logger
-	cfg    *config.Config
-	secret []byte // the webhook HMAC key, from its systemd credential
-	queue  Queue
-	waker  Waker
-	github GitHub
-	now    func() time.Time
+	logger   *slog.Logger
+	cfg      *config.Config
+	secret   []byte // the webhook secret (HMAC key, or GitLab's shared token), from its systemd credential
+	queue    Queue
+	waker    Waker
+	github   GitHub
+	provider vcs.Provider // the GitLab driver; nil for GitHub, which has its own path
+	now      func() time.Time
 }
 
-// NewServer initializes the HTTP API controller. webhookSecret is the HMAC
-// key every delivery is signed with (secrets.WebhookSecret); it is held in
-// memory only and must not be empty.
-func NewServer(logger *slog.Logger, cfg *config.Config, webhookSecret []byte, queue Queue, waker Waker, github GitHub) (*Server, error) {
+// Option configures a Server beyond the GitHub defaults.
+type Option func(*Server)
+
+// WithProvider sets the forge driver of a GitLab deployment
+// (PREVIEWD_VCS_PROVIDER=gitlab): it authenticates and decodes the hooks.
+func WithProvider(p vcs.Provider) Option {
+	return func(s *Server) { s.provider = p }
+}
+
+// NewServer initializes the HTTP API controller. webhookSecret is the key
+// every delivery is authenticated with (secrets.WebhookSecret: the HMAC key
+// of GitHub, the shared token of GitLab); it is held in memory only and must
+// not be empty. A GitLab deployment (cfg.VCSProvider) must pass its driver
+// with WithProvider.
+func NewServer(logger *slog.Logger, cfg *config.Config, webhookSecret []byte, queue Queue, waker Waker, github GitHub, opts ...Option) (*Server, error) {
 	if len(webhookSecret) == 0 {
 		return nil, errors.New("webhook secret is empty: webhooks are never accepted unsigned")
 	}
-	return &Server{logger: logger, cfg: cfg, secret: webhookSecret, queue: queue, waker: waker, github: github, now: time.Now}, nil
+	s := &Server{logger: logger, cfg: cfg, secret: webhookSecret, queue: queue, waker: waker, github: github, now: time.Now}
+	for _, opt := range opts {
+		opt(s)
+	}
+	if cfg.VCSProvider == vcs.ProviderGitLab && (s.provider == nil || s.provider.Name() != vcs.ProviderGitLab) {
+		return nil, errors.New("PREVIEWD_VCS_PROVIDER=gitlab needs the GitLab driver: webhooks are never accepted unverified")
+	}
+	return s, nil
 }
 
 // Routes constructs the mux router with signature verification middleware.
@@ -90,10 +109,15 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealthCheck())
 
 	// The source filter runs first: a peer outside the allowed CIDRs is
-	// refused before the signature check reads the body.
+	// refused before the signature check reads the body. One forge per
+	// daemon: the other's route does not exist.
+	source := SourceFilter(s.cfg.WebhookAllowedCIDRs, s.logger)
+	if s.cfg.VCSProvider == vcs.ProviderGitLab {
+		mux.Handle("POST /webhooks/gitlab", source(VerifyWebhook(s.provider, s.secret)(http.HandlerFunc(s.handleGitLabWebhook()))))
+		return mux
+	}
 	webhookHandler := http.HandlerFunc(s.handleGitHubWebhook())
-	mux.Handle("POST /webhooks/github", SourceFilter(s.cfg.WebhookAllowedCIDRs, s.logger)(
-		ValidateGitHubSignature(s.secret)(webhookHandler)))
+	mux.Handle("POST /webhooks/github", source(ValidateGitHubSignature(s.secret)(webhookHandler)))
 
 	return mux
 }
@@ -217,6 +241,12 @@ func (s *Server) handlePullRequest(w http.ResponseWriter, r *http.Request, in in
 		return
 	}
 
+	s.processPullRequest(w, r, in, pr)
+}
+
+// processPullRequest records a validated pull or merge request event: a
+// deploy, a teardown, or a label. The forge's decoding ends before it.
+func (s *Server) processPullRequest(w http.ResponseWriter, r *http.Request, in inbound, pr validate.PullRequest) {
 	envID := envid.Generate(pr.Repo, pr.HeadRef, uint64(pr.Number))
 	log := s.logger.With("delivery_id", in.delivery.ID, "delivery_time", in.delivery.Time, "environment_id", envID,
 		"repository", pr.Repo, "pr_number", pr.Number, "action", pr.Action, "commit_sha", pr.HeadSHA)

@@ -20,6 +20,8 @@ var (
 	// with external authentication may also normalize to underscores.
 	loginPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,38}$`)
 	dnsLabelPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+	// POSIX environment variable name, as the shells and runtimes read it.
+	envNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
 )
 
 const (
@@ -125,6 +127,15 @@ func GitRef(s string) error {
 func DNSLabel(s string) error {
 	if !dnsLabelPattern.MatchString(s) {
 		return fmt.Errorf("invalid DNS label %s", Quote(s))
+	}
+	return nil
+}
+
+// EnvName validates the name of an environment variable a PR's compose file
+// sets in a container.
+func EnvName(s string) error {
+	if !envNamePattern.MatchString(s) {
+		return fmt.Errorf("invalid environment variable name %s", Quote(s))
 	}
 	return nil
 }

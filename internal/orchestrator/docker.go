@@ -11,6 +11,7 @@ import (
 	"maps"
 	"math"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -26,6 +27,7 @@ import (
 	"github.com/moby/moby/api/types/image"
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/api/types/volume"
 	"github.com/moby/moby/client"
 )
 
@@ -33,7 +35,7 @@ import (
 // its container, one read-only file per key.
 const SecretsMountTarget = "/run/secrets"
 
-// Ownership labels on the containers and networks previewd creates. They
+// Ownership labels on the containers, networks and volumes previewd creates. They
 // carry identities only, are set by previewd on every create (overriding any
 // image label of the same key), and are read by Observe at startup. Traefik
 // reads no label.
@@ -448,6 +450,102 @@ func containerSpec(env Environment, limits Limits) (*container.Config, *containe
 			},
 		},
 	}
+	if env.Compose != nil {
+		// Non-secret settings of the PR's compose file: its secrets travel by
+		// the ramfs mount only. parseEnv admits literal KEY=value pairs only:
+		// no interpolation, no host inheritance, no env_file.
+		// nosemgrep: semgrep.previewd-no-container-env
+		cfg.Env = slices.Clone(env.Compose.Primary.Env)
+		cfg.Cmd = slices.Clone(env.Compose.Primary.Command)
+		hostCfg.Mounts = append(hostCfg.Mounts, volumeMounts(env.ID, env.Compose.Primary.Mounts)...)
+	}
+	return cfg, hostCfg, nil
+}
+
+// sidecarCaps is what the official database and cache images need at start:
+// their entrypoint, running as root inside the container, owns the data
+// directory and drops to the service's own user. Every other capability is
+// dropped, and no-new-privileges stays set.
+var sidecarCaps = []string{"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"}
+
+// sidecarTmpfsBytes bounds each tmpfs of a sidecar; it counts against the
+// container's memory limit.
+const sidecarTmpfsBytes = 64 << 20
+
+// volumeName is the daemon-wide name of the volume vol of envID.
+func volumeName(envID, vol string) string { return "previewd-" + envID + "-" + vol }
+
+// sidecarName is the container name of the sidecar svc of envID (the
+// primary is named envID itself).
+func sidecarName(envID, svc string) string { return envID + "-" + svc }
+
+func volumeMounts(envID string, mounts []ComposeMount) []mount.Mount {
+	out := make([]mount.Mount, 0, len(mounts))
+	for _, m := range mounts {
+		out = append(out, mount.Mount{Type: mount.TypeVolume, Source: volumeName(envID, m.Volume), Target: m.Target, ReadOnly: m.ReadOnly})
+	}
+	return out
+}
+
+// endpointAlias attaches a container to the environment network under its
+// service name, so that the services reach one another by it. The network is
+// per environment: an alias never collides across environments.
+func endpointAlias(envID, svc string) *network.NetworkingConfig {
+	return &network.NetworkingConfig{EndpointsConfig: map[string]*network.EndpointSettings{
+		networkName(envID): {Aliases: []string{svc}},
+	}}
+}
+
+// sidecarSpec builds the container configuration of a sidecar of env. imageID
+// is the ID of the verified local image, never a name a registry could
+// answer. A sidecar gets what the primary gets (the environment's internal
+// network only, no privilege gain, a read-only root file system, bounded
+// memory without swap and task count) and none of what the primary is given:
+// no secrets mount, no host path, no published port. Its writable state is
+// its named volumes and two bounded tmpfs.
+func sidecarSpec(env Environment, svc ComposeService, imageID string, limits Limits) (*container.Config, *container.HostConfig, error) {
+	if !envid.Valid(env.ID) {
+		return nil, nil, fmt.Errorf("sidecar %s: invalid environment ID %q", svc.Name, textutil.Truncate(env.ID, maxBuildErrorBytes))
+	}
+	if imageID == "" {
+		return nil, nil, fmt.Errorf("environment %s: sidecar %s has no verified image", env.ID, svc.Name)
+	}
+	if err := limits.validate(); err != nil {
+		return nil, nil, fmt.Errorf("environment %s: %w", env.ID, err)
+	}
+	pids := limits.Pids
+	// Env holds the literal, non-secret settings of the PR's compose file (see
+	// parseEnv); a sidecar gets no secrets mount.
+	// nosemgrep: semgrep.previewd-no-container-env
+	cfg := &container.Config{
+		Image: imageID,
+		Env:   slices.Clone(svc.Env),
+		Cmd:   slices.Clone(svc.Command),
+		Labels: map[string]string{
+			LabelEnv: env.ID,
+			LabelJob: strconv.FormatInt(env.JobID, 10),
+		},
+	}
+	tmpfs := func(target string, mode os.FileMode) mount.Mount {
+		return mount.Mount{Type: mount.TypeTmpfs, Target: target, TmpfsOptions: &mount.TmpfsOptions{
+			SizeBytes: sidecarTmpfsBytes, Mode: mode, Options: [][]string{{"nosuid"}, {"nodev"}},
+		}}
+	}
+	hostCfg := &container.HostConfig{
+		NetworkMode:    container.NetworkMode(networkName(env.ID)),
+		AutoRemove:     false,
+		CapDrop:        []string{"ALL"},
+		CapAdd:         slices.Clone(sidecarCaps),
+		SecurityOpt:    []string{"no-new-privileges:true"},
+		ReadonlyRootfs: true,
+		Resources: container.Resources{
+			CgroupParent: EnvCgroupParent,
+			Memory:       limits.MemoryBytes,
+			MemorySwap:   limits.MemoryBytes,
+			PidsLimit:    &pids,
+		},
+		Mounts: append([]mount.Mount{tmpfs("/tmp", 0o1777), tmpfs("/run", 0o755)}, volumeMounts(env.ID, svc.Mounts)...),
+	}
 	return cfg, hostCfg, nil
 }
 
@@ -460,20 +558,24 @@ func containerSpec(env Environment, limits Limits) (*container.Config, *containe
 // the cgroupfs driver it is a plain directory.
 const EnvCgroupParent = "system.slice"
 
-// Deploy starts the environment's container on its internal network only,
-// joins the proxy to that network, and returns the address the route
-// document points to.
+// Deploy starts the environment on its internal network only, joins the
+// proxy to that network, and returns the address the route document points
+// to. With env.Compose, the sidecars start first (their images verified on
+// the host, their named volumes created and checked), then the primary.
 func (d *DockerEngine) Deploy(ctx context.Context, env Environment) (netip.AddrPort, error) {
 	cfg, hostCfg, err := containerSpec(env, d.limits)
 	if err != nil {
 		return netip.AddrPort{}, err
 	}
+	createOpts := client.ContainerCreateOptions{Config: cfg, HostConfig: hostCfg, Name: env.ID}
+	if env.Compose != nil {
+		if err := d.startSidecars(ctx, env); err != nil {
+			return netip.AddrPort{}, err
+		}
+		createOpts.NetworkingConfig = endpointAlias(env.ID, env.Compose.Primary.Name)
+	}
 
-	resp, err := d.client.ContainerCreate(ctx, client.ContainerCreateOptions{
-		Config:     cfg,
-		HostConfig: hostCfg,
-		Name:       env.ID,
-	})
+	resp, err := d.client.ContainerCreate(ctx, createOpts)
 	if err != nil {
 		return netip.AddrPort{}, fmt.Errorf("failed to create environment container %s: %w", env.ID, err)
 	}
@@ -497,6 +599,90 @@ func (d *DockerEngine) Deploy(ctx context.Context, env Environment) (netip.AddrP
 		return netip.AddrPort{}, fmt.Errorf("inspect environment container %s: %w", env.ID, err)
 	}
 	return backendAddr(res.Container, netName, env.Port)
+}
+
+// startSidecars verifies every sidecar image on the host, creates the
+// environment's volumes, then creates and starts each sidecar. Nothing
+// reaches the daemon before every image is verified, and nothing is pulled.
+// A failure leaves what was created for Destroy (the reconciler's rollback,
+// or the startup sweep) to remove by ownership label.
+func (d *DockerEngine) startSidecars(ctx context.Context, env Environment) error {
+	type planned struct {
+		name string
+		cfg  *container.Config
+		host *container.HostConfig
+		svc  ComposeService
+	}
+	plan := make([]planned, 0, len(env.Compose.Sidecars))
+	for _, svc := range env.Compose.Sidecars {
+		imageID, err := d.resolveSidecarImage(ctx, svc.Image)
+		if err != nil {
+			return fmt.Errorf("sidecar %s: %w", svc.Name, err)
+		}
+		cfg, host, err := sidecarSpec(env, svc, imageID, d.limits)
+		if err != nil {
+			return err
+		}
+		plan = append(plan, planned{sidecarName(env.ID, svc.Name), cfg, host, svc})
+	}
+	if err := d.createVolumes(ctx, env); err != nil {
+		return err
+	}
+	for _, p := range plan {
+		resp, err := d.client.ContainerCreate(ctx, client.ContainerCreateOptions{
+			Config: p.cfg, HostConfig: p.host, Name: p.name, NetworkingConfig: endpointAlias(env.ID, p.svc.Name),
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create sidecar container %s: %w", p.name, err)
+		}
+		if _, err := d.client.ContainerStart(ctx, resp.ID, client.ContainerStartOptions{}); err != nil {
+			return fmt.Errorf("failed to start sidecar container %s: %w", p.name, err)
+		}
+	}
+	return nil
+}
+
+// resolveSidecarImage returns the ID of the local image of ref (a canonical
+// name:tag@sha256:<digest> reference of the allowlist) after the checks of a
+// base image: its local name:tag is the pinned digest and it carries no
+// ONBUILD trigger. The container runs that ID, so the tag moving after the
+// check changes nothing. A missing image is an error: previewd never pulls.
+func (d *DockerEngine) resolveSidecarImage(ctx context.Context, ref string) (string, error) {
+	nameTag, _, err := validate.SplitBaseImage(ref)
+	if err != nil {
+		return "", fmt.Errorf("image %s: %w", textutil.Truncate(ref, maxBuildErrorBytes), err)
+	}
+	res, err := d.client.ImageInspect(ctx, nameTag)
+	if err != nil {
+		return "", fmt.Errorf("image %s is not loaded on the host as %s (previewd never pulls): %w", ref, nameTag, err)
+	}
+	if err := checkBaseImage(ref, res.InspectResponse); err != nil {
+		return "", err
+	}
+	return res.ID, nil
+}
+
+// createVolumes creates the named volumes of env.Compose, labelled with the
+// ownership labels, on the plain local driver without option. The daemon
+// answers an existing volume of that name instead of failing: it is accepted
+// only if it is ours (the label), local, and without option, since a driver
+// option could make it a bind mount of a host path.
+func (d *DockerEngine) createVolumes(ctx context.Context, env Environment) error {
+	for _, vol := range env.Compose.Volumes {
+		name := volumeName(env.ID, vol)
+		res, err := d.client.VolumeCreate(ctx, client.VolumeCreateOptions{
+			Name:   name,
+			Driver: "local",
+			Labels: map[string]string{LabelEnv: env.ID, LabelJob: strconv.FormatInt(env.JobID, 10)},
+		})
+		if err != nil {
+			return fmt.Errorf("create volume %s: %w", name, err)
+		}
+		if v := res.Volume; v.Name != name || v.Driver != "local" || len(v.Options) != 0 || v.Labels[LabelEnv] != env.ID {
+			return fmt.Errorf("volume %s already exists and is not previewd's plain local volume of %s: refusing to reuse it", name, env.ID)
+		}
+	}
+	return nil
 }
 
 // connectProxy joins the proxy container to netName. Already joined is fine.
@@ -548,14 +734,13 @@ func backendAddr(c container.InspectResponse, netName string, port int) (netip.A
 	return netip.AddrPortFrom(ep.IPAddress, uint16(port)), nil // #nosec G115 -- port checked within 1..65535 above
 }
 
-// Destroy aggressively terminates the container, purges the image, and removes the network.
+// Destroy aggressively terminates every container of the environment (the
+// primary and its sidecars, by ownership label), removes the network, then
+// the named volumes (in use until the containers are gone), and purges the
+// image.
 func (d *DockerEngine) Destroy(ctx context.Context, id string) error {
-	opts := client.ContainerRemoveOptions{
-		Force:         true,
-		RemoveVolumes: true,
-	}
-	if _, err := d.client.ContainerRemove(ctx, id, opts); err != nil && !errdefs.IsNotFound(err) {
-		return fmt.Errorf("container teardown failed: %w", err)
+	if err := d.removeContainers(ctx, id); err != nil {
+		return err
 	}
 
 	netName := networkName(id)
@@ -566,11 +751,51 @@ func (d *DockerEngine) Destroy(ctx context.Context, id string) error {
 		return fmt.Errorf("network teardown failed: %w", err)
 	}
 
+	if err := d.removeVolumes(ctx, id); err != nil {
+		return err
+	}
+
 	imgName := fmt.Sprintf("%s:latest", id)
 	if _, err := d.client.ImageRemove(ctx, imgName, client.ImageRemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
 		return fmt.Errorf("image teardown failed: %w", err)
 	}
 
+	return nil
+}
+
+// removeContainers force-removes the container named id (created before
+// ownership labels existed) and every container labelled as id's.
+func (d *DockerEngine) removeContainers(ctx context.Context, id string) error {
+	opts := client.ContainerRemoveOptions{
+		Force:         true,
+		RemoveVolumes: true,
+	}
+	if _, err := d.client.ContainerRemove(ctx, id, opts); err != nil && !errdefs.IsNotFound(err) {
+		return fmt.Errorf("container teardown failed: %w", err)
+	}
+	owned, err := d.client.ContainerList(ctx, client.ContainerListOptions{All: true, Filters: make(client.Filters).Add("label", LabelEnv+"="+id)})
+	if err != nil {
+		return fmt.Errorf("list containers of %s: %w", id, err)
+	}
+	for _, c := range owned.Items {
+		if _, err := d.client.ContainerRemove(ctx, c.ID, opts); err != nil && !errdefs.IsNotFound(err) {
+			return fmt.Errorf("container teardown failed: %w", err)
+		}
+	}
+	return nil
+}
+
+// removeVolumes removes the named volumes labelled as id's.
+func (d *DockerEngine) removeVolumes(ctx context.Context, id string) error {
+	owned, err := d.client.VolumeList(ctx, client.VolumeListOptions{Filters: make(client.Filters).Add("label", LabelEnv+"="+id)})
+	if err != nil {
+		return fmt.Errorf("list volumes of %s: %w", id, err)
+	}
+	for _, v := range owned.Items {
+		if _, err := d.client.VolumeRemove(ctx, v.Name, client.VolumeRemoveOptions{}); err != nil && !errdefs.IsNotFound(err) {
+			return fmt.Errorf("volume teardown failed: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -595,9 +820,10 @@ func (d *DockerEngine) disconnectProxy(ctx context.Context, netName string) erro
 	return nil
 }
 
-// Observe reports, per environment, the containers and networks previewd
-// owns on the host: by ownership label, or by name for resources created
-// before labels existed (container <env-id>, network <env-id>-net).
+// Observe reports, per environment, the containers (primary and sidecars),
+// networks and named volumes previewd owns on the host: by ownership label,
+// or by name for resources created before labels existed (container <env-id>,
+// network <env-id>-net).
 func (d *DockerEngine) Observe(ctx context.Context) (map[string]EngineState, error) {
 	containers, err := d.client.ContainerList(ctx, client.ContainerListOptions{All: true})
 	if err != nil {
@@ -607,11 +833,17 @@ func (d *DockerEngine) Observe(ctx context.Context) (map[string]EngineState, err
 	if err != nil {
 		return nil, fmt.Errorf("list networks: %w", err)
 	}
-	return observe(containers.Items, networks.Items), nil
+	volumes, err := d.client.VolumeList(ctx, client.VolumeListOptions{Filters: make(client.Filters).Add("label", LabelEnv)})
+	if err != nil {
+		return nil, fmt.Errorf("list volumes: %w", err)
+	}
+	return observe(containers.Items, networks.Items, volumes.Items), nil
 }
 
-// observe groups owned containers and networks by environment.
-func observe(containers []container.Summary, networks []network.Summary) map[string]EngineState {
+// observe groups owned containers, networks and volumes by environment. A
+// volume alone makes an environment (a crash between its creation and the
+// first container): the sweep then destroys it.
+func observe(containers []container.Summary, networks []network.Summary, volumes []volume.Volume) map[string]EngineState {
 	states := map[string]EngineState{}
 	for _, c := range containers {
 		name := ""
@@ -623,11 +855,22 @@ func observe(containers []container.Summary, networks []network.Summary) map[str
 			continue
 		}
 		st := states[env]
-		st.Running = st.Running || c.State == container.StateRunning
 		st.Containers++
-		if job, err := strconv.ParseInt(c.Labels[LabelJob], 10, 64); err == nil && job > 0 && name == env {
-			st.JobID = job
+		if name == env { // the primary: sidecars are named <env>-<service>
+			st.Running = st.Running || c.State == container.StateRunning
+			if job, err := strconv.ParseInt(c.Labels[LabelJob], 10, 64); err == nil && job > 0 {
+				st.JobID = job
+			}
 		}
+		states[env] = st
+	}
+	for _, v := range volumes {
+		env := ownerOf(v.Labels, "")
+		if env == "" {
+			continue
+		}
+		st := states[env]
+		st.Volumes++
 		states[env] = st
 	}
 	for _, n := range networks {

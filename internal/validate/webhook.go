@@ -88,6 +88,9 @@ type PullRequest struct {
 	SenderLogin string
 	SenderID    int64
 	Label       string // labeled and unlabeled only
+	// ProjectID is the handle the forge's API is addressed by when it is not
+	// Repo: GitLab's numeric project ID. "" for GitHub.
+	ProjectID string
 }
 
 // accountWire is a GitHub account object.
@@ -244,3 +247,8 @@ func cloneURL(s string) error {
 	}
 	return nil
 }
+
+// CloneURL checks the syntax of a clone URL a forge reported: absolute, no
+// user info, no control character. Which schemes and hosts may be fetched is
+// the fetch policy's decision (internal/vcs).
+func CloneURL(s string) error { return cloneURL(s) }
