@@ -316,7 +316,7 @@ func newGLFake(t *testing.T) *glFake {
 		if path != glPath {
 			return http.StatusNotFound, map[string]string{"message": "404 Project Not Found"}
 		}
-		return http.StatusOK, map[string]any{"id": 15, "path_with_namespace": glPath}
+		return http.StatusOK, map[string]any{"id": 15, "path_with_namespace": glPath, "http_url_to_repo": "https://gitlab.corp/acme/sub/app.git"}
 	}
 	mux := http.NewServeMux()
 	guard := func(h http.HandlerFunc) http.HandlerFunc {
@@ -369,7 +369,7 @@ func newGLFake(t *testing.T) *glFake {
 func glMR(state, source, target string) map[string]any {
 	toInt := func(s string) int { var n int; _, _ = fmt.Sscan(s, &n); return n }
 	return map[string]any{
-		"iid": 7, "project_id": toInt(target), "state": state, "sha": glHeadSHA,
+		"iid": 7, "project_id": toInt(target), "state": state, "sha": glHeadSHA, "source_branch": "feature/login",
 		"source_project_id": toInt(source), "target_project_id": toInt(target),
 		"author": map[string]any{"id": glAuthorID, "username": "author"},
 		"labels": []string{"previewd", "needs review"},

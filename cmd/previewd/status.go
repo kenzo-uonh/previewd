@@ -57,25 +57,6 @@ type envView struct {
 	LastActive  *time.Time `json:"last_active_at"`
 }
 
-// state names what an environment is, from its latest job.
-func state(j store.Job) string {
-	switch {
-	case j.Type == store.JobTeardown && j.Status == store.StatusSuccess:
-		return "removed"
-	case j.Type == store.JobTeardown:
-		return "removing"
-	case j.Status == store.StatusSuccess:
-		return "running"
-	case j.Status == store.StatusPendingApproval:
-		return "awaiting-approval"
-	case j.Status == store.StatusFailed:
-		return "failed"
-	case j.Status == store.StatusSkipped:
-		return "superseded"
-	}
-	return "deploying"
-}
-
 func view(st store.EnvironmentStatus) envView {
 	j := st.Latest
 	updated := j.FinishedAt
@@ -83,7 +64,7 @@ func view(st store.EnvironmentStatus) envView {
 		updated = j.CreatedAt
 	}
 	v := envView{
-		Environment: j.EnvID, State: state(j), Repository: printable(j.Source.Repo), PullRequest: j.Source.PRNumber,
+		Environment: j.EnvID, State: st.State(), Repository: printable(j.Source.Repo), PullRequest: j.Source.PRNumber,
 		Commit: j.Source.CommitSHA, Job: j.ID, JobType: string(j.Type), JobStatus: string(j.Status), Failure: string(j.Failure),
 		Updated: time.UnixMilli(updated).UTC(),
 	}

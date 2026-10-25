@@ -78,3 +78,24 @@ func WebhookSecret(name string) ([]byte, error) {
 	}
 	return secret, nil
 }
+
+// TriggerToken reads the bearer token of the CI trigger API from the systemd
+// credential name (Credential's rules). Trailing CR and LF bytes are
+// dropped; what is left must be 32 to 255 printable ASCII characters without
+// space (openssl rand -hex 32 makes one): a short token could be guessed.
+func TriggerToken(name string) ([]byte, error) {
+	data, err := Credential(name)
+	if err != nil {
+		return nil, fmt.Errorf("trigger token: %w", err)
+	}
+	token := bytes.TrimRight(data, "\r\n")
+	ok := len(token) >= 32 && len(token) <= 255
+	for _, c := range token {
+		ok = ok && c > ' ' && c <= '~'
+	}
+	if !ok {
+		clear(data)
+		return nil, fmt.Errorf("trigger token: credential %s must hold 32 to 255 printable characters without space", name)
+	}
+	return token, nil
+}

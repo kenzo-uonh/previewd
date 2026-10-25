@@ -278,8 +278,8 @@ type fjFakeComment struct {
 func fjPullDoc(state, head string) map[string]any {
 	return map[string]any{
 		"number": 7, "state": state,
-		"head":   map[string]any{"sha": testHead, "repo": map[string]any{"full_name": head}},
-		"base":   map[string]any{"repo": map[string]any{"full_name": fjRepo}},
+		"head":   map[string]any{"ref": "feature/login", "sha": testHead, "repo": map[string]any{"full_name": head}},
+		"base":   map[string]any{"repo": map[string]any{"full_name": fjRepo, "clone_url": "https://forge.corp/" + fjRepo + ".git"}},
 		"user":   map[string]any{"id": fjAuthorID, "login": "john.doe"},
 		"labels": []map[string]any{{"name": "previewd"}, {"name": strings.Repeat("l", 80)}},
 	}

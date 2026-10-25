@@ -119,3 +119,42 @@ func TestOpenStatusReaderRefusesBadPaths(t *testing.T) {
 		}
 	}
 }
+
+// The daemon reads an environment as the status reader does (the trigger
+// API's status route).
+func TestStoreEnvironmentAndItsState(t *testing.T) {
+	s, _ := sweptStore(t)
+	ctx := context.Background()
+	if _, ok, err := s.Environment(ctx, envA); ok || err != nil {
+		t.Fatalf("before any job: %v, %v", ok, err)
+	}
+	enqueue(t, s, "d1", envA, JobDeploy, 100)
+	st, ok, err := s.Environment(ctx, envA)
+	if err != nil || !ok || st.State() != "deploying" || st.Running() {
+		t.Fatalf("queued: %+v, %v, %v", st, ok, err)
+	}
+	finish(t, s, acquire(t, s), StatusSuccess)
+	if err := s.UpdateLastActive(ctx, envA, t0.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if st, _, _ = s.Environment(ctx, envA); st.State() != "running" || !st.Running() || !st.LastActive.Equal(t0.Add(time.Minute)) {
+		t.Errorf("running: %+v", st)
+	}
+	if _, _, err := s.Environment(ctx, ""); err == nil {
+		t.Error("an empty ID was looked up")
+	}
+
+	for want, j := range map[string]Job{
+		"removed":           {Type: JobTeardown, Status: StatusSuccess},
+		"removing":          {Type: JobTeardown, Status: StatusQueued},
+		"running":           {Type: JobDeploy, Status: StatusSuccess},
+		"awaiting-approval": {Type: JobDeploy, Status: StatusPendingApproval},
+		"failed":            {Type: JobDeploy, Status: StatusFailed},
+		"superseded":        {Type: JobDeploy, Status: StatusSkipped},
+		"deploying":         {Type: JobDeploy, Status: StatusInProgress},
+	} {
+		if got := (EnvironmentStatus{Latest: j}).State(); got != want {
+			t.Errorf("%s %s: State() = %q, want %q", j.Type, j.Status, got, want)
+		}
+	}
+}

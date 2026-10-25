@@ -72,7 +72,11 @@ type Server struct {
 	github   GitHub
 	provider vcs.Provider // the GitLab or Forgejo driver; nil for GitHub, which has its own path
 	reviews  Reviews      // the Forgejo review truth; nil for the other forges
-	now      func() time.Time
+	// trigger is the CI trigger API, nil unless PREVIEWD_TRIGGER_API=1;
+	// triggerErr what WithTrigger found wrong with its configuration.
+	trigger    *trigger
+	triggerErr error
+	now        func() time.Time
 }
 
 // Option configures a Server beyond the GitHub defaults.
@@ -99,6 +103,12 @@ func NewServer(logger *slog.Logger, cfg *config.Config, webhookSecret []byte, qu
 	for _, opt := range opts {
 		opt(s)
 	}
+	switch {
+	case s.triggerErr != nil:
+		return nil, s.triggerErr
+	case cfg.TriggerAPI != (s.trigger != nil):
+		return nil, errors.New("PREVIEWD_TRIGGER_API and the trigger configuration disagree: the trigger API is never served unauthenticated")
+	}
 	switch cfg.VCSProvider {
 	case vcs.ProviderGitLab:
 		if s.provider == nil || s.provider.Name() != vcs.ProviderGitLab {
@@ -121,6 +131,8 @@ func (s *Server) Routes() http.Handler {
 	// The source filter runs first: a peer outside the allowed CIDRs is
 	// refused before the signature check reads the body. One forge per
 	// daemon: the other's route does not exist.
+	s.triggerRoutes(mux, s.logger)
+
 	source := SourceFilter(s.cfg.WebhookAllowedCIDRs, s.logger)
 	switch s.cfg.VCSProvider {
 	case vcs.ProviderGitLab:

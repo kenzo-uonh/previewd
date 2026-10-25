@@ -31,6 +31,8 @@ type forge struct {
 	// feedback gives the developer the commit status and the sticky comment
 	// of each deploy; nil when PREVIEWD_FEEDBACK=0.
 	feedback orchestrator.Feedback
+	// heads reads a request's head for the CI trigger API.
+	heads api.Heads
 }
 
 // newForge wires the forge cfg selects. A credential that cannot be read, a
@@ -81,7 +83,7 @@ func newGitHubForge(cfg *config.Config, approvals orchestrator.Approvals, logger
 		return forge{}, fmt.Errorf("source fetcher: %w", err)
 	}
 	logger.Info("Source fetch armed", "forge", vcs.ProviderGitHub, "ghes_tarball", fetcher.Tarball(), "max_bytes", cfg.MaxBuildContextBytes)
-	f := forge{provider: vcs.ProviderGitHub, authorizer: authorizer, fetch: fetcher.Fetch, github: ghes}
+	f := forge{provider: vcs.ProviderGitHub, authorizer: authorizer, fetch: fetcher.Fetch, github: ghes, heads: ghes}
 	if cfg.Feedback {
 		f.feedback = vcs.NewNotifier(ghes, nil)
 		logger.Info("Developer feedback armed", "forge", vcs.ProviderGitHub, "permissions", "statuses:write, pull_requests:write")
@@ -129,7 +131,7 @@ func newGitLabForge(cfg *config.Config, approvals orchestrator.Approvals, logger
 		return forge{}, fmt.Errorf("source fetcher: %w", err)
 	}
 	logger.Info("Source fetch armed", "forge", vcs.ProviderGitLab, "gitlab_url", cfg.GitLabURL, "max_bytes", cfg.MaxBuildContextBytes)
-	f := forge{provider: vcs.ProviderGitLab, authorizer: authorizer, fetch: fetcher.Fetch, options: []api.Option{api.WithProvider(gitlab)}}
+	f := forge{provider: vcs.ProviderGitLab, authorizer: authorizer, fetch: fetcher.Fetch, options: []api.Option{api.WithProvider(gitlab)}, heads: gitlab}
 	if cfg.Feedback {
 		f.feedback = vcs.NewNotifier(gitlab, gitlab.ResolveProject)
 		logger.Info("Developer feedback armed", "forge", vcs.ProviderGitLab, "token_scope", "api")
@@ -181,7 +183,7 @@ func newForgejoForge(cfg *config.Config, approvals orchestrator.Approvals, logge
 	logger.Info("Source fetch armed", "forge", vcs.ProviderForgejo, "forgejo_url", cfg.ForgejoURL, "max_bytes", cfg.MaxBuildContextBytes)
 	f := forge{
 		provider: vcs.ProviderForgejo, authorizer: authorizer, fetch: fetcher.Fetch, github: forgejo,
-		options: []api.Option{api.WithProvider(forgejo), api.WithReviews(forgejo)},
+		options: []api.Option{api.WithProvider(forgejo), api.WithReviews(forgejo)}, heads: forgejo,
 	}
 	if cfg.Feedback {
 		f.feedback = vcs.NewNotifier(forgejo, nil)

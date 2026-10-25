@@ -136,6 +136,16 @@ type Config struct {
 	ForgejoTokenCredential         string
 	ForgejoWebhookSecretCredential string
 
+	// CI trigger API (V1.2 spec 3.4): POST /api/v1/trigger and GET
+	// /api/v1/status/{envid}, off unless PREVIEWD_TRIGGER_API=1. The bearer
+	// token is the systemd credential TriggerTokenCredential
+	// (PREVIEWD_TRIGGER_TOKEN_CREDENTIAL, default trigger-token), never a
+	// value in the environment; TriggerAllowedCIDRs
+	// (PREVIEWD_TRIGGER_ALLOWED_CIDRS) are the CI runners' addresses.
+	TriggerAPI             bool
+	TriggerTokenCredential string
+	TriggerAllowedCIDRs    []netip.Prefix
+
 	// Webhook listener (V1 F4, C2). TLS unless AllowPlaintextWebhooks.
 	TLSCertFile            string
 	TLSKeyCredential       string
@@ -158,6 +168,8 @@ const (
 	legacyGitLabHookEnv       = "PREVIEWD_GITLAB_WEBHOOK_SECRET"  // #nosec G101 -- an environment variable name, not a credential
 	forgejoTokenEnv           = "PREVIEWD_FORGEJO_TOKEN"          // #nosec G101 -- an environment variable name, not a credential
 	forgejoHookEnv            = "PREVIEWD_FORGEJO_WEBHOOK_SECRET" // #nosec G101 -- an environment variable name, not a credential
+	triggerTokenEnv           = "PREVIEWD_TRIGGER_TOKEN"          // #nosec G101 -- an environment variable name, not a credential
+	defaultTriggerCredential  = "trigger-token"                   // #nosec G101 -- the name of a systemd credential, not a credential
 	defaultApprovalLabel      = "previewd-approved"
 	defaultDeliveryMaxAge     = 15 * time.Minute
 	minDeliveryMaxAge         = time.Minute
@@ -245,9 +257,9 @@ func Load() (*Config, error) {
 			"remove it and pass the secret as the systemd credential named by PREVIEWD_WEBHOOK_SECRET_CREDENTIAL (default %s)",
 			legacyWebhookSecretEnv, defaultWebhookSecretCredential)
 	}
-	for _, name := range []string{legacyGitLabTokenEnv, legacyGitLabHookEnv, forgejoTokenEnv, forgejoHookEnv} {
+	for _, name := range []string{legacyGitLabTokenEnv, legacyGitLabHookEnv, forgejoTokenEnv, forgejoHookEnv, triggerTokenEnv} {
 		if _, set := os.LookupEnv(name); set {
-			return nil, fmt.Errorf("%s is set: a forge secret is never read from the environment; "+
+			return nil, fmt.Errorf("%s is set: a secret is never read from the environment; "+
 				"remove it and pass it as the systemd credential named by %s_CREDENTIAL", name, name)
 		}
 	}
@@ -479,6 +491,27 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid PREVIEWD_WEBHOOK_ALLOWED_CIDRS: %w", err)
 	}
+	triggerAPI, err := optIn("PREVIEWD_TRIGGER_API")
+	if err != nil {
+		return nil, err
+	}
+	triggerCred, err := credentialName("PREVIEWD_TRIGGER_TOKEN_CREDENTIAL", defaultTriggerCredential)
+	if err != nil {
+		return nil, err
+	}
+	triggerCIDRs, err := validate.CIDRs(os.Getenv("PREVIEWD_TRIGGER_ALLOWED_CIDRS"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid PREVIEWD_TRIGGER_ALLOWED_CIDRS: %w", err)
+	}
+	if !triggerAPI {
+		// A key of an API that is off is a misconfiguration to surface.
+		for _, k := range []string{"PREVIEWD_TRIGGER_TOKEN_CREDENTIAL", "PREVIEWD_TRIGGER_ALLOWED_CIDRS"} {
+			if _, set := os.LookupEnv(k); set {
+				return nil, fmt.Errorf("%s is set but the trigger API is off: set PREVIEWD_TRIGGER_API=1, or remove it", k)
+			}
+		}
+		triggerCred = ""
+	}
 
 	return &Config{
 		APIPort:             apiPort,
@@ -547,6 +580,10 @@ func Load() (*Config, error) {
 		TLSKeyCredential:       keyCred,
 		AllowPlaintextWebhooks: plaintext,
 		WebhookAllowedCIDRs:    cidrs,
+
+		TriggerAPI:             triggerAPI,
+		TriggerTokenCredential: triggerCred,
+		TriggerAllowedCIDRs:    triggerCIDRs,
 	}, nil
 }
 

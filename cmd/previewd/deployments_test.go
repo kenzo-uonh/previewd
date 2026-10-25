@@ -195,3 +195,33 @@ func TestDaemonUnitEgressAllowsOnlyTheProxyAddress(t *testing.T) {
 		t.Errorf("deny any %v, allowed %v; want deny any, then localhost and 172.30.255.2/32 only", denyAny, allowed)
 	}
 }
+
+// The CI companions (V1.2 spec 3.4) keep the trigger token off every
+// command line, never trace the shell, call no third-party action and name
+// no public image: what a runner shows or pulls never carries the token or
+// leaves the site.
+func TestCICompanionsKeepTheTokenOffTheRunner(t *testing.T) {
+	for _, name := range []string{"ci/github-action/action.yml", "ci/gitlab-component/templates/deploy.yml"} {
+		var code []string // the file without its comments, which document the usage
+		for line := range strings.SplitSeq(deploymentFile(t, name), "\n") {
+			if !strings.HasPrefix(strings.TrimSpace(line), "#") {
+				code = append(code, line)
+			}
+		}
+		f := strings.Join(code, "\n")
+		for _, want := range []string{"--config -", `"Authorization: Bearer %s"`, "--proto '=https'", "set -eu", "pull_request"} {
+			if !strings.Contains(f, want) {
+				t.Errorf("%s lacks %s", name, want)
+			}
+		}
+		for _, forbidden := range []string{"set -x", "set -ex", "--header \"Authorization", "-H \"Authorization", "echo \"$PREVIEWD_TRIGGER_TOKEN", "uses:", "--insecure", " -k ", "commit_sha"} {
+			if strings.Contains(f, forbidden) {
+				t.Errorf("%s contains %q", name, forbidden)
+			}
+		}
+	}
+	gl := deploymentFile(t, "ci/gitlab-component/templates/deploy.yml")
+	if !strings.Contains(gl, "image: $[[ inputs.image ]]") || !strings.Contains(gl, "name: review/$CI_COMMIT_REF_SLUG") {
+		t.Error("the GitLab component must take its image from the site and record a review app")
+	}
+}

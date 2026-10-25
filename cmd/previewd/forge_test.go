@@ -53,6 +53,9 @@ func TestNewForgeWiresGitLab(t *testing.T) {
 	if f.provider != vcs.ProviderGitLab {
 		t.Errorf("provider %q", f.provider)
 	}
+	if _, ok := f.heads.(*vcs.GitLab); !ok {
+		t.Errorf("heads is %T, want the GitLab driver", f.heads)
+	}
 }
 
 // Fails closed: a GitLab daemon without its token does not start, and does
@@ -134,6 +137,9 @@ func TestNewForgeWiresForgejo(t *testing.T) {
 	}
 	if _, ok := f.authorizer.(*orchestrator.GHESAuthorizer); !ok {
 		t.Errorf("authorizer is %T, want the GHES gate over Forgejo", f.authorizer)
+	}
+	if _, ok := f.heads.(*vcs.Forgejo); !ok {
+		t.Errorf("heads is %T, want the Forgejo driver", f.heads)
 	}
 	if _, ok := f.github.(*vcs.Forgejo); !ok || f.fetch == nil || len(f.options) != 2 || f.provider != vcs.ProviderForgejo {
 		t.Errorf("github %T, fetch %v, options %d, provider %q", f.github, f.fetch != nil, len(f.options), f.provider)

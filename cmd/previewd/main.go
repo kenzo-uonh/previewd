@@ -318,7 +318,24 @@ func main() {
 	} else {
 		logger.Info("Ingress activity sensing off", "setting", "PREVIEWD_ACTIVITY_SENSING=0")
 	}
-	apiServer, err := api.NewServer(logger, cfg, webhookSecret, db, reconciler, vcsForge.github, vcsForge.options...)
+	options := vcsForge.options
+	if cfg.TriggerAPI {
+		// The CI trigger API (V1.2 spec 3.4): its bearer token is a systemd
+		// credential, held in memory as a digest only (api.WithTrigger).
+		token, err := secrets.TriggerToken(cfg.TriggerTokenCredential)
+		if err != nil {
+			logger.Error("Trigger token refused", "credential", cfg.TriggerTokenCredential, "error", err)
+			os.Exit(1)
+		}
+		options = append(slices.Clone(options), api.WithTrigger(token, vcsForge.heads, db))
+		clear(token)
+		if len(cfg.TriggerAllowedCIDRs) == 0 {
+			logger.Warn("PREVIEWD_TRIGGER_ALLOWED_CIDRS is unset: the trigger API answers any source address")
+		}
+		logger.Info("Trigger API armed", "routes", "POST /api/v1/trigger, GET /api/v1/status/{envid}",
+			"allowed_cidrs", len(cfg.TriggerAllowedCIDRs))
+	}
+	apiServer, err := api.NewServer(logger, cfg, webhookSecret, db, reconciler, vcsForge.github, options...)
 	if err != nil {
 		logger.Error("API server refused", "error", err)
 		os.Exit(1)

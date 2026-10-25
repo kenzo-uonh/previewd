@@ -1,0 +1,126 @@
+# previewd GitLab CI component (V1.2 spec 3.4): deploy the merge request to
+# previewd and record it as a GitLab review app (environment review/<branch>)
+# whose URL is the preview's. Runs on any runner that can reach previewd,
+# in an image the site provides (sh and curl, nothing else): no default image
+# is named, so nothing is pulled from a public registry.
+#
+# The webhook stays the primary path: previewd deploys a merge request on its
+# own when GitLab delivers the hook, and tears it down when the merge request
+# is closed or merged. This job nudges it and waits for the URL. It sends the
+# project path and the merge request IID only: previewd reads the branch and
+# the commit from GitLab, and its deploy gate decides, as for a hook, whether
+# the head may run (a fork needs an approver's approval of its exact commit).
+# The trigger token cannot approve anything.
+#
+# Runner leakage: the token is a masked, protected CI/CD variable
+# (PREVIEWD_TRIGGER_TOKEN). It travels on curl's standard input (--config -),
+# never on a command line nor in a file or an artifact; the script never
+# traces (no set -x). The dotenv artifact carries the preview URL only.
+#
+# Usage (.gitlab-ci.yml), with the component published in the instance's
+# catalog or included from a project of the instance:
+#   include:
+#     - component: $CI_SERVER_FQDN/platform/previewd/deploy@1.2.0
+#       inputs:
+#         server_url: https://previewd.corp.example:8443
+#         image: registry.corp.example/tools/curl:8.10
+spec:
+  inputs:
+    server_url:
+      description: previewd's API, https://host[:port] (PREVIEWD_SERVER_URL).
+    image:
+      description: An image from the site's registry with sh and curl.
+    stage:
+      description: The stage of the deploy job.
+      default: deploy
+    timeout_seconds:
+      description: How long to wait for the preview to run.
+      default: "900"
+    ca_file:
+      description: CA bundle that signs previewd's certificate, a path in the image, when its store does not hold it.
+      default: ""
+---
+previewd-deploy:
+  stage: $[[ inputs.stage ]]
+  image: $[[ inputs.image ]]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  variables:
+    PREVIEWD_SERVER_URL: $[[ inputs.server_url ]]
+    PREVIEWD_TIMEOUT: $[[ inputs.timeout_seconds ]]
+    PREVIEWD_CA_FILE: $[[ inputs.ca_file ]]
+    GIT_STRATEGY: none
+  environment:
+    name: review/$CI_COMMIT_REF_SLUG
+    url: $PREVIEWD_PREVIEW_URL
+    deployment_tier: development
+  artifacts:
+    reports:
+      dotenv: previewd.env
+  script:
+    - |
+      set -eu
+      fail() { echo "previewd: $*" >&2; exit 1; }
+
+      PREVIEWD_REPOSITORY=${CI_MERGE_REQUEST_PROJECT_PATH:-}
+      PREVIEWD_PULL_REQUEST=${CI_MERGE_REQUEST_IID:-}
+      PREVIEWD_TRIGGER_TOKEN=${PREVIEWD_TRIGGER_TOKEN:-}
+      case "$PREVIEWD_SERVER_URL" in https://*) ;; *) fail "server_url must be https://host[:port]" ;; esac  # airgap:allow a scheme check, not an endpoint
+      case "$PREVIEWD_PULL_REQUEST" in ''|*[!0-9]*) fail "not a merge request pipeline" ;; esac
+      case "$PREVIEWD_TIMEOUT" in ''|*[!0-9]*) fail "timeout_seconds must be a number" ;; esac
+      case "$PREVIEWD_REPOSITORY" in */*) ;; *) fail "unexpected project path" ;; esac
+      case "$PREVIEWD_REPOSITORY" in *[!A-Za-z0-9._/-]*) fail "the project path holds an unexpected character" ;; esac
+      [ -n "$PREVIEWD_TRIGGER_TOKEN" ] || fail "the CI/CD variable PREVIEWD_TRIGGER_TOKEN is not set"
+      case "$PREVIEWD_TRIGGER_TOKEN" in *[!!-~]*) fail "the token holds a space or a control character" ;; esac
+      server=${PREVIEWD_SERVER_URL%/}
+
+      # api METHOD PATH [BODY]: one call; sets $out (the reply body) and
+      # $status (the HTTP status). The token reaches curl on stdin only.
+      api() {
+        reply=$(mktemp)
+        set -- "$@" ""
+        status=$(
+          printf 'header = "Authorization: Bearer %s"\n' "$PREVIEWD_TRIGGER_TOKEN" |
+            curl --config - --silent --show-error --proto '=https' --tlsv1.2 --max-time 30 \
+              ${PREVIEWD_CA_FILE:+--cacert "$PREVIEWD_CA_FILE"} \
+              --request "$1" --header 'Content-Type: application/json' \
+              ${3:+--data "$3"} --output "$reply" --write-out '%{http_code}' "$server$2"
+        ) || { rm -f "$reply"; fail "cannot reach $server"; }
+        out=$(cat "$reply")
+        rm -f "$reply"
+      }
+      # field NAME: a string field of the JSON reply on stdin.
+      field() { sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p"; }
+
+      body=$(printf '{"repository":"%s","pull_request":%s}' "$PREVIEWD_REPOSITORY" "$PREVIEWD_PULL_REQUEST")
+      api POST /api/v1/trigger "$body"
+      case "$status" in
+        200|202) ;;
+        409) fail "merge request $PREVIEWD_REPOSITORY!$PREVIEWD_PULL_REQUEST is not open" ;;
+        *) fail "trigger refused: HTTP $status" ;;
+      esac
+      env_id=$(printf '%s' "$out" | field environment_id)
+      case "$env_id" in ''|*[!a-z0-9-]*) fail "unexpected reply from previewd" ;; esac
+      echo "previewd: environment $env_id ($(printf '%s' "$out" | field status))"
+
+      deadline=$(( $(date +%s) + PREVIEWD_TIMEOUT ))
+      while :; do
+        api GET "/api/v1/status/$env_id"
+        state=$(printf '%s' "$out" | field state)
+        case "$status:$state" in
+          200:running)
+            url=$(printf '%s' "$out" | field preview_url)
+            echo "previewd: running at $url"
+            printf 'PREVIEWD_PREVIEW_URL=%s\nPREVIEWD_ENVIRONMENT_ID=%s\n' "$url" "$env_id" > previewd.env
+            exit 0 ;;
+          200:failed) fail "the deploy failed at $(printf '%s' "$out" | field failure)" ;;
+          200:removed|200:removing|200:superseded) fail "the environment is $state" ;;
+          200:*|404:*|429:*) ;;
+          *) fail "status refused: HTTP $status" ;;
+        esac
+        [ "$(date +%s)" -lt "$deadline" ] || fail "timed out after ${PREVIEWD_TIMEOUT}s ($state)"
+        if [ "$state" = awaiting-approval ]; then
+          echo "previewd: awaiting an approver's approval of the head commit"
+        fi
+        sleep 10
+      done

@@ -64,6 +64,27 @@ func (e EnvironmentStatus) Running() bool {
 	return e.Latest.Type == JobDeploy && e.Latest.Status == StatusSuccess
 }
 
+// State names what the environment is, from its latest job: running,
+// deploying, awaiting-approval, failed, superseded, removing or removed.
+func (e EnvironmentStatus) State() string {
+	j := e.Latest
+	switch {
+	case j.Type == JobTeardown && j.Status == StatusSuccess:
+		return "removed"
+	case j.Type == JobTeardown:
+		return "removing"
+	case j.Status == StatusSuccess:
+		return "running"
+	case j.Status == StatusPendingApproval:
+		return "awaiting-approval"
+	case j.Status == StatusFailed:
+		return "failed"
+	case j.Status == StatusSkipped:
+		return "superseded"
+	}
+	return "deploying"
+}
+
 // Queries of the status reader: the latest job of each environment and its
 // activity, constant SQL, every value bound.
 const (
@@ -174,10 +195,20 @@ func (r *StatusReader) Environments(ctx context.Context) (out []EnvironmentStatu
 
 // Environment returns envID; false when the queue has no job of it.
 func (r *StatusReader) Environment(ctx context.Context, envID string) (EnvironmentStatus, bool, error) {
+	return environment(ctx, r.db, envID)
+}
+
+// Environment returns envID as the queue and the tap know it, for the
+// status API; false when the queue has no job of it.
+func (s *Store) Environment(ctx context.Context, envID string) (EnvironmentStatus, bool, error) {
+	return environment(ctx, s.db, envID)
+}
+
+func environment(ctx context.Context, db *sql.DB, envID string) (EnvironmentStatus, bool, error) {
 	if !validPreviewID(envID) {
 		return EnvironmentStatus{}, false, fmt.Errorf("environment status: %w: environment %s", ErrInvalidInternalJob, quoted(envID))
 	}
-	st, err := scanStatus(r.db.QueryRowContext(ctx, queryStatus, envID))
+	st, err := scanStatus(db.QueryRowContext(ctx, queryStatus, envID))
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return EnvironmentStatus{}, false, nil

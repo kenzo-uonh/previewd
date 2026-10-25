@@ -381,6 +381,7 @@ type fjPullReply struct {
 	Number *int64  `json:"number"`
 	State  *string `json:"state"`
 	Head   *struct {
+		Ref  *string     `json:"ref"`
 		SHA  *string     `json:"sha"`
 		Repo *fjRepoWire `json:"repo"`
 	} `json:"head"`
