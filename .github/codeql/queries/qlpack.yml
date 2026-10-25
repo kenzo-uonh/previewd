@@ -1,0 +1,5 @@
+name: previewd/codeql-queries
+version: 0.0.1
+description: previewd project queries; they only refine stock queries and are CI-only
+dependencies:
+  codeql/go-all: "*"

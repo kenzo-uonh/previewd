@@ -1,0 +1,17 @@
+# CodeQL configuration for the codeql job of .github/workflows/ci.yml.
+#
+# go/log-injection is replaced by previewd/log-injection
+# (.github/codeql/queries/LogInjection.ql): the same query, except that slog
+# call arguments are not sinks while every slog handler of the program is a
+# standard library one. cmd/previewd newLogger is a slog.JSONHandler, which
+# escapes control characters, so a webhook value cannot forge a log record.
+# The query reports again as soon as that stops being true. Test code is
+# excluded from the check; it never ships.
+name: previewd
+queries:
+  - uses: security-extended
+  - uses: security-and-quality
+  - uses: ./.github/codeql/queries
+query-filters:
+  - exclude:
+      id: go/log-injection
