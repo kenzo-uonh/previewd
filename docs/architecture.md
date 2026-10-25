@@ -16,6 +16,8 @@ How previewd turns a signed pull-request webhook into an isolated, routed previe
   - [Disk (V1 F5, V1-I9)](#disk-v1-f5-v1-i9)
   - [Startup sweep](#startup-sweep)
 - [Compose sidecars](#compose-sidecars-v11-spec-33)
+- [Ingress activity (V1.2)](#ingress-activity-v12-spec-33)
+- [CI trigger API (V1.2)](#ci-trigger-api-v12-spec-34)
 - [Audit Trail](#audit-trail)
 - [Formal Verification (Phase 1)](#formal-verification-phase-1)
 
@@ -122,20 +124,20 @@ The staging root lives in memory and must be mounted before starting previewd ([
 
 ## Forges
 
-A forge is a `vcs.Provider` (`internal/vcs/vcs.go`): `Name`, `VerifyWebhook` (authenticates a request against the secret and returns its body, at most 1 MiB), `ParseEvent`, `FetchTarball`, `GetMRState` (open, head commit, trusted) and `GetApprovals`. The daemon serves one (`PREVIEWD_VCS_PROVIDER`). `vcs.Client` (the GitHub App) and `vcs.GitLab` implement it; `vcs.Authorized` matches approvals to `PREVIEWD_APPROVERS` by account ID.
+A forge is a `vcs.Provider` (`internal/vcs/vcs.go`): `Name`, `VerifyWebhook` (authenticates a request against the secret and returns its body, at most 1 MiB), `ParseEvent`, `FetchTarball`, `GetMRState` (open, head commit, trusted) and `GetApprovals`. The daemon serves one (`PREVIEWD_VCS_PROVIDER`). `vcs.Client` (the GitHub App), `vcs.GitLab` and `vcs.Forgejo` implement it; `vcs.Authorized` matches approvals to `PREVIEWD_APPROVERS` by account ID.
 
-| | GitHub (GHES, github.com) | GitLab (Self-Managed, gitlab.com) |
-|---|---|---|
-| Route | `POST /webhooks/github` | `POST /webhooks/gitlab` |
-| Authentication | `X-Hub-Signature-256`, HMAC-SHA256 of the body | `X-Gitlab-Token`, the shared secret, compared in constant time (digests, `subtle.ConstantTimeCompare`) |
-| Event | `X-GitHub-Event: pull_request`, `pull_request_review` | `X-Gitlab-Event: Merge Request Hook` |
-| Replay key | `X-GitHub-Delivery` (UUIDv1) and the body's digest | `X-Gitlab-Event-UUID` (body digest when absent) and the body's digest |
-| Order of intents | the delivery UUID's time | the instant the hook is received |
-| API credential | installation token per read, scoped, revoked | access token in `PRIVATE-TOKEN`, read only |
-| Trusted | head in the repository, opener can write | head in the project, author an active member with Developer or more |
-| Approval | a review (or label), bound to its `commit_id` | `approved` / `unapproved` hooks; bound to the head the hook named, confirmed on GitLab at each use (`Approval.CommitSHA` is empty) |
+| | GitHub (GHES, github.com) | GitLab (Self-Managed, gitlab.com) | Forgejo, Gitea (V1.2) |
+|---|---|---|---|
+| Route | `POST /webhooks/github` | `POST /webhooks/gitlab` | `POST /webhooks/forgejo` |
+| Authentication | `X-Hub-Signature-256`, HMAC-SHA256 of the body | `X-Gitlab-Token`, the shared secret, compared in constant time (digests, `subtle.ConstantTimeCompare`) | `X-Forgejo-Signature` and/or `X-Gitea-Signature`, HMAC-SHA256 of the body as bare hex, each present one must match (`subtle.ConstantTimeCompare`) |
+| Event | `X-GitHub-Event: pull_request`, `pull_request_review` | `X-Gitlab-Event: Merge Request Hook` | `X-Forgejo-Event` / `X-Gitea-Event` (must agree, and agree with the signed body): `pull_request`, `pull_request_approved`, `pull_request_rejected` |
+| Replay key | `X-GitHub-Delivery` (UUIDv1) and the body's digest | `X-Gitlab-Event-UUID` (body digest when absent) and the body's digest | `X-Forgejo-Delivery` / `X-Gitea-Delivery` (required UUID) and the body's digest |
+| Order of intents | the delivery UUID's time | the instant the hook is received | the instant the delivery is received |
+| API credential | installation token per read, scoped, revoked | access token in `PRIVATE-TOKEN`, read only | access token in `Authorization: token`, a repository administrator's |
+| Trusted | head in the repository, opener can write | head in the project, author an active member with Developer or more | head in the repository, author with `write`, `admin` or `owner` |
+| Approval | a review (or label), bound to its `commit_id` | `approved` / `unapproved` hooks; bound to the head the hook named, confirmed on GitLab at each use (`Approval.CommitSHA` is empty) | an approving review, bound to the review read from the API in the same step (its ID, `commit_id`, `submitted_at`) |
 
-GitLab ingestion shares the pull request path of GitHub from the decoded event on (signed window, environment ID, enqueue). `cmd/previewd/forge.go` wires the forge the daemon serves: `orchestrator.GitLabAuthorizer` is its deploy gate and `vcs.GitLabFetcher` its source fetch (the store keeps a project by path, GitLab is addressed by ID, so the path is resolved at each use). Approvals are recorded and confirmed as described in [Configuration: GitLab](configuration.md#gitlab).
+GitLab and Forgejo ingestion share the pull request path of GitHub from the decoded event on (signed window, environment ID, enqueue). `cmd/previewd/forge.go` wires the forge the daemon serves: `orchestrator.GitLabAuthorizer` is GitLab's deploy gate and `vcs.GitLabFetcher` its source fetch (the store keeps a project by path, GitLab is addressed by ID, so the path is resolved at each use). Forgejo answers the questions GHES answers (the pull request, its reviews on their commits, an account's permission), so `vcs.Forgejo` is read by the GitHub gate, `orchestrator.GHESAuthorizer`, unchanged, and `vcs.ForgejoFetcher` fetches the repository's archive. Approvals are recorded and confirmed as described in [Configuration: GitLab](configuration.md#gitlab) and [Configuration: Forgejo and Gitea](configuration.md#forgejo-and-gitea).
 
 ## Webhook Ingestion
 
@@ -318,7 +320,7 @@ Opt-in (`PREVIEWD_COMPOSE_ENABLED=1`, see [Configuration](configuration.md#compo
 
 **Storage.** Named volumes only, each declared at the top level without any option (a driver, a driver option or `external` could turn it into a host bind mount) and named as a DNS label. A host path (`/…`, `./…`, `../…`, `~…`, anything with a slash), a `bind` or `tmpfs` mount, an anonymous volume, a mode other than `ro`/`rw` and a target that is not a clean absolute path, or is under `/run/secrets`, `/proc`, `/sys` or `/dev`, are refused. The daemon-wide volume name is `previewd-<env-id>-<name>`; it is created on the plain `local` driver with the ownership labels. A volume of that name that already exists is reused only if it carries this environment's label, uses `local` and has no option.
 
-**Network and ingress.** Every container of the environment attaches to the environment's internal bridge network only (`<env-id>-net`, the existing name) and answers to its service name there, so `postgres` resolves from the application. `ports` and `expose` are counted and dropped (the count is logged): nothing is published, and the network has no route out. The route document points to the application container only; the proxy joins the network as before.
+**Network and ingress.** Every container of the environment attaches to the environment's internal bridge network only (`<env-id>-net`, the existing name) and answers there to two aliases: its service name and its canonical name `<service>.internal` (V1.2 spec 3.2, `orchestrator.ServiceAliases`), so `postgres` and `postgres.internal` resolve from the application, and the application's own name from a sidecar. `.internal` is the top-level domain ICANN reserved for private use; Docker's embedded resolver serves the aliases on that network only, so a name never resolves from, or collides with, another environment. The proxy joins under no alias. `ports` and `expose` are counted and dropped (the count is logged): nothing is published, and the network has no route out. The route document points to the application container only; the proxy joins the network as before.
 
 **Sidecar containers.** Same as the application's (all capabilities dropped, `no-new-privileges`, read-only root file system, memory limit without swap, task limit, `system.slice` cgroup parent, ownership labels `previewd.env` and `previewd.job`) with three differences:
 
@@ -332,8 +334,22 @@ Opt-in (`PREVIEWD_COMPOSE_ENABLED=1`, see [Configuration](configuration.md#compo
 
 **What it does not do.** No readiness wait (the application must retry its connection to a sidecar that is still starting), no seeding, no per-service resource limits, no sidecar reachable from outside the environment.
 
+## Ingress activity (V1.2 spec 3.3)
+
+previewd records when each environment last served an HTTP request, without being in the request path. Traefik counts requests per router (`traefik_router_requests_total`, router labels on, on the `metrics` entry point bound to `172.30.255.2:8082`), and a router is named after its environment (`proxy.Route.Document`). `proxy.TraefikMetrics` reads the counters every 15 s (plain HTTP to an IP literal on `previewd-proxy`, no proxy, no redirect, 8 MiB cap, a strict parser of the one metric) and observes every environment whose counter moved; the first read is a baseline, and a counter that restarted above zero (Traefik restarted) is activity.
+
+`proxy.ActivityTap` coalesces: `Observe` is a `sync.Map` lookup and an atomic compare-and-swap, never a write; `Flush` (every 5 s) writes each environment at most once per minute through `store.UpdateLastActive`, which records only an environment the queue has a job of and never moves the instant back (schema 5, table `activity`). A failed write is retried a minute later, never sooner; an unknown or idle environment is forgotten, and at most 4,096 are tracked. Heavy traffic therefore costs the database one write per environment per minute.
+
+A forward-auth hook in each route would have put the daemon in front of every preview request, handed it every request's headers, and made a daemon restart an outage of every preview: the counters avoid all three. The activity is read by `previewd list`, `previewd status` and `GET /api/v1/status/{env}`; it is information, not a control.
+
+## CI trigger API (V1.2 spec 3.4)
+
+Off unless `PREVIEWD_TRIGGER_API=1`. `POST /api/v1/trigger` takes a project and a request number only (unknown fields refused), reads the head from the forge (`vcs.Head`: branch, commit, head project, author, clone URL; `PullRequestHead` on each driver), and enqueues a deploy of it as a delivery of its own (a random delivery ID and payload digest, the receipt instant as its order). A head already queued, awaiting approval or running is answered `current` and never rebuilt. The deploy gate then classifies the job from the forge exactly as for a webhook: the trigger records no grant, so an untrusted head still waits for an approver's approval of its exact commit. `GET /api/v1/status/{env}` reports the environment's state and, once it runs, its preview URL.
+
+Both routes are rate limited before authentication (token buckets), then authenticated by a bearer token compared in constant time against the digest of a systemd credential (the token itself is not kept), behind their own source filter (`PREVIEWD_TRIGGER_ALLOWED_CIDRS`). The companion GitHub Action and GitLab CI component (`deployments/ci/`) are POSIX shell and curl: the token travels on curl's standard input, never on a command line.
+
 ## Developer feedback (V1.1 spec 3.3)
 
 The reconciler reports each deploy through `orchestrator.Feedback` (`*vcs.Notifier` in the daemon; nil when `PREVIEWD_FEEDBACK=0`): `Begin` after the deploy is authorized and before anything is built, `Succeed` after the database records SUCCESS, `Fail` after the rollback, with the step that failed. Each call runs on a context detached from the job and bounded to 10 s; its error is logged at warn in one place (`Reconciler.notify`) and dropped, so feedback cannot fail, delay or roll back a deploy.
 
-`Provider.SetCommitStatus` and `Provider.PostComment` implement it per forge. The comment is the one sticky object: the driver lists the thread, takes the comment that starts with `<!-- previewd-status -->` **and was written by its own credential** (GitHub: `performed_via_github_app.id`; GitLab: the author of `GET /user`, user notes only), skips the write when the body is unchanged, updates it in place otherwise, and creates it when none exists. GitHub writes mint a token scoped to one repository and one permission at write level (`statuses`, `pull_requests`), revoked after use; `checkGrant` still refuses any grant other than the level requested.
+`Provider.SetCommitStatus` and `Provider.PostComment` implement it per forge. The comment is the one sticky object: the driver lists the thread, takes the comment that starts with `<!-- previewd-status -->` **and was written by its own credential** (GitHub: `performed_via_github_app.id`; GitLab: the author of `GET /user`, user notes only; Forgejo: the author of `GET /user`), skips the write when the body is unchanged, updates it in place otherwise, and creates it when none exists. GitHub writes mint a token scoped to one repository and one permission at write level (`statuses`, `pull_requests`), revoked after use; `checkGrant` still refuses any grant other than the level requested.

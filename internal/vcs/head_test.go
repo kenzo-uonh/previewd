@@ -26,7 +26,9 @@ func TestGitHubPullRequestHead(t *testing.T) {
 		"no ref":       func(d map[string]any) { d["head"].(map[string]any)["ref"] = "" },
 		"bad ref":      func(d map[string]any) { d["head"].(map[string]any)["ref"] = "a..b" },
 		"no clone url": func(d map[string]any) { d["base"] = map[string]any{"repo": map[string]string{"full_name": testRepo}} },
-		"other repo":   func(d map[string]any) { d["base"] = map[string]any{"repo": map[string]string{"full_name": "acme/other", "clone_url": "https://x/y.git"}} },
+		"other repo": func(d map[string]any) {
+			d["base"] = map[string]any{"repo": map[string]string{"full_name": "acme/other", "clone_url": "https://x/y.git"}}
+		},
 	} {
 		f.prReply = func() any { d := prDoc(testRepo, "open"); edit(d); return d }
 		if h, err := f.client(t, nil).PullRequestHead(context.Background(), testRepo, 7); err == nil {
@@ -57,7 +59,9 @@ func TestForgejoPullRequestHead(t *testing.T) {
 	for name, edit := range map[string]func(map[string]any){
 		"no ref":       func(d map[string]any) { delete(d["head"].(map[string]any), "ref") },
 		"no clone url": func(d map[string]any) { d["base"] = map[string]any{"repo": map[string]any{"full_name": fjRepo}} },
-		"bad clone":    func(d map[string]any) { d["base"].(map[string]any)["repo"].(map[string]any)["clone_url"] = "https://u:p@x/y.git" },
+		"bad clone": func(d map[string]any) {
+			d["base"].(map[string]any)["repo"].(map[string]any)["clone_url"] = "https://u:p@x/y.git"
+		},
 	} {
 		f.pr = func() any { d := fjPullDoc("open", fjRepo); edit(d); return d }
 		if h, err := c.PullRequestHead(context.Background(), fjRepo, 7); err == nil {

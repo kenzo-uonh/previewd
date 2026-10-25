@@ -10,14 +10,17 @@ Every value is validated at start: a malformed value refuses to start. Each `PRE
 - [Opt-ins that relax a control](#opt-ins-that-relax-a-control)
 - [Webhook listener](#webhook-listener)
 - [GitHub Enterprise Server](#github-enterprise-server)
+- [GitLab](#gitlab)
+- [Forgejo and Gitea](#forgejo-and-gitea)
 - [Credentials](#credentials)
 - [Approvals and trust](#approvals-and-trust)
 - [Secrets and memory](#secrets-and-memory)
 - [Builds](#builds)
 - [Workers and containers](#workers-and-containers) (including [Compose sidecars](#compose-sidecars-previewd_compose_enabled-and-previewd_compose_max_services))
-- [Routing](#routing)
+- [Routing](#routing) (including [ingress activity](#ingress-activity-previewd_activity_sensing-and-previewd_traefik_metrics_addr))
+- [CI trigger API](#ci-trigger-api)
 - [Storage, retention and cleanup](#storage-retention-and-cleanup)
-- [Operator commands](#operator-commands) (`doctor`, `backup`, `restore`)
+- [Operator commands](#operator-commands) (`init`, `setup-credentials`, `doctor`, `list`, `status`, `backup`, `restore`)
 
 ## Quick reference
 
@@ -30,7 +33,7 @@ Every value is validated at start: a malformed value refuses to start. Each `PRE
 | [`PREVIEWD_WEBHOOK_ALLOWED_CIDRS`](#previewd_webhook_allowed_cidrs) | unset (any source) | comma-separated prefixes |
 | [`PREVIEWD_WEBHOOK_SECRET_CREDENTIAL`](#previewd_webhook_secret_credential) | `webhook_secret` | credential name; **required credential** |
 | [`PREVIEWD_DELIVERY_MAX_AGE`](#previewd_delivery_max_age) | `15m` | `1m`..`2h` |
-| [`PREVIEWD_VCS_PROVIDER`](#previewd_vcs_provider) | `github` | `github` or `gitlab` |
+| [`PREVIEWD_VCS_PROVIDER`](#previewd_vcs_provider) | `github` | `github`, `gitlab` or `forgejo` |
 | [`PREVIEWD_GHES_URL`](#previewd_ghes_url) | — | **required** with `github`, `https://host[:port]` |
 | [`PREVIEWD_GHES_CA_FILE`](#previewd_ghes_ca_file) | unset (system roots) | PEM bundle path |
 | [`PREVIEWD_GITHUB_APP_ID`](#previewd_github_app_id-and-previewd_github_app_key_credential) | — | **required** with `github` |
@@ -39,6 +42,10 @@ Every value is validated at start: a malformed value refuses to start. Each `PRE
 | [`PREVIEWD_GITLAB_CA_FILE`](#gitlab) | unset (system roots) | clean absolute PEM bundle path |
 | [`PREVIEWD_GITLAB_TOKEN_CREDENTIAL`](#gitlab) | `gitlab-api-token` | credential name |
 | [`PREVIEWD_GITLAB_WEBHOOK_SECRET_CREDENTIAL`](#gitlab) | `gitlab-webhook-secret` | credential name |
+| [`PREVIEWD_FORGEJO_URL`](#forgejo-and-gitea) | — | **required** with `forgejo`, `https://host[:port]` |
+| [`PREVIEWD_FORGEJO_CA_FILE`](#forgejo-and-gitea) | unset (system roots) | clean absolute PEM bundle path |
+| [`PREVIEWD_FORGEJO_TOKEN_CREDENTIAL`](#forgejo-and-gitea) | `forgejo-api-token` | credential name |
+| [`PREVIEWD_FORGEJO_WEBHOOK_SECRET_CREDENTIAL`](#forgejo-and-gitea) | `forgejo-webhook-secret` | credential name |
 | [`PREVIEWD_APPROVERS`](#previewd_approvers) | unset (no approver) | `owner/repo:login#id`, comma-separated |
 | [`PREVIEWD_LABEL_APPROVAL`](#previewd_label_approval) | unset | exactly `1` |
 | [`PREVIEWD_APPROVAL_LABEL`](#previewd_approval_label) | `previewd-approved` | 1 to 50 bytes |
@@ -64,6 +71,11 @@ Every value is validated at start: a malformed value refuses to start. Each `PRE
 | [`PREVIEWD_TRAEFIK_DOMAIN`](#previewd_traefik_domain) | `local.previewd` | domain |
 | [`PREVIEWD_ROUTES_DIR`](#previewd_routes_dir) | `/var/lib/previewd/routes` | existing absolute directory |
 | [`PREVIEWD_TRAEFIK_CONTAINER`](#previewd_traefik_container) | `traefik-proxy` | container name |
+| [`PREVIEWD_ACTIVITY_SENSING`](#ingress-activity-previewd_activity_sensing-and-previewd_traefik_metrics_addr) | on | `0` or `1` |
+| [`PREVIEWD_TRAEFIK_METRICS_ADDR`](#ingress-activity-previewd_activity_sensing-and-previewd_traefik_metrics_addr) | `172.30.255.2:8082` | `IP:PORT` |
+| [`PREVIEWD_TRIGGER_API`](#ci-trigger-api) | unset (off) | exactly `1` |
+| [`PREVIEWD_TRIGGER_TOKEN_CREDENTIAL`](#ci-trigger-api) | `trigger-token` | credential name; only with the trigger API |
+| [`PREVIEWD_TRIGGER_ALLOWED_CIDRS`](#ci-trigger-api) | unset (any source) | comma-separated prefixes; only with the trigger API |
 | [`PREVIEWD_DB_PATH`](#previewd_db_path) | `previewd.sqlite` | path |
 | [`PREVIEWD_RETENTION`](#previewd_retention) | `720h` | at least `24h` |
 | [`PREVIEWD_ENV_TTL`](#previewd_env_ttl) | `168h` | at least `1h`, or exactly `0` |
@@ -128,9 +140,9 @@ How long after its signed time a delivery is still accepted (default: `15m`, a G
 
 ### `PREVIEWD_VCS_PROVIDER`
 
-`github` (the default: GHES and github.com) or `gitlab` (GitLab Self-Managed CE/EE and gitlab.com). Exactly those two spellings: anything else, case and padding included, refuses to start. One forge per daemon: only that forge's webhook route exists (`/webhooks/github` or `/webhooks/gitlab`).
+`github` (the default: GHES and github.com), `gitlab` (GitLab Self-Managed CE/EE and gitlab.com) or `forgejo` (Forgejo and Gitea, V1.2). Exactly those spellings: anything else, case and padding included (`gitea` too: Gitea is served as `forgejo`), refuses to start. One forge per daemon: only that forge's webhook route exists (`/webhooks/github`, `/webhooks/gitlab` or `/webhooks/forgejo`).
 
-The keys of the other forge are a contradiction, refused at start whatever their value: a stale `PREVIEWD_GHES_URL` in a GitLab deployment (or `PREVIEWD_GITLAB_URL` in a GitHub one) is never ignored. With `gitlab`, `PREVIEWD_WEBHOOK_SECRET_CREDENTIAL` is refused too: the webhook secret is the credential of `PREVIEWD_GITLAB_WEBHOOK_SECRET_CREDENTIAL`. `PREVIEWD_APPROVERS` and `PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS` name projects as the forge spells them (see [Approvals and trust](#approvals-and-trust)); `PREVIEWD_LABEL_APPROVAL` is refused with `gitlab`.
+The keys of the other forges are a contradiction, refused at start whatever their value: a stale `PREVIEWD_GHES_URL` in a GitLab or Forgejo deployment (or any other forge's key in another one) is never ignored. With `gitlab` or `forgejo`, `PREVIEWD_WEBHOOK_SECRET_CREDENTIAL` is refused too: the webhook secret is the credential of `PREVIEWD_GITLAB_WEBHOOK_SECRET_CREDENTIAL` or `PREVIEWD_FORGEJO_WEBHOOK_SECRET_CREDENTIAL`. `PREVIEWD_APPROVERS` and `PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS` name projects as the forge spells them (see [Approvals and trust](#approvals-and-trust)); `PREVIEWD_LABEL_APPROVAL` is refused with `gitlab` and with `forgejo`.
 
 ## GitHub Enterprise Server
 
@@ -173,6 +185,26 @@ The deploy gate (`orchestrator.GitLabAuthorizer`) reads GitLab again before anyt
 
 The merge request's opener is stored as `gitlab-user-<id>` (a hook names its author by ID only); the ID is the identity. A project path is at most 140 bytes (what the queue keeps); a longer one is refused at the hook.
 
+## Forgejo and Gitea
+
+With `PREVIEWD_VCS_PROVIDER=forgejo` (V1.2 spec 3.1): Forgejo, and Gitea, which speaks the same API. The driver uses REST API v1 (`/api/v1`) over net/http only, through no proxy, following no redirect; the token is sent as `Authorization: token <token>` to the configured host only, kept in memory, never logged or quoted.
+
+- `PREVIEWD_FORGEJO_URL` is **required**: `https://host[:port]`, no path (a Forgejo served under a sub-path is not supported), user info, query or fragment.
+- `PREVIEWD_FORGEJO_CA_FILE` is the PEM bundle of the site CA that signs the Forgejo certificate: a clean absolute path; when set it is the only trust.
+- `PREVIEWD_FORGEJO_TOKEN_CREDENTIAL` (default `forgejo-api-token`) names the credential holding an access token of a service account with **Administrator** access to each served repository (Forgejo serves another account's permission to repository administrators only, and trust and approvals are judged on it) and the scope `read:repository`. [Developer feedback](#developer-feedback-previewd_feedback-and-previewd_preview_url_scheme) also needs `write:repository` (commit status), `write:issue` (the sticky comment) and `read:user` (the account whose comment is the sticky one); without them the writes are refused and logged at warn, and the deploy is not affected.
+- `PREVIEWD_FORGEJO_WEBHOOK_SECRET_CREDENTIAL` (default `forgejo-webhook-secret`) names the credential holding the webhook's secret. Every delivery must carry `X-Forgejo-Signature` and/or `X-Gitea-Signature`, the 64 lowercase hex digits of HMAC-SHA256(secret, body) (no `sha256=` prefix), each at most once, every one present matching (constant-time comparison). Create a **Forgejo** (or **Gitea**) webhook, content type `application/json`, with the events **Pull request** and **Pull request approved / rejected**.
+- `PREVIEWD_FORGEJO_TOKEN` and `PREVIEWD_FORGEJO_WEBHOOK_SECRET` (the secrets themselves) refuse to start whatever their value.
+
+Deliveries: `X-Forgejo-Event` / `X-Gitea-Event` must agree; `pull_request` (actions `opened`, `reopened`, `synchronized` or `synchronize`, `closed`) deploys and tears down, `pull_request_approved` and `pull_request_rejected` are reviews; every other event, and the label actions (`labeled`, `unlabeled`, `label_updated`, `label_cleared`: labels carry no authority on Forgejo), are ignored. The event header must name the event the signed body carries. The delivery ID (`X-Forgejo-Delivery` / `X-Gitea-Delivery`, a UUID) is required; with the body's digest it is the replay key. Ordering is by the instant the delivery is received.
+
+A trusted pull request is one whose head lives in the base repository and whose author has `write`, `admin` or `owner` permission there. The deploy gate is the GitHub one (`orchestrator.GHESAuthorizer`) reading Forgejo: it reads the pull request, its reviews and the permission again before anything is fetched or built, and on every re-validation. The source is the repository's archive at the exact commit (`GET /repos/{owner}/{repo}/archive/{sha}.tar.gz`, whose pax header must name the commit), extracted under the same bounds as a GHES tarball. An archive served by redirect (an object store with `SERVE_DIRECT`) is refused.
+
+**Approvals.** An untrusted pull request (a fork, a deleted head, an author who cannot write) deploys only on an approving review of its exact head by an account listed in `PREVIEWD_APPROVERS` (`owner/repo:username#id`, the username at most 39 bytes: Forgejo allows 40, the audit trail keeps 39):
+
+- A review delivery names neither the review nor its commit: previewd reads the approver's reviews from Forgejo in the same step. Their latest verdict must be an approval of the head the delivery names; that review's ID, commit and submission time are what is recorded (`approval_granted`, detail `review`) and windowed (V1-I7). When Forgejo cannot be read, the delivery is answered 503 and nothing is recorded (Forgejo can redeliver it).
+- A request for changes by that account revokes the head (`changes_requested`); a dismissal sends no delivery and is read by the gate and the re-validation (`DISMISSED`). The author's own approval counts for nothing.
+- Reviews are read page by page until an empty page (at most 20): Forgejo caps a page at its `MAX_RESPONSE_ITEMS`, and a list cut short could hide a later change request.
+
 ## Credentials
 
 Credentials are read by name from `$CREDENTIALS_DIRECTORY`, never from a configured path. Pass them in the unit with:
@@ -182,7 +214,7 @@ LoadCredentialEncrypted=github-app-key:/etc/credstore.encrypted/github-app-key
 LoadCredentialEncrypted=webhook_secret:/etc/credstore.encrypted/webhook_secret
 ```
 
-(or `LoadCredential=`). This command seals the secret from standard input:
+(or `LoadCredential=`). `previewd setup-credentials NAME...` seals each secret, typed twice without echo or piped (`< key.pem`), with `systemd-creds encrypt`, and prints the `LoadCredentialEncrypted=` lines (see [Operator commands](#operator-commands)). By hand, this command seals the secret from standard input:
 
 ```bash
 systemd-creds encrypt --name=webhook_secret - /etc/credstore.encrypted/webhook_secret
@@ -196,13 +228,16 @@ In GHES, enable SSL verification on the webhook and make the listener certificat
 | `github-app-key` | `PREVIEWD_GITHUB_APP_KEY_CREDENTIAL` | GitHub App private key |
 | `gitlab-api-token` | `PREVIEWD_GITLAB_TOKEN_CREDENTIAL` | GitLab Project or Group Access Token (`gitlab` provider) |
 | `gitlab-webhook-secret` | `PREVIEWD_GITLAB_WEBHOOK_SECRET_CREDENTIAL` | Secret token of the GitLab hook (`gitlab` provider) |
+| `forgejo-api-token` | `PREVIEWD_FORGEJO_TOKEN_CREDENTIAL` | Forgejo or Gitea access token (`forgejo` provider) |
+| `forgejo-webhook-secret` | `PREVIEWD_FORGEJO_WEBHOOK_SECRET_CREDENTIAL` | HMAC secret of the Forgejo webhook (`forgejo` provider) |
+| `trigger-token` | `PREVIEWD_TRIGGER_TOKEN_CREDENTIAL` | Bearer token of the [CI trigger API](#ci-trigger-api), 32 to 255 printable characters (`openssl rand -hex 32`) |
 | (no default name) | `PREVIEWD_TLS_KEY_CREDENTIAL` | Webhook listener's TLS key |
 
 ## Approvals and trust
 
 ### `PREVIEWD_APPROVERS`
 
-Accounts whose review approves untrusted code, as comma-separated `owner/repo:login#id` entries (repository spelled as GitHub spells it; with `gitlab`, `group[/subgroup]/project:username#id`, the numeric user ID mandatory as well).
+Accounts whose review approves untrusted code, as comma-separated `owner/repo:login#id` entries (repository spelled as GitHub spells it; with `gitlab`, `group[/subgroup]/project:username#id`; with `forgejo`, `owner/repo:username#id` with Forgejo's names, dots and underscores included; the numeric user ID mandatory as well).
 
 - The numeric account ID is mandatory and is the identity; the login is for logs and the audit trail.
 - Any malformed entry, or an account listed twice for a repository, refuses to start.
@@ -331,6 +366,30 @@ Directory of the route documents, watched by Traefik's file provider (default: `
 
 Name of the Traefik container, joined to each environment network (default: `traefik-proxy`). Checked at startup.
 
+### Ingress activity: `PREVIEWD_ACTIVITY_SENSING` and `PREVIEWD_TRAEFIK_METRICS_ADDR`
+
+On by default (V1.2 spec 3.3); `PREVIEWD_ACTIVITY_SENSING=0`, exactly, turns it off. The daemon records when each environment last served an HTTP request (`previewd list`, `previewd status`, the status API):
+
+- previewd is not in the request path. It reads Traefik's per-router request counters every 15 s from `PREVIEWD_TRAEFIK_METRICS_ADDR` (an `IP:PORT` literal, default `172.30.255.2:8082`: the `metrics` entry point of the shipped `traefik.yml`, bound to the proxy's address on `previewd-proxy` and published nowhere). A router is named after its environment; a counter that moved is an environment that served a request. The counters carry no request data.
+- Writes are coalesced in memory: at most one per environment per minute, whatever the traffic, and only for an environment the queue knows (schema 5, table `activity`).
+- `previewd.service` allows the daemon's egress to `172.30.255.2/32` for it. Change the address there, in `traefik.yml` and in this key together.
+- It is information, not a control: a metrics endpoint that cannot be read is logged at warn once (and its recovery once), and nothing else changes.
+
+## CI trigger API
+
+Off unless `PREVIEWD_TRIGGER_API=1` (V1.2 spec 3.4). It serves the companion [GitHub Action](../deployments/ci/github-action/action.yml) and [GitLab CI component](../deployments/ci/gitlab-component/templates/deploy.yml) on the webhook listener (TLS):
+
+| Route | Answers |
+|-------|---------|
+| `POST /api/v1/trigger` with `{"repository": "<project>", "pull_request": <number>}` | `202 queued` (with `environment_id`, `job_id`, `preview_url`), `200 current` when that head is already queued, awaiting approval or running (it is never rebuilt), `409 closed`, `502` when the forge cannot be read |
+| `GET /api/v1/status/{environment_id}` | `state` (`deploying`, `awaiting-approval`, `running`, `failed`, `superseded`, `removing`, `removed`), `job_status`, `commit_sha`, `failure`, `preview_url` once running, `last_active_at`; `404` when unknown |
+
+- A trigger names a project and a number, nothing else: an unknown field (a commit, a branch) is refused. The head is read from the forge, and the deploy it queues is classified by the deploy gate exactly as a webhook's: an untrusted head still runs only on an approver's approval of its exact commit. The token cannot approve anything.
+- `Authorization: Bearer <token>`, compared in constant time against the digest of the `trigger-token` credential (`PREVIEWD_TRIGGER_TOKEN_CREDENTIAL`). `PREVIEWD_TRIGGER_TOKEN` in the environment refuses to start: the token is never read from there.
+- Rate limited before authentication: 10 triggers then one every 6 s, 120 status reads then two a second (`429` with `Retry-After`).
+- `PREVIEWD_TRIGGER_ALLOWED_CIDRS` (the runners' prefixes) filters the source address of both routes; `PREVIEWD_WEBHOOK_ALLOWED_CIDRS` does not apply to them. Unset is any source, logged at warn.
+- `PREVIEWD_TRIGGER_TOKEN_CREDENTIAL` or `PREVIEWD_TRIGGER_ALLOWED_CIDRS` set while the API is off refuses to start.
+
 ## Storage, retention and cleanup
 
 ### `PREVIEWD_DB_PATH`
@@ -376,11 +435,14 @@ The maintenance loop runs a pass at start, then every interval, 1m..24h (default
 
 ## Operator commands
 
-`previewd doctor`, `backup` and `restore` read no credential and need no complete configuration ([Day-2 in deployment.md](deployment.md#9-day-2-doctor-backup-and-restore)).
+`previewd init`, `setup-credentials`, `doctor`, `list`, `status`, `backup` and `restore` read no credential of the daemon and need no complete configuration ([Day-2 in deployment.md](deployment.md#9-day-2-doctor-backup-and-restore)).
 
 | Command | Reads |
 |---------|-------|
-| `previewd doctor [-conf PATH] [-user NAME]` | The `PREVIEWD_*` lines of `PATH` (default `/etc/previewd/previewd.conf`, the unit's `EnvironmentFile=`; it must exist when `-conf` is given), then the environment, then the defaults: [`PREVIEWD_VCS_PROVIDER`](#previewd_vcs_provider), `PREVIEWD_GHES_URL`, `PREVIEWD_GHES_CA_FILE`, `PREVIEWD_GITLAB_URL`, `PREVIEWD_GITLAB_CA_FILE`, [`PREVIEWD_BUILDKIT_CGROUP`](#previewd_buildkit_cgroup) (default `/sys/fs/cgroup/previewd.slice/previewd-builds.slice`), [`PREVIEWD_SECRETS_STAGING_DIR`](#previewd_secrets_staging_dir), [`PREVIEWD_TRAEFIK_CONTAINER`](#previewd_traefik_container). `NAME` is the service user whose uid must own the staging directory (default `previewd`). |
+| `previewd init [-out PATH] [-force] [-user NAME]` | Asks for the preview domain, the forge (`PREVIEWD_VCS_PROVIDER` and its URL, App ID, CA file), the database and routes paths, the listener certificate and key credential name, the allowed base images and the build cgroup, each validated as the daemon does; runs the doctor's checks on those settings; writes `PATH` (default `/etc/previewd/previewd.conf`) with mode `0600`, atomically. No secret is asked for or written. An existing `PATH` is refused unless `-force`, which keeps it as `PATH.replaced-<UTC time>`. When a check fails the file is written only on an explicit `yes` (exit 1 either way). |
+| `previewd setup-credentials [-dir DIR] [-with-key KEY] [-force] NAME...` | Nothing of the configuration. Locks memory (raising `RLIMIT_MEMLOCK` to unlimited: run as root), reads each secret (on a terminal: twice, without echo; piped: to its end, one `NAME` per run, trailing line breaks dropped), runs `/usr/bin/systemd-creds encrypt --name=NAME [--with-key=KEY] - DIR/NAME` with the secret on its standard input, mode `0600`, and prints the `LoadCredentialEncrypted=` lines. The secret is never written in the clear, put on a command line or printed. `DIR` defaults to `/etc/credstore.encrypted`; an existing credential is refused unless `-force`. |
+| `previewd list [-db PATH] [-json]`, `previewd status [-db PATH] [-json] ENV` | [`PREVIEWD_DB_PATH`](#previewd_db_path) when `-db` is not given, read-only: each environment's state, repository, pull request, commit, latest job and last activity. `status` exits 1 for an unknown environment. |
+| `previewd doctor [-conf PATH] [-user NAME]` | The `PREVIEWD_*` lines of `PATH` (default `/etc/previewd/previewd.conf`, the unit's `EnvironmentFile=`; it must exist when `-conf` is given), then the environment, then the defaults: [`PREVIEWD_VCS_PROVIDER`](#previewd_vcs_provider), `PREVIEWD_GHES_URL`, `PREVIEWD_GHES_CA_FILE`, `PREVIEWD_GITLAB_URL`, `PREVIEWD_GITLAB_CA_FILE`, `PREVIEWD_FORGEJO_URL`, `PREVIEWD_FORGEJO_CA_FILE`, [`PREVIEWD_BUILDKIT_CGROUP`](#previewd_buildkit_cgroup) (default `/sys/fs/cgroup/previewd.slice/previewd-builds.slice`), [`PREVIEWD_SECRETS_STAGING_DIR`](#previewd_secrets_staging_dir), [`PREVIEWD_TRAEFIK_CONTAINER`](#previewd_traefik_container). `NAME` is the service user whose uid must own the staging directory (default `previewd`). |
 | `previewd backup [-db PATH] -out FILE` | [`PREVIEWD_DB_PATH`](#previewd_db_path) when `-db` is not given. |
 | `previewd restore -in FILE [-db PATH] [-force]` | [`PREVIEWD_DB_PATH`](#previewd_db_path) when `-db` is not given. |
 

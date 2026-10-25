@@ -170,9 +170,14 @@ func subcommand() (code int, ran bool) {
 		return runRestore(context.Background(), os.Args[2:], os.Stdout, os.Stderr), true
 	case "list", "status":
 		return runStatus(context.Background(), os.Args[1], os.Args[2:], os.Stdout, os.Stderr, time.Now), true
+	case "init":
+		return runInit(context.Background(), os.Args[2:], os.Stdin, os.Getenv, os.Stdout, os.Stderr, newDoctorHost(), time.Now), true
+	case "setup-credentials":
+		return runSetupCredentials(context.Background(), os.Args[2:], os.Stdin, os.Stdout, os.Stderr, newCredentialsHost()), true
 	default:
 		diag := &console{w: os.Stderr}
-		diag.printf("previewd: unknown command %q (run without arguments to start the daemon)\n%s%s%s%s%s", os.Args[1], auditUsage, buildProbeUsage, doctorUsage, backupUsage, statusUsage)
+		diag.printf("previewd: unknown command %q (run without arguments to start the daemon)\n%s%s%s%s%s%s%s", os.Args[1],
+			auditUsage, buildProbeUsage, doctorUsage, backupUsage, statusUsage, initUsage, credentialsUsage)
 		return exitUsage, true
 	}
 }
