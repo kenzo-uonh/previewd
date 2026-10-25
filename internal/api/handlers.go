@@ -70,15 +70,17 @@ type Server struct {
 	queue    Queue
 	waker    Waker
 	github   GitHub
-	provider vcs.Provider // the GitLab driver; nil for GitHub, which has its own path
+	provider vcs.Provider // the GitLab or Forgejo driver; nil for GitHub, which has its own path
+	reviews  Reviews      // the Forgejo review truth; nil for the other forges
 	now      func() time.Time
 }
 
 // Option configures a Server beyond the GitHub defaults.
 type Option func(*Server)
 
-// WithProvider sets the forge driver of a GitLab deployment
-// (PREVIEWD_VCS_PROVIDER=gitlab): it authenticates and decodes the hooks.
+// WithProvider sets the forge driver of a GitLab or a Forgejo deployment
+// (PREVIEWD_VCS_PROVIDER=gitlab or forgejo): it authenticates and decodes
+// the hooks.
 func WithProvider(p vcs.Provider) Option {
 	return func(s *Server) { s.provider = p }
 }
@@ -87,7 +89,8 @@ func WithProvider(p vcs.Provider) Option {
 // every delivery is authenticated with (secrets.WebhookSecret: the HMAC key
 // of GitHub, the shared token of GitLab); it is held in memory only and must
 // not be empty. A GitLab deployment (cfg.VCSProvider) must pass its driver
-// with WithProvider.
+// with WithProvider; a Forgejo one its driver with WithProvider and
+// WithReviews.
 func NewServer(logger *slog.Logger, cfg *config.Config, webhookSecret []byte, queue Queue, waker Waker, github GitHub, opts ...Option) (*Server, error) {
 	if len(webhookSecret) == 0 {
 		return nil, errors.New("webhook secret is empty: webhooks are never accepted unsigned")
@@ -96,8 +99,15 @@ func NewServer(logger *slog.Logger, cfg *config.Config, webhookSecret []byte, qu
 	for _, opt := range opts {
 		opt(s)
 	}
-	if cfg.VCSProvider == vcs.ProviderGitLab && (s.provider == nil || s.provider.Name() != vcs.ProviderGitLab) {
-		return nil, errors.New("PREVIEWD_VCS_PROVIDER=gitlab needs the GitLab driver: webhooks are never accepted unverified")
+	switch cfg.VCSProvider {
+	case vcs.ProviderGitLab:
+		if s.provider == nil || s.provider.Name() != vcs.ProviderGitLab {
+			return nil, errors.New("PREVIEWD_VCS_PROVIDER=gitlab needs the GitLab driver: webhooks are never accepted unverified")
+		}
+	case vcs.ProviderForgejo:
+		if s.provider == nil || s.provider.Name() != vcs.ProviderForgejo || s.reviews == nil {
+			return nil, errors.New("PREVIEWD_VCS_PROVIDER=forgejo needs the Forgejo driver and its reviews: webhooks are never accepted unverified")
+		}
 	}
 	return s, nil
 }
@@ -112,8 +122,12 @@ func (s *Server) Routes() http.Handler {
 	// refused before the signature check reads the body. One forge per
 	// daemon: the other's route does not exist.
 	source := SourceFilter(s.cfg.WebhookAllowedCIDRs, s.logger)
-	if s.cfg.VCSProvider == vcs.ProviderGitLab {
+	switch s.cfg.VCSProvider {
+	case vcs.ProviderGitLab:
 		mux.Handle("POST /webhooks/gitlab", source(VerifyWebhook(s.provider, s.secret)(http.HandlerFunc(s.handleGitLabWebhook()))))
+		return mux
+	case vcs.ProviderForgejo:
+		mux.Handle("POST /webhooks/forgejo", source(VerifyWebhook(s.provider, s.secret)(http.HandlerFunc(s.handleForgejoWebhook()))))
 		return mux
 	}
 	webhookHandler := http.HandlerFunc(s.handleGitHubWebhook())

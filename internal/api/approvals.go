@@ -45,7 +45,7 @@ func (s *Server) truth(r *http.Request, log *slog.Logger, pr validate.PullReques
 	if s.provider != nil {
 		st, err := s.provider.GetMRState(ctx, pr.ProjectID, strconv.FormatUint(uint64(pr.Number), 10))
 		if err != nil {
-			log.Warn("GitLab unavailable: approval judged without GitLab truth (fail closed)", "error", err)
+			log.Warn("Forge unavailable: approval judged without the forge's truth (fail closed)", "forge", s.provider.Name(), "error", err)
 			return false, false
 		}
 		return st.Trusted, st.Open && st.HeadSHA == commit

@@ -384,7 +384,7 @@ func newGHESClient(cfg *config.Config, logger *slog.Logger) (*vcs.Client, error)
 }
 
 func readBounded(path string, limit int64) (data []byte, err error) {
-	f, err := os.Open(path) // #nosec G304 -- the operator's CA bundle (PREVIEWD_GHES_CA_FILE, PREVIEWD_GITLAB_CA_FILE)
+	f, err := os.Open(path) // #nosec G304 -- the operator's CA bundle (PREVIEWD_GHES_CA_FILE, PREVIEWD_GITLAB_CA_FILE, PREVIEWD_FORGEJO_CA_FILE)
 	if err != nil {
 		return nil, err
 	}

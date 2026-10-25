@@ -114,3 +114,53 @@ func TestNewForgeWiresFeedbackOnlyWhenEnabled(t *testing.T) {
 		t.Errorf("feedback = %v, %v; want none when disabled", f.feedback, err)
 	}
 }
+
+func forgejoConfig() *config.Config {
+	return &config.Config{
+		VCSProvider: "forgejo", ForgejoURL: "https://forge.internal.corp", ForgejoTokenCredential: "forgejo-api-token",
+		MaxBuildContextBytes: 1 << 20,
+	}
+}
+
+// Forgejo is served by the GHES deploy gate reading the Forgejo driver, the
+// driver also being the approval handlers' truth and the webhook decoder.
+func TestNewForgeWiresForgejo(t *testing.T) {
+	credentials(t, "forgejo-api-token", "fj-TESTONLY0123456789abcdef")
+	cfg := forgejoConfig()
+	cfg.Feedback = true
+	f, err := newForge(cfg, noApprovals{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f.authorizer.(*orchestrator.GHESAuthorizer); !ok {
+		t.Errorf("authorizer is %T, want the GHES gate over Forgejo", f.authorizer)
+	}
+	if _, ok := f.github.(*vcs.Forgejo); !ok || f.fetch == nil || len(f.options) != 2 || f.provider != vcs.ProviderForgejo {
+		t.Errorf("github %T, fetch %v, options %d, provider %q", f.github, f.fetch != nil, len(f.options), f.provider)
+	}
+	if _, ok := f.feedback.(*vcs.Notifier); !ok {
+		t.Errorf("feedback is %T, want the notifier", f.feedback)
+	}
+}
+
+// Fails closed: a Forgejo daemon without its token, with a malformed one, an
+// unreadable CA bundle or no approval store does not start.
+func TestNewForgeRefusesForgejoWithoutItsToken(t *testing.T) {
+	t.Setenv("CREDENTIALS_DIRECTORY", t.TempDir())
+	if _, err := newForge(forgejoConfig(), noApprovals{}, slog.New(slog.DiscardHandler)); err == nil || !strings.Contains(err.Error(), "forgejo token") {
+		t.Errorf("err = %v; want a refusal naming the Forgejo token", err)
+	}
+	credentials(t, "forgejo-api-token", "token with spaces")
+	if _, err := newForge(forgejoConfig(), noApprovals{}, slog.New(slog.DiscardHandler)); err == nil {
+		t.Error("a malformed token was accepted")
+	}
+	credentials(t, "forgejo-api-token", "fj-TESTONLY0123456789abcdef")
+	cfg := forgejoConfig()
+	cfg.ForgejoCAFile = filepath.Join(t.TempDir(), "absent.pem")
+	if _, err := newForge(cfg, noApprovals{}, slog.New(slog.DiscardHandler)); err == nil || !strings.Contains(err.Error(), "PREVIEWD_FORGEJO_CA_FILE") {
+		t.Errorf("an unreadable CA bundle: err = %v", err)
+	}
+	if _, err := newForge(forgejoConfig(), nil, slog.New(slog.DiscardHandler)); err == nil {
+		t.Error("a Forgejo gate without an approval store was wired")
+	}
+}
