@@ -61,28 +61,33 @@ func WithReviews(r Reviews) Option {
 	return func(s *Server) { s.reviews = r }
 }
 
-// forgeHeader reads a header Forgejo sends under two names: each at most
-// once and, when both are present, equal. "" when neither is.
-func forgeHeader(h http.Header, names ...string) (string, error) {
+// forgeHeader reads a header Forgejo sends under two names, each given with
+// the values the request carries for it: each at most once and, when both
+// are present, equal. "" when neither is. The caller reads the values by the
+// constant name, so the request's whole header map (Authorization and
+// Cookie included) never travels through this function.
+func forgeHeader(name string, values []string, alias string, aliasValues []string) (string, error) {
 	var value string
-	for _, name := range names {
-		values := h.Values(name)
+	for _, h := range []struct {
+		name   string
+		values []string
+	}{{name, values}, {alias, aliasValues}} {
 		switch {
-		case len(values) > 1:
-			return "", fmt.Errorf("more than one %s header", name)
-		case len(values) == 0:
+		case len(h.values) > 1:
+			return "", fmt.Errorf("more than one %s header", h.name)
+		case len(h.values) == 0:
 			continue
-		case value != "" && values[0] != value:
-			return "", fmt.Errorf("%s disagrees with %s", name, names[0])
+		case value != "" && h.values[0] != value:
+			return "", fmt.Errorf("%s disagrees with %s", h.name, name)
 		}
-		value = values[0]
+		value = h.values[0]
 	}
 	return value, nil
 }
 
 func (s *Server) handleForgejoWebhook() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		event, err := forgeHeader(r.Header, forgejoEventHeader, giteaEventHeader)
+		event, err := forgeHeader(forgejoEventHeader, r.Header.Values(forgejoEventHeader), giteaEventHeader, r.Header.Values(giteaEventHeader))
 		switch {
 		case err != nil:
 			s.logger.Error("Rejected event header", "error", err)
@@ -97,7 +102,7 @@ func (s *Server) handleForgejoWebhook() http.HandlerFunc {
 			s.respond(w, http.StatusAccepted, reply{Status: "ignored"})
 			return
 		}
-		raw, err := forgeHeader(r.Header, forgejoDeliveryHeader, giteaDeliveryHeader)
+		raw, err := forgeHeader(forgejoDeliveryHeader, r.Header.Values(forgejoDeliveryHeader), giteaDeliveryHeader, r.Header.Values(giteaDeliveryHeader))
 		if err != nil {
 			s.logger.Error("Rejected delivery ID", "error", err)
 			http.Error(w, "conflicting delivery headers", http.StatusBadRequest)
