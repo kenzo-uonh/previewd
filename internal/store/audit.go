@@ -20,9 +20,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
-	"os"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -324,34 +321,9 @@ type AuditReader struct {
 // version is refused: an older one must first be migrated by the daemon,
 // a newer one belongs to a newer binary.
 func OpenAuditReader(ctx context.Context, path string) (*AuditReader, error) {
-	if path == "" || strings.ContainsAny(path, "?#") {
-		return nil, fmt.Errorf("audit: database path %s is empty or contains '?' or '#'", quoted(path))
-	}
-	abs, err := filepath.Abs(path)
+	db, err := openReadOnly(ctx, "audit", path)
 	if err != nil {
-		return nil, fmt.Errorf("audit: database path: %w", err)
-	}
-	if _, err := os.Stat(abs); err != nil {
-		return nil, fmt.Errorf("audit: %w", err)
-	}
-	q := url.Values{}
-	q.Set("mode", "ro")
-	q.Add("_pragma", "query_only(1)")
-	q.Add("_pragma", "busy_timeout(5000)")
-	db, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: abs, RawQuery: q.Encode()}).String())
-	if err != nil {
-		return nil, fmt.Errorf("audit: open %s: %w", abs, err)
-	}
-	var version int
-	if err := db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
-		return nil, errors.Join(fmt.Errorf("audit: read schema version of %s: %w", abs, err), db.Close())
-	}
-	if version != len(migrations) {
-		return nil, errors.Join(fmt.Errorf("audit: %s is at schema version %d, this binary reads %d: start the matching daemon once to migrate it",
-			abs, version, len(migrations)), db.Close())
-	}
-	if err := verifySchema(ctx, db); err != nil {
-		return nil, errors.Join(err, db.Close())
+		return nil, err
 	}
 	return &AuditReader{db: db}, nil
 }

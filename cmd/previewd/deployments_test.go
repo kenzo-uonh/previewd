@@ -69,6 +69,18 @@ func TestProxyUnitMatchesTheComposeProxy(t *testing.T) {
 	if !strings.Contains(traefik, `"172.30.255.2:80"`) {
 		t.Error("traefik.yml no longer binds the address the unit gives the container")
 	}
+	// The metrics entry point (ingress activity sensing) binds the proxy's
+	// address too, carries router labels, and is published nowhere.
+	for _, want := range []string{`address: "172.30.255.2:8082"`, "entryPoint: metrics", "addRoutersLabels: true"} {
+		if !strings.Contains(traefik, want) {
+			t.Errorf("traefik.yml lacks %s", want)
+		}
+	}
+	for name, file := range map[string]string{"previewd-proxy.service": unit, "docker-compose.yml": compose} {
+		if strings.Contains(file, "8082") {
+			t.Errorf("%s publishes the metrics entry point", name)
+		}
+	}
 }
 
 func TestProxyUnitIsolation(t *testing.T) {
@@ -140,7 +152,7 @@ func TestSecretsMountUnitIsRamfs(t *testing.T) {
 
 func TestDaemonUnitIsOrderedAfterWhatItVerifies(t *testing.T) {
 	unit := deploymentFile(t, "previewd.service")
-	for _, want := range []string{"RequiresMountsFor=/run/previewd/secrets", "LimitMEMLOCK=infinity"} {
+	for _, want := range []string{"RequiresMountsFor=/run/previewd/secrets", "LimitMEMLOCK=infinity", "LimitCORE=0"} {
 		found := false
 		for _, d := range directives(unit) {
 			found = found || d == want
@@ -164,5 +176,52 @@ func TestSysctlDropIn(t *testing.T) {
 	settings := directives(deploymentFile(t, "99-previewd.conf"))
 	if len(settings) != 1 || settings[0] != "-kernel.unprivileged_userns_clone = 1" {
 		t.Errorf("settings = %q; want only the (failure-tolerant) userns knob", settings)
+	}
+}
+
+// The daemon's egress filter stays closed but for loopback and the proxy's
+// one address (its metrics entry point): never the proxy network, never
+// any.
+func TestDaemonUnitEgressAllowsOnlyTheProxyAddress(t *testing.T) {
+	var allowed []string
+	denyAny := false
+	for _, d := range directives(deploymentFile(t, "previewd.service")) {
+		if v, ok := strings.CutPrefix(d, "IPAddressAllow="); ok {
+			allowed = append(allowed, v)
+		}
+		denyAny = denyAny || d == "IPAddressDeny=any"
+	}
+	if !denyAny || strings.Join(allowed, ",") != "localhost,172.30.255.2/32" {
+		t.Errorf("deny any %v, allowed %v; want deny any, then localhost and 172.30.255.2/32 only", denyAny, allowed)
+	}
+}
+
+// The CI companions (V1.2 spec 3.4) keep the trigger token off every
+// command line, never trace the shell, call no third-party action and name
+// no public image: what a runner shows or pulls never carries the token or
+// leaves the site.
+func TestCICompanionsKeepTheTokenOffTheRunner(t *testing.T) {
+	for _, name := range []string{"ci/github-action/action.yml", "ci/gitlab-component/templates/deploy.yml"} {
+		var code []string // the file without its comments, which document the usage
+		for line := range strings.SplitSeq(deploymentFile(t, name), "\n") {
+			if !strings.HasPrefix(strings.TrimSpace(line), "#") {
+				code = append(code, line)
+			}
+		}
+		f := strings.Join(code, "\n")
+		for _, want := range []string{"--config -", `"Authorization: Bearer %s"`, "--proto '=https'", "set -eu", "pull_request"} {
+			if !strings.Contains(f, want) {
+				t.Errorf("%s lacks %s", name, want)
+			}
+		}
+		for _, forbidden := range []string{"set -x", "set -ex", "--header \"Authorization", "-H \"Authorization", "echo \"$PREVIEWD_TRIGGER_TOKEN", "uses:", "--insecure", " -k ", "commit_sha"} {
+			if strings.Contains(f, forbidden) {
+				t.Errorf("%s contains %q", name, forbidden)
+			}
+		}
+	}
+	gl := deploymentFile(t, "ci/gitlab-component/templates/deploy.yml")
+	if !strings.Contains(gl, "image: $[[ inputs.image ]]") || !strings.Contains(gl, "name: review/$CI_COMMIT_REF_SLUG") {
+		t.Error("the GitLab component must take its image from the site and record a review app")
 	}
 }

@@ -39,6 +39,11 @@ const (
 	defaultProbePort  = 9
 	// freeDiskTimeout bounds the startup read of the free-disk floor.
 	freeDiskTimeout = 10 * time.Second
+	// activityReadInterval is how often Traefik's request counters are read;
+	// activityFlushTick how often the tap looks for activity to write (each
+	// environment is written at most once a minute whatever these are).
+	activityReadInterval = 15 * time.Second
+	activityFlushTick    = 5 * time.Second
 )
 
 func main() {
@@ -66,6 +71,13 @@ func main() {
 		"domain", cfg.TraefikDomain,
 		"docker_host", cfg.DockerHost,
 	)
+
+	// No core file may ever hold a secret: refused unless verified, before
+	// any secret is read (the unit also sets LimitCORE=0).
+	if err := hardening.DisableCoreDumps(); err != nil {
+		logger.Error("Core dump suppression refused", "error", err)
+		os.Exit(1)
+	}
 
 	// Lock memory before any secret is read into it.
 	if err := hardening.LockMemory(); err != nil {
@@ -291,7 +303,46 @@ func main() {
 	}
 	logger.Info("Maintenance loop running", "interval", cfg.PruneInterval, "retention", cfg.Retention, "batch", cfg.PruneBatch,
 		"env_ttl", cfg.EnvTTL)
-	apiServer, err := api.NewServer(logger, cfg, webhookSecret, db, reconciler, vcsForge.github, vcsForge.options...)
+	// Ingress activity sensing (V1.2 spec 3.3): Traefik's per-router request
+	// counters, read on a timer, coalesced into at most one write per
+	// environment per minute. Information for operators, not a control: a
+	// proxy whose metrics cannot be read is logged, and nothing else changes.
+	if cfg.ActivitySensing {
+		tap, err := proxy.NewActivityTap(db, func(err error) bool { return errors.Is(err, store.ErrNoJob) }, logger)
+		if err != nil {
+			logger.Error("Activity tap refused", "error", err)
+			os.Exit(1)
+		}
+		counters, err := proxy.NewTraefikMetrics(cfg.TraefikMetricsAddr, tap, logger)
+		if err != nil {
+			logger.Error("Traefik metrics refused", "metrics_addr", cfg.TraefikMetricsAddr, "error", err)
+			os.Exit(1)
+		}
+		background.Go(func() { tap.Run(ctx, activityFlushTick) })
+		background.Go(func() { counters.Run(ctx, activityReadInterval) })
+		logger.Info("Ingress activity sensing armed", "metrics_addr", cfg.TraefikMetricsAddr,
+			"read_interval", activityReadInterval, "write_interval", proxy.ActivityFlushInterval)
+	} else {
+		logger.Info("Ingress activity sensing off", "setting", "PREVIEWD_ACTIVITY_SENSING=0")
+	}
+	options := vcsForge.options
+	if cfg.TriggerAPI {
+		// The CI trigger API (V1.2 spec 3.4): its bearer token is a systemd
+		// credential, held in memory as a digest only (api.WithTrigger).
+		token, err := secrets.TriggerToken(cfg.TriggerTokenCredential)
+		if err != nil {
+			logger.Error("Trigger token refused", "credential", cfg.TriggerTokenCredential, "error", err)
+			os.Exit(1)
+		}
+		options = append(slices.Clone(options), api.WithTrigger(token, vcsForge.heads, db))
+		clear(token)
+		if len(cfg.TriggerAllowedCIDRs) == 0 {
+			logger.Warn("PREVIEWD_TRIGGER_ALLOWED_CIDRS is unset: the trigger API answers any source address")
+		}
+		logger.Info("Trigger API armed", "routes", "POST /api/v1/trigger, GET /api/v1/status/{envid}",
+			"allowed_cidrs", len(cfg.TriggerAllowedCIDRs))
+	}
+	apiServer, err := api.NewServer(logger, cfg, webhookSecret, db, reconciler, vcsForge.github, options...)
 	if err != nil {
 		logger.Error("API server refused", "error", err)
 		os.Exit(1)
@@ -384,7 +435,7 @@ func newGHESClient(cfg *config.Config, logger *slog.Logger) (*vcs.Client, error)
 }
 
 func readBounded(path string, limit int64) (data []byte, err error) {
-	f, err := os.Open(path) // #nosec G304 -- the operator's CA bundle (PREVIEWD_GHES_CA_FILE, PREVIEWD_GITLAB_CA_FILE)
+	f, err := os.Open(path) // #nosec G304 -- the operator's CA bundle (PREVIEWD_GHES_CA_FILE, PREVIEWD_GITLAB_CA_FILE, PREVIEWD_FORGEJO_CA_FILE)
 	if err != nil {
 		return nil, err
 	}

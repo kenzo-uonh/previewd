@@ -14,25 +14,27 @@ previewd ships as a `.deb` and an `.rpm` (`make release` builds both into `dist/
 
 ```bash
 sudo apt install ./previewd_1.0.0_amd64.deb      # or: sudo dnf install --disablerepo='*' ./previewd-1.0.0-1.x86_64.rpm
-sudo editor /etc/previewd/previewd.conf          # PREVIEWD_* settings: paths and identifiers, never a secret
-sudo systemctl enable --now previewd
+sudo previewd init                               # asks for the domain, forge and paths, runs the doctor, writes /etc/previewd/previewd.conf (0600, never a secret)
+sudo previewd setup-credentials webhook_secret   # one per credential init lists: systemd-creds encrypt, no echo, prints the LoadCredentialEncrypted= line
+sudo systemctl edit previewd                     # add those LoadCredentialEncrypted= lines (and IPAddressAllow= for the forge)
+sudo previewd doctor && sudo systemctl enable --now previewd
 ```
 
-The package installs the binary (`/usr/bin/previewd`), the systemd unit, the build slice and the Docker drop-in, and creates the `previewd` system user. Before the first start, seal the credentials, mount the ramfs staging root, start Traefik and allow your GHES address: previewd checks each of them and refuses to start while one is missing. Every step: [Deployment](docs/deployment.md).
+The package installs the binary (`/usr/bin/previewd`), the systemd unit, the build slice and the Docker drop-in, and creates the `previewd` system user. Before the first start, seal the credentials, mount the ramfs staging root, start Traefik and allow your forge's address: previewd checks each of them and refuses to start while one is missing. Every step: [Deployment](docs/deployment.md).
 
 ## The Workflow (How it Works)
 
-1. **A developer opens a pull request** on the organization's GitHub Enterprise Server. GHES sends a signed webhook to previewd; nothing else is contacted.
+1. **A developer opens a pull request** on the organization's forge: GitHub Enterprise Server, GitLab Self-Managed, or Forgejo / Gitea (V1.2). The forge sends a signed webhook to previewd; nothing else is contacted. A CI pipeline can also ask for the preview and wait for its URL ([trigger API](docs/configuration.md#ci-trigger-api), with the companion [GitHub Action](deployments/ci/github-action/action.yml) and [GitLab CI component](deployments/ci/gitlab-component/templates/deploy.yml)); the forge still decides what runs.
 2. **previewd decides whether the code may run.** A branch of the same repository pushed by someone with write access deploys at once. A fork or an outside contributor waits until an approver listed in `PREVIEWD_APPROVERS` approves that exact commit; every decision goes to the audit trail.
-3. **previewd builds and runs it.** It fetches the commit's tarball from GHES with a repository-scoped GitHub App token revoked after use, builds the image without network inside the bounded `previewd-builds.slice` cgroup, and starts the environment on its own private network with its secrets as read-only in-memory files.
-4. **The preview gets its own address.** Traefik serves it at `http://pr-<number>-<hash>.<PREVIEWD_TRAEFIK_DOMAIN>`; previewd automatically posts a status comment and commit status check with the live preview link directly back to the pull request (or GitLab merge request). Each new push rebuilds the preview (from a fork, once the new commit is approved).
+3. **previewd builds and runs it.** It fetches the commit's archive from the forge (on GHES with a repository-scoped GitHub App token revoked after use), builds the image without network inside the bounded `previewd-builds.slice` cgroup, and starts the environment on its own private network with its secrets as read-only in-memory files. Compose sidecars answer there to their service name and to `<service>.internal`.
+4. **The preview gets its own address.** Traefik serves it at `http://pr-<number>-<hash>.<PREVIEWD_TRAEFIK_DOMAIN>`; previewd automatically posts a status comment and commit status check with the live preview link directly back to the pull request (or GitLab merge request). Each new push rebuilds the preview (from a fork, once the new commit is approved). `previewd list` shows every preview and when it last served a request, read from Traefik's counters, never from the request path.
 5. **The preview is destroyed** when the pull request is closed, when its approval is withdrawn (dismissed review, requested changes, label removed), or when its running version reaches the TTL with no newer push (`PREVIEWD_ENV_TTL`, default 7 days). Teardown removes the container, network, image, route and staged secrets.
 
 ## Why it exists
 
 Hosted preview services send source code, and often the secrets an application needs, to someone else's cloud. Banks, hospitals and defense organizations cannot do that: their code and credentials must stay inside their own network, often on machines with no internet access at all. previewd is built for them:
 
-- **Runs entirely on your premises.** One static binary next to Docker and Traefik on a single Linux host, talking to your own GitHub Enterprise Server. It needs no cloud account, calls no service outside your network and installs offline.
+- **Runs entirely on your premises.** One static binary next to Docker and Traefik on a single Linux host, talking to your own GitHub Enterprise Server, GitLab or Forgejo. It needs no cloud account, calls no service outside your network and installs offline.
 - **Treats pull-request code as hostile.** Builds run without network access, containers run locked down on private networks, and code from forks or outside contributors runs only after a named approver has reviewed that exact commit.
 - **Never writes a secret to disk.** previewd's own keys are systemd credentials; application secrets are held in locked memory and handed to a preview only as read-only files in memory.
 - **Leaves a verifiable record.** Every authorization decision is written to a tamper-evident, hash-chained audit trail.
@@ -60,8 +62,13 @@ On this page: [Codebase Structure](#codebase-structure) · [Development & Execut
 │       ├── audit.go               # `previewd audit verify|export`: read-only check and JSON Lines export of the audit trail.
 │       ├── buildprobe.go          # `previewd build-probe`: the network check run inside the startup probe's BuildKit RUN step.
 │       ├── doctor.go              # `previewd doctor`: host pre-flight (build cgroup, dockerd egress, ramfs staging, memory lock, clock skew, Traefik isolation), [PASS]/[FAIL], exit 0/1.
+│       ├── init.go                # `previewd init`: interactive first configuration, checked by the doctor, written 0600 atomically (no secret).
+│       ├── credentials.go         # `previewd setup-credentials`: systemd-creds encrypt from a hidden prompt or a pipe, memory locked, never in argv (term_*, memlock_*: _linux/_other).
+│       ├── status.go              # `previewd list|status`: read-only environment states and last ingress activity.
+│       ├── forge.go               # Wiring of the one forge served: GitHub, GitLab or Forgejo (gate, source fetch, feedback, trigger heads).
 │       └── backup.go              # `previewd backup|restore`: online SQLite snapshot beside the daemon, verified audit chain; restore from a verified snapshot, 0600.
 ├── deployments/
+│   ├── ci/                        # Companion CI clients (V1.2): github-action/action.yml (composite, sh + curl), gitlab-component/templates/deploy.yml (review app); token on stdin only.
 │   ├── docker-compose.yml         # Traefik: digest-pinned, read-only, no socket, routes dir mounted read-only, cgroup parent system.slice.
 │   ├── docker.service.d/
 │   │   └── previewd-builds.conf   # dockerd drop-in: default cgroup parent previewd-builds.slice (BuildKit RUN steps), egress filter (IPAddressDeny).
@@ -70,7 +77,7 @@ On this page: [Codebase Structure](#codebase-structure) · [Development & Execut
 │   ├── run-previewd-secrets.mount # ramfs at /run/previewd/secrets (mode 0700) at boot.
 │   ├── 99-previewd.conf           # /etc/sysctl.d drop-in: unprivileged user namespaces.
 │   ├── previewd-builds.slice      # Bounded subtree of every build: MemoryMax 4G, MemorySwapMax 0, CPUQuota 200%, TasksMax 2048 (D-V1-4).
-│   └── traefik.yml                # Traefik static configuration: file provider only, no API, no telemetry.
+│   └── traefik.yml                # Traefik static configuration: file provider only, no API, no telemetry; a metrics entry point on the proxy address for ingress activity.
 ├── docs/
 │   ├── architecture.md            # Tech stack, ingestion, staging, reconciliation, audit trail, verification.
 │   ├── configuration.md           # Environment variables and credentials.
@@ -79,6 +86,8 @@ On this page: [Codebase Structure](#codebase-structure) · [Development & Execut
 ├── internal/
 │   ├── api/
 │   │   ├── handlers.go            # Webhook receivers for GitHub PR events (validate + envid).
+│   │   ├── gitlab.go, forgejo.go  # GitLab and Forgejo webhook routes (Forgejo approvals bound to the review read from the API).
+│   │   ├── trigger.go             # CI trigger and status API: rate limit, bearer token digest, the forge's head only (opt-in).
 │   │   └── middleware.go          # Bounded body read, HMAC-SHA256 verification (validate).
 │   ├── config/
 │   │   └── config.go              # Air-gapped environment configuration loading.
@@ -95,23 +104,28 @@ On this page: [Codebase Structure](#codebase-structure) · [Development & Execut
 │   │   └── reconciler.go          # Startup sweep (stale build dirs, inventory, destroy, route GC), deployment workers (build slots, build timeout, free-disk floor, build cache prune), maintenance loop (TTL, prune, images).
 │   ├── proxy/
 │   │   ├── route.go               # Traefik file-provider route documents (validated, JSON-as-YAML), the only routing path.
+│   │   ├── activity.go            # Ingress activity: Traefik per-router counters, coalescing tap (one write per environment per minute).
 │   │   └── publish.go             # Atomic publish: temp file, fsync, rename, fsync dir.
 │   ├── secrets/
 │   │   ├── credential.go          # systemd credentials by name from $CREDENTIALS_DIRECTORY (App key, listener key, webhook secret).
 │   │   ├── injector.go            # Loads the secrets file into memory.
 │   │   └── stager*.go             # ramfs staging: fs-type, owner and mode checks, one file per key.
 │   ├── store/
-│   │   ├── db.go                  # modernc.org/sqlite pool (No CGO): WAL, busy_timeout, IMMEDIATE transactions, forward-only migrations (schema 4), incremental auto_vacuum.
+│   │   ├── db.go                  # modernc.org/sqlite pool (No CGO): WAL, busy_timeout, IMMEDIATE transactions, forward-only migrations (schema 5), incremental auto_vacuum.
 │   │   ├── jobs.go                # Durable job queue: replay protection, stale deliveries, leases, startup sweep (TLA+ model).
 │   │   ├── approvals.go           # Approval grants and revocations (order-independent), classification, park, internal teardowns.
 │   │   ├── audit.go               # Append-only, hash-chained audit trail.
 │   │   ├── maintenance.go         # Batched pruning behind the watermark, incremental_vacuum, TTL expiry.
+│   │   ├── activity.go            # Last ingress activity per environment (schema 5), read-only status reader.
 │   │   └── schema.go              # Startup schema check: pinned columns, no BLOB affinity.
 │   ├── textutil/                  # Sanitize: map untrusted text onto [a-zA-Z0-9-] (leaf).
 │   ├── validate/                  # Identifier validators (base images: name:tag@sha256), webhook HMAC and payload schema, layering test (leaf).
 │   └── vcs/
 │       ├── clone.go               # git fallback (no GitHub App): exactly the commit, --depth=1, its argument vectors in one function.
 │       ├── ghes.go                # GHES client as a GitHub App: scoped tokens revoked after use, bounded replies.
+│       ├── gitlab*.go             # GitLab driver: access token, merge requests, approvals, archive.
+│       ├── forgejo.go             # Forgejo / Gitea driver: bare-hex HMAC webhooks, pull requests, reviews, permissions, archive, feedback.
+│       ├── head.go                # A request's head as the forge reports it (CI trigger).
 │       ├── tarball.go             # Source fetch (H2): the commit tarball from GHES, extracted under bounds through os.Root.
 │       └── github.go              # GitHub webhook event names.
 ├── test/e2e/                      # E2E tools, e2e build tag: fakegithub (fake GHES, tarballs), exfil (E3 listener), dockerapi (G1 on the real engine).

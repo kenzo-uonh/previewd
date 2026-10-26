@@ -122,7 +122,13 @@ func ParseGitLabApprovers(s string) (map[string][]Approver, error) {
 // GitLabEventUUID validates X-Gitlab-Event-UUID, the identifier GitLab gives
 // one hook event, and returns its canonical lower-case form: the replay key.
 // Only the canonical 8-4-4-4-12 form is accepted, of any UUID version.
-func GitLabEventUUID(s string) (string, error) {
+func GitLabEventUUID(s string) (string, error) { return EventUUID(s) }
+
+// EventUUID validates a delivery identifier a forge sends as a UUID
+// (X-Gitlab-Event-UUID, X-Forgejo-Delivery) and returns its canonical
+// lower-case form: the replay key. Only the canonical 8-4-4-4-12 form is
+// accepted, of any UUID version.
+func EventUUID(s string) (string, error) {
 	if len(s) != 36 {
 		return "", fmt.Errorf("invalid event uuid %s", Quote(s))
 	}

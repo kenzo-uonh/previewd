@@ -487,12 +487,27 @@ func volumeMounts(envID string, mounts []ComposeMount) []mount.Mount {
 	return out
 }
 
+// InternalDomain is the suffix of the canonical name of a compose service in
+// its environment (V1.2 spec 3.2): postgres is also postgres.internal.
+// .internal is reserved for private use (ICANN, 2024): no public name can
+// ever take it.
+const InternalDomain = "internal"
+
+// ServiceAliases are the names a compose service answers to on its
+// environment network, the primary included: its service name and
+// <service>.internal. Docker's embedded resolver serves them on that network
+// only, which is internal (no gateway, no egress) and per environment: a
+// name never resolves from, or collides with, another environment, and the
+// proxy joins the network under no alias.
+func ServiceAliases(svc string) []string {
+	return []string{svc, svc + "." + InternalDomain}
+}
+
 // endpointAlias attaches a container to the environment network under its
-// service name, so that the services reach one another by it. The network is
-// per environment: an alias never collides across environments.
+// service aliases, so that the services reach one another by them.
 func endpointAlias(envID, svc string) *network.NetworkingConfig {
 	return &network.NetworkingConfig{EndpointsConfig: map[string]*network.EndpointSettings{
-		networkName(envID): {Aliases: []string{svc}},
+		networkName(envID): {Aliases: ServiceAliases(svc)},
 	}}
 }
 

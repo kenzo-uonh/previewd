@@ -374,6 +374,20 @@ var migrations = []string{
 	CREATE TRIGGER audit_events_no_delete BEFORE DELETE ON audit_events
 		BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;
 	PRAGMA user_version = 4;`,
+
+	// 5: HTTP ingress activity (V1.2 spec 3.3, "005_inactivity"). The spec
+	// adds last_active_at to an environments table; that table was dropped by
+	// migration 2 (an environment is its jobs), so the instant lives in a
+	// table of its own, one row per environment, indexed for "idle since".
+	// The coalescing tap writes it at most once a minute per environment,
+	// and only for an environment the queue has a job of (activity.go). The
+	// latest job of an environment is never pruned, so neither is its row.
+	`CREATE TABLE activity (
+		preview_id TEXT PRIMARY KEY CHECK (length(preview_id) BETWEEN 1 AND 63),
+		last_active_at INTEGER NOT NULL CHECK (last_active_at > 0)
+	);
+	CREATE INDEX activity_by_last_active ON activity (last_active_at);
+	PRAGMA user_version = 5;`,
 }
 
 // migrate applies every migration above the database's user_version, each in

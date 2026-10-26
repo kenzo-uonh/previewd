@@ -257,7 +257,7 @@ func TestSourceFilter(t *testing.T) {
 	allowed := []netip.Prefix{netip.MustParsePrefix("10.20.0.0/16"), netip.MustParsePrefix("fd00::/8")}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	reached := 0
-	h := SourceFilter(allowed, logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := SourceFilter(allowed, logger, "Webhook", "PREVIEWD_WEBHOOK_ALLOWED_CIDRS")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reached++
 		w.WriteHeader(http.StatusAccepted)
 	}))
@@ -285,7 +285,7 @@ func TestSourceFilter(t *testing.T) {
 	if reached != 3 {
 		t.Fatalf("handler reached %d times, want 3", reached)
 	}
-	if h := SourceFilter(nil, logger)(okHandler); h == nil {
+	if h := SourceFilter(nil, logger, "Webhook", "PREVIEWD_WEBHOOK_ALLOWED_CIDRS")(okHandler); h == nil {
 		t.Fatal("no prefixes: nil handler")
 	}
 }
