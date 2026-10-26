@@ -61,33 +61,40 @@ func WithReviews(r Reviews) Option {
 	return func(s *Server) { s.reviews = r }
 }
 
-// forgeHeader reads a header Forgejo sends under two names, each given with
-// the values the request carries for it: each at most once and, when both
-// are present, equal. "" when neither is. The caller reads the values by the
-// constant name, so the request's whole header map (Authorization and
-// Cookie included) never travels through this function.
-func forgeHeader(name string, values []string, alias string, aliasValues []string) (string, error) {
+// headerRead is one header as the request carries it: its name, its first
+// value and how many times it was sent.
+type headerRead struct {
+	name  string
+	value string
+	count int
+}
+
+// forgeHeader combines a header Forgejo sends under two names: each at most
+// once and, when both are present, equal. "" when neither is. The caller
+// reads each by its constant name (Get for the value, the length of Values
+// for the count), so the request's whole header map (Authorization and
+// Cookie included) never enters this function.
+func forgeHeader(first, second headerRead) (string, error) {
 	var value string
-	for _, h := range []struct {
-		name   string
-		values []string
-	}{{name, values}, {alias, aliasValues}} {
+	for _, h := range []headerRead{first, second} {
 		switch {
-		case len(h.values) > 1:
+		case h.count > 1:
 			return "", fmt.Errorf("more than one %s header", h.name)
-		case len(h.values) == 0:
+		case h.count == 0:
 			continue
-		case value != "" && h.values[0] != value:
-			return "", fmt.Errorf("%s disagrees with %s", h.name, name)
+		case value != "" && h.value != value:
+			return "", fmt.Errorf("%s disagrees with %s", h.name, first.name)
 		}
-		value = h.values[0]
+		value = h.value
 	}
 	return value, nil
 }
 
 func (s *Server) handleForgejoWebhook() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		event, err := forgeHeader(forgejoEventHeader, r.Header.Values(forgejoEventHeader), giteaEventHeader, r.Header.Values(giteaEventHeader))
+		event, err := forgeHeader(
+			headerRead{forgejoEventHeader, r.Header.Get(forgejoEventHeader), len(r.Header.Values(forgejoEventHeader))},
+			headerRead{giteaEventHeader, r.Header.Get(giteaEventHeader), len(r.Header.Values(giteaEventHeader))})
 		switch {
 		case err != nil:
 			s.logger.Error("Rejected event header", "error", err)
@@ -102,7 +109,9 @@ func (s *Server) handleForgejoWebhook() http.HandlerFunc {
 			s.respond(w, http.StatusAccepted, reply{Status: "ignored"})
 			return
 		}
-		raw, err := forgeHeader(forgejoDeliveryHeader, r.Header.Values(forgejoDeliveryHeader), giteaDeliveryHeader, r.Header.Values(giteaDeliveryHeader))
+		raw, err := forgeHeader(
+			headerRead{forgejoDeliveryHeader, r.Header.Get(forgejoDeliveryHeader), len(r.Header.Values(forgejoDeliveryHeader))},
+			headerRead{giteaDeliveryHeader, r.Header.Get(giteaDeliveryHeader), len(r.Header.Values(giteaDeliveryHeader))})
 		if err != nil {
 			s.logger.Error("Rejected delivery ID", "error", err)
 			http.Error(w, "conflicting delivery headers", http.StatusBadRequest)
