@@ -89,3 +89,31 @@ func TestWebhookSecret(t *testing.T) {
 		t.Error("no credentials directory: accepted")
 	}
 }
+
+func TestTriggerToken(t *testing.T) {
+	dir := t.TempDir()
+	good := strings.Repeat("ab12", 16) // 64 hex characters, as openssl rand -hex 32 writes
+	for name, content := range map[string]string{
+		"hex": good, "echoed": good + "\n", "crlf": good + "\r\n",
+		"short": strings.Repeat("a", 31), "space": good[:40] + " " + good[:10], "tab": good + "\t",
+		"long": strings.Repeat("a", 256), "control": good + "\x01", "utf8": good + "é", "empty": "",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o400); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("CREDENTIALS_DIRECTORY", dir)
+	for _, name := range []string{"hex", "echoed", "crlf"} {
+		if got, err := TriggerToken(name); err != nil || string(got) != good {
+			t.Errorf("TriggerToken(%s) = %q, %v", name, got, err)
+		}
+	}
+	for _, name := range []string{"short", "space", "tab", "long", "control", "utf8", "empty", "missing", "../hex"} {
+		got, err := TriggerToken(name)
+		if err == nil {
+			t.Errorf("TriggerToken(%s) = %q, want an error", name, got)
+		} else if strings.Contains(err.Error(), good[:16]) {
+			t.Errorf("TriggerToken(%s): the error quotes the token: %v", name, err)
+		}
+	}
+}

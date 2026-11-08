@@ -111,11 +111,15 @@ func gitlabDeliveryID(header, digest string) (string, error) {
 
 // pullRequestOf is ev in the shape the pull request path records.
 func pullRequestOf(ev *vcs.Event) validate.PullRequest {
+	opener := ev.Author.Login
+	if opener == "" {
+		// A GitLab hook names its author by ID only; the ID is the identity.
+		opener = "gitlab-user-" + strconv.FormatInt(ev.Author.ID, 10)
+	}
 	return validate.PullRequest{
 		Action: ev.Action, Number: ev.IID, Repo: ev.Project, HeadRef: ev.HeadRef, HeadSHA: ev.HeadSHA,
 		CloneURL: ev.CloneURL, HeadRepo: ev.HeadProject, ProjectID: ev.ProjectID,
-		// A hook names its author by ID only; the ID is the identity.
-		OpenerLogin: "gitlab-user-" + strconv.FormatInt(ev.Author.ID, 10), OpenerID: ev.Author.ID,
+		OpenerLogin: opener, OpenerID: ev.Author.ID,
 		UpdatedAt: ev.UpdatedAt, SenderLogin: ev.Sender.Login, SenderID: ev.Sender.ID,
 	}
 }

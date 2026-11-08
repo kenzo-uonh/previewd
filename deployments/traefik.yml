@@ -9,7 +9,8 @@ global:
   checkNewVersion: false
   sendAnonymousUsage: false
 
-# No API, no dashboard.
+# No API, no dashboard. The metrics entry point below serves Prometheus
+# counters only.
 
 entryPoints:
   web:
@@ -18,6 +19,21 @@ entryPoints:
     # must not listen there: a PR container could otherwise reach other
     # environments through it. Keep in sync with docker-compose.yml.
     address: "172.30.255.2:80"
+  # Request counters for previewd's ingress activity sensing (V1.2 spec 3.3):
+  # the daemon reads /metrics here (PREVIEWD_TRAEFIK_METRICS_ADDR). Bound to
+  # the same address as web, for the same reason, and never published to
+  # the host's interfaces (docker-compose.yml, previewd-proxy.service): it
+  # is reached on previewd-proxy only. It serves counts per router (one
+  # router per environment), no request data.
+  metrics:
+    address: "172.30.255.2:8082"
+
+metrics:
+  prometheus:
+    entryPoint: metrics
+    addRoutersLabels: true
+    addEntryPointsLabels: false
+    addServicesLabels: false
 
 providers:
   file:

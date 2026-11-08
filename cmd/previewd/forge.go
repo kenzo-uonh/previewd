@@ -23,13 +23,16 @@ type forge struct {
 	provider   string
 	authorizer orchestrator.Authorizer
 	fetch      orchestrator.FetchFunc
-	// github is the GHES truth the approval handlers read; nil under GitLab,
-	// whose driver the options carry.
+	// github is the GHES truth the approval handlers read: the GitHub App
+	// client, or the Forgejo driver; nil under GitLab, whose driver the
+	// options carry.
 	github  api.GitHub
 	options []api.Option
 	// feedback gives the developer the commit status and the sticky comment
 	// of each deploy; nil when PREVIEWD_FEEDBACK=0.
 	feedback orchestrator.Feedback
+	// heads reads a request's head for the CI trigger API.
+	heads api.Heads
 }
 
 // newForge wires the forge cfg selects. A credential that cannot be read, a
@@ -41,6 +44,8 @@ func newForge(cfg *config.Config, approvals orchestrator.Approvals, logger *slog
 		return newGitLabForge(cfg, approvals, logger)
 	case vcs.ProviderGitHub:
 		return newGitHubForge(cfg, approvals, logger)
+	case vcs.ProviderForgejo:
+		return newForgejoForge(cfg, approvals, logger)
 	}
 	return forge{}, fmt.Errorf("unknown forge %q", cfg.VCSProvider)
 }
@@ -78,7 +83,7 @@ func newGitHubForge(cfg *config.Config, approvals orchestrator.Approvals, logger
 		return forge{}, fmt.Errorf("source fetcher: %w", err)
 	}
 	logger.Info("Source fetch armed", "forge", vcs.ProviderGitHub, "ghes_tarball", fetcher.Tarball(), "max_bytes", cfg.MaxBuildContextBytes)
-	f := forge{provider: vcs.ProviderGitHub, authorizer: authorizer, fetch: fetcher.Fetch, github: ghes}
+	f := forge{provider: vcs.ProviderGitHub, authorizer: authorizer, fetch: fetcher.Fetch, github: ghes, heads: ghes}
 	if cfg.Feedback {
 		f.feedback = vcs.NewNotifier(ghes, nil)
 		logger.Info("Developer feedback armed", "forge", vcs.ProviderGitHub, "permissions", "statuses:write, pull_requests:write")
@@ -126,10 +131,63 @@ func newGitLabForge(cfg *config.Config, approvals orchestrator.Approvals, logger
 		return forge{}, fmt.Errorf("source fetcher: %w", err)
 	}
 	logger.Info("Source fetch armed", "forge", vcs.ProviderGitLab, "gitlab_url", cfg.GitLabURL, "max_bytes", cfg.MaxBuildContextBytes)
-	f := forge{provider: vcs.ProviderGitLab, authorizer: authorizer, fetch: fetcher.Fetch, options: []api.Option{api.WithProvider(gitlab)}}
+	f := forge{provider: vcs.ProviderGitLab, authorizer: authorizer, fetch: fetcher.Fetch, options: []api.Option{api.WithProvider(gitlab)}, heads: gitlab}
 	if cfg.Feedback {
 		f.feedback = vcs.NewNotifier(gitlab, gitlab.ResolveProject)
 		logger.Info("Developer feedback armed", "forge", vcs.ProviderGitLab, "token_scope", "api")
+	}
+	return f, nil
+}
+
+// newForgejoForge wires Forgejo or Gitea (V1.2 spec 3.1): the access token
+// from its systemd credential, held in memory only, and the GHES deploy gate
+// reading Forgejo, which answers the same questions (the pull request, its
+// reviews on their commits, an account's permission). A pull request whose
+// head lives in the repository and whose author can write there deploys;
+// any other needs an approving review of its exact head by a
+// PREVIEWD_APPROVERS account. The source is the repository's archive.
+func newForgejoForge(cfg *config.Config, approvals orchestrator.Approvals, logger *slog.Logger) (forge, error) {
+	token, err := secrets.Credential(cfg.ForgejoTokenCredential)
+	if err != nil {
+		return forge{}, fmt.Errorf("forgejo token: %w", err)
+	}
+	defer clear(token)
+	var ca []byte
+	if cfg.ForgejoCAFile != "" {
+		if ca, err = readBounded(cfg.ForgejoCAFile, maxCABundleBytes); err != nil {
+			return forge{}, fmt.Errorf("PREVIEWD_FORGEJO_CA_FILE: %w", err)
+		}
+	}
+	forgejo, err := vcs.NewForgejo(vcs.ForgejoConfig{BaseURL: cfg.ForgejoURL, Token: token, CAPEM: ca, Logger: logger})
+	if err != nil {
+		return forge{}, fmt.Errorf("forgejo client (%s): %w", cfg.ForgejoURL, err)
+	}
+	if len(cfg.FullSecretsRepos) > 0 {
+		logger.Error("Opt-in active: approved untrusted deploys of these repositories receive the trusted secret section",
+			"opt_in", "PREVIEWD_APPROVED_UNTRUSTED_FULL_SECRETS", "repositories", slices.Sorted(maps.Keys(cfg.FullSecretsRepos)))
+	}
+	authorizer, err := orchestrator.NewAuthorizer(orchestrator.AuthorizerConfig{
+		GitHub:           forgejo,
+		Approvals:        approvals,
+		Approvers:        cfg.Approvers,
+		FullSecretsRepos: cfg.FullSecretsRepos,
+		Logger:           logger,
+	})
+	if err != nil {
+		return forge{}, fmt.Errorf("authorizer: %w", err)
+	}
+	fetcher, err := vcs.NewForgejoFetcher(forgejo, cfg.MaxBuildContextBytes)
+	if err != nil {
+		return forge{}, fmt.Errorf("source fetcher: %w", err)
+	}
+	logger.Info("Source fetch armed", "forge", vcs.ProviderForgejo, "forgejo_url", cfg.ForgejoURL, "max_bytes", cfg.MaxBuildContextBytes)
+	f := forge{
+		provider: vcs.ProviderForgejo, authorizer: authorizer, fetch: fetcher.Fetch, github: forgejo,
+		options: []api.Option{api.WithProvider(forgejo), api.WithReviews(forgejo)}, heads: forgejo,
+	}
+	if cfg.Feedback {
+		f.feedback = vcs.NewNotifier(forgejo, nil)
+		logger.Info("Developer feedback armed", "forge", vcs.ProviderForgejo, "token_scopes", "write:repository, write:issue, read:user")
 	}
 	return f, nil
 }

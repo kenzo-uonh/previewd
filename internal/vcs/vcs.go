@@ -22,32 +22,37 @@ import (
 
 // Provider names.
 const (
-	ProviderGitHub = "github"
-	ProviderGitLab = "gitlab"
+	ProviderGitHub  = "github"
+	ProviderGitLab  = "gitlab"
+	ProviderForgejo = "forgejo"
 )
 
 // Event actions, as previewd names them whatever the forge calls them. A
 // GitLab "open", "update" (a push), "close", "merge" and "approval" are
 // ActionOpened, ActionSynchronize, ActionClosed, ActionClosed and
-// ActionApproved.
+// ActionApproved. A Forgejo "synchronized" is ActionSynchronize, an approving
+// review ActionApproved and a review requesting changes
+// ActionChangesRequested.
 const (
-	ActionOpened      = validate.ActionOpened
-	ActionReopened    = validate.ActionReopened
-	ActionSynchronize = validate.ActionSynchronize
-	ActionClosed      = validate.ActionClosed
-	ActionLabeled     = validate.ActionLabeled
-	ActionUnlabeled   = validate.ActionUnlabeled
-	ActionApproved    = "approved"
-	ActionUnapproved  = "unapproved"
+	ActionOpened           = validate.ActionOpened
+	ActionReopened         = validate.ActionReopened
+	ActionSynchronize      = validate.ActionSynchronize
+	ActionClosed           = validate.ActionClosed
+	ActionLabeled          = validate.ActionLabeled
+	ActionUnlabeled        = validate.ActionUnlabeled
+	ActionApproved         = "approved"
+	ActionUnapproved       = "unapproved"
+	ActionChangesRequested = "changes_requested"
 )
 
 // Provider is a forge previewd serves.
 //
-// A project is addressed by ProjectID: owner/repo on GitHub, the numeric
-// project ID on GitLab (a path is never put in a GitLab URL). A request is
-// addressed by its number within the project, mrIID, in canonical decimal.
+// A project is addressed by ProjectID: owner/repo on GitHub and Forgejo, the
+// numeric project ID on GitLab (a path is never put in a GitLab URL). A
+// request is addressed by its number within the project, mrIID, in canonical
+// decimal.
 type Provider interface {
-	// Name is ProviderGitHub or ProviderGitLab.
+	// Name is ProviderGitHub, ProviderGitLab or ProviderForgejo.
 	Name() string
 	// VerifyWebhook authenticates req against secret and returns its body,
 	// read up to validate.MaxPayloadBytes. An empty secret, a missing or

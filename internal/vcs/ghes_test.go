@@ -176,8 +176,8 @@ func newFakeGHES(t *testing.T) *fakeGHES {
 func prDoc(base, state string) map[string]any {
 	return map[string]any{
 		"number": 7, "state": state,
-		"head":   map[string]any{"sha": testHead, "repo": map[string]string{"full_name": testRepo}},
-		"base":   map[string]any{"repo": map[string]string{"full_name": base}},
+		"head":   map[string]any{"ref": "feature/login", "sha": testHead, "repo": map[string]string{"full_name": testRepo}},
+		"base":   map[string]any{"repo": map[string]string{"full_name": base, "clone_url": "https://ghes.example/" + base + ".git"}},
 		"user":   map[string]any{"login": "opener", "id": testOpenerID},
 		"labels": []map[string]string{{"name": "previewd-approved"}},
 	}

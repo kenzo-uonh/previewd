@@ -171,8 +171,9 @@ func TestDoctorDefaultsAndSettings(t *testing.T) {
 // probe: the GHES of a bank is signed by the bank's CA.
 func TestDoctorPassesTheForgeCA(t *testing.T) {
 	for provider, tc := range map[string]struct{ urlKey, caKey, url string }{
-		"github": {"PREVIEWD_GHES_URL", "PREVIEWD_GHES_CA_FILE", ghesEnv},
-		"gitlab": {"PREVIEWD_GITLAB_URL", "PREVIEWD_GITLAB_CA_FILE", "https://gitlab.example.test"},
+		"github":  {"PREVIEWD_GHES_URL", "PREVIEWD_GHES_CA_FILE", ghesEnv},
+		"gitlab":  {"PREVIEWD_GITLAB_URL", "PREVIEWD_GITLAB_CA_FILE", "https://gitlab.example.test"},
+		"forgejo": {"PREVIEWD_FORGEJO_URL", "PREVIEWD_FORGEJO_CA_FILE", "https://forge.example.test"},
 	} {
 		var log probeLog
 		host := healthyHost(&log, map[string]string{"/etc/site/ca.pem": "PEM BYTES"})

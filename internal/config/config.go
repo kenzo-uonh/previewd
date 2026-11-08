@@ -93,13 +93,23 @@ type Config struct {
 	ComposeEnabled     bool
 	ComposeMaxServices int
 
+	// HTTP ingress activity sensing (V1.2 spec 3.3). ActivitySensing is
+	// PREVIEWD_ACTIVITY_SENSING (on unless exactly 0): the daemon reads
+	// Traefik's per-router request counters at TraefikMetricsAddr,
+	// PREVIEWD_TRAEFIK_METRICS_ADDR (default 172.30.255.2:8082, the metrics
+	// entry point of deployments/traefik.yml), and records when each
+	// environment last served a request.
+	ActivitySensing    bool
+	TraefikMetricsAddr netip.AddrPort
+
 	// WebhookSecretCredential names the systemd credential holding the
 	// webhook HMAC secret: read from $CREDENTIALS_DIRECTORY, never from the
 	// environment or a configured path.
 	WebhookSecretCredential string
 
 	// VCSProvider is PREVIEWD_VCS_PROVIDER: the one forge the daemon serves,
-	// "github" (the default: GHES and github.com) or "gitlab" (V1.1 spec 3.1).
+	// "github" (the default: GHES and github.com), "gitlab" (V1.1 spec 3.1)
+	// or "forgejo" (Forgejo and Gitea, V1.2 spec 3.1).
 	// Approvers and FullSecretsRepos name projects as that forge spells them.
 	VCSProvider string
 
@@ -118,6 +128,24 @@ type Config struct {
 	GitLabTokenCredential         string
 	GitLabWebhookSecretCredential string
 
+	// Forgejo and Gitea (V1.2 spec 3.1), for the forgejo provider only: as
+	// for GitLab, the access token and the webhook's HMAC secret are systemd
+	// credential names, and WebhookSecretCredential is then the latter.
+	ForgejoURL                     string // https://host[:port]
+	ForgejoCAFile                  string // site CA bundle; "" for the system roots
+	ForgejoTokenCredential         string
+	ForgejoWebhookSecretCredential string
+
+	// CI trigger API (V1.2 spec 3.4): POST /api/v1/trigger and GET
+	// /api/v1/status/{envid}, off unless PREVIEWD_TRIGGER_API=1. The bearer
+	// token is the systemd credential TriggerTokenCredential
+	// (PREVIEWD_TRIGGER_TOKEN_CREDENTIAL, default trigger-token), never a
+	// value in the environment; TriggerAllowedCIDRs
+	// (PREVIEWD_TRIGGER_ALLOWED_CIDRS) are the CI runners' addresses.
+	TriggerAPI             bool
+	TriggerTokenCredential string
+	TriggerAllowedCIDRs    []netip.Prefix
+
 	// Webhook listener (V1 F4, C2). TLS unless AllowPlaintextWebhooks.
 	TLSCertFile            string
 	TLSKeyCredential       string
@@ -126,14 +154,22 @@ type Config struct {
 }
 
 const (
-	defaultAppKeyCredential        = "github-app-key"        // #nosec G101 -- the name of a systemd credential, not a credential
-	defaultWebhookSecretCredential = "webhook_secret"        // #nosec G101 -- the name of a systemd credential, not a credential
-	defaultGitLabTokenCredential   = "gitlab-api-token"      // #nosec G101 -- the name of a systemd credential, not a credential
-	defaultGitLabHookCredential    = "gitlab-webhook-secret" // #nosec G101 -- the name of a systemd credential, not a credential
-	// legacyWebhookSecretEnv held the secret itself before V1: refused.
-	legacyWebhookSecretEnv    = "PREVIEWD_WEBHOOK_SECRET"        // #nosec G101 -- an environment variable name, not a credential
-	legacyGitLabTokenEnv      = "PREVIEWD_GITLAB_TOKEN"          // #nosec G101 -- an environment variable name, not a credential
-	legacyGitLabHookEnv       = "PREVIEWD_GITLAB_WEBHOOK_SECRET" // #nosec G101 -- an environment variable name, not a credential
+	defaultAppKeyCredential        = "github-app-key"         // #nosec G101 -- the name of a systemd credential, not a credential
+	defaultWebhookSecretCredential = "webhook_secret"         // #nosec G101 -- the name of a systemd credential, not a credential
+	defaultGitLabTokenCredential   = "gitlab-api-token"       // #nosec G101 -- the name of a systemd credential, not a credential
+	defaultGitLabHookCredential    = "gitlab-webhook-secret"  // #nosec G101 -- the name of a systemd credential, not a credential
+	defaultForgejoTokenCredential  = "forgejo-api-token"      // #nosec G101 -- the name of a systemd credential, not a credential
+	defaultForgejoHookCredential   = "forgejo-webhook-secret" // #nosec G101 -- the name of a systemd credential, not a credential
+	// legacyWebhookSecretEnv held the secret itself before V1: refused. The
+	// forge secrets named after it are refused likewise: a secret is never
+	// read from the environment.
+	legacyWebhookSecretEnv    = "PREVIEWD_WEBHOOK_SECRET"         // #nosec G101 -- an environment variable name, not a credential
+	legacyGitLabTokenEnv      = "PREVIEWD_GITLAB_TOKEN"           // #nosec G101 -- an environment variable name, not a credential
+	legacyGitLabHookEnv       = "PREVIEWD_GITLAB_WEBHOOK_SECRET"  // #nosec G101 -- an environment variable name, not a credential
+	forgejoTokenEnv           = "PREVIEWD_FORGEJO_TOKEN"          // #nosec G101 -- an environment variable name, not a credential
+	forgejoHookEnv            = "PREVIEWD_FORGEJO_WEBHOOK_SECRET" // #nosec G101 -- an environment variable name, not a credential
+	triggerTokenEnv           = "PREVIEWD_TRIGGER_TOKEN"          // #nosec G101 -- an environment variable name, not a credential
+	defaultTriggerCredential  = "trigger-token"                   // #nosec G101 -- the name of a systemd credential, not a credential
 	defaultApprovalLabel      = "previewd-approved"
 	defaultDeliveryMaxAge     = 15 * time.Minute
 	minDeliveryMaxAge         = time.Minute
@@ -177,6 +213,10 @@ const defaultRoutesDir = "/var/lib/previewd/routes"
 // defaultTraefikContainer is the container_name in deployments/docker-compose.yml.
 const defaultTraefikContainer = "traefik-proxy"
 
+// defaultTraefikMetricsAddr is the metrics entry point of
+// deployments/traefik.yml: the proxy's address on previewd-proxy.
+const defaultTraefikMetricsAddr = "172.30.255.2:8082"
+
 // Defaults `previewd doctor` applies to the keys it reads without loading
 // the whole configuration. DefaultBuildCgroup is the subtree of
 // deployments/previewd-builds.slice.
@@ -217,9 +257,9 @@ func Load() (*Config, error) {
 			"remove it and pass the secret as the systemd credential named by PREVIEWD_WEBHOOK_SECRET_CREDENTIAL (default %s)",
 			legacyWebhookSecretEnv, defaultWebhookSecretCredential)
 	}
-	for _, name := range []string{legacyGitLabTokenEnv, legacyGitLabHookEnv} {
+	for _, name := range []string{legacyGitLabTokenEnv, legacyGitLabHookEnv, forgejoTokenEnv, forgejoHookEnv, triggerTokenEnv} {
 		if _, set := os.LookupEnv(name); set {
-			return nil, fmt.Errorf("%s is set: a GitLab secret is never read from the environment; "+
+			return nil, fmt.Errorf("%s is set: a secret is never read from the environment; "+
 				"remove it and pass it as the systemd credential named by %s_CREDENTIAL", name, name)
 		}
 	}
@@ -276,8 +316,11 @@ func Load() (*Config, error) {
 	}
 
 	parseApprovers, repoValid := validate.ParseApprovers, validate.RepoFullName
-	if provider == providerGitLab {
+	switch provider {
+	case providerGitLab:
 		parseApprovers, repoValid = validate.ParseGitLabApprovers, validate.GitLabProjectPath
+	case providerForgejo:
+		parseApprovers, repoValid = validate.ParseForgejoApprovers, validate.ForgejoRepoFullName
 	}
 	approvers, err := parseApprovers(os.Getenv("PREVIEWD_APPROVERS"))
 	if err != nil {
@@ -378,6 +421,14 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	activity, err := onUnlessZero("PREVIEWD_ACTIVITY_SENSING")
+	if err != nil {
+		return nil, err
+	}
+	metricsAddr, err := addrPort("PREVIEWD_TRAEFIK_METRICS_ADDR", defaultTraefikMetricsAddr)
+	if err != nil {
+		return nil, err
+	}
 	if os.Getenv("PREVIEWD_ENV_TTL") != "0" {
 		if envTTL, err = boundedDuration("PREVIEWD_ENV_TTL", defaultEnvTTL, minEnvTTL, maxEnvTTL); err != nil {
 			return nil, fmt.Errorf("%w (or 0 to disable)", err)
@@ -396,16 +447,30 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	if provider == providerGitLab && labelApproval {
+	switch {
+	case provider == providerGitLab && labelApproval:
 		// The label path is GitHub's: a GitLab approval is an approval event.
 		return nil, errors.New("PREVIEWD_LABEL_APPROVAL is not supported with PREVIEWD_VCS_PROVIDER=gitlab: a GitLab merge request is approved with GitLab's own approval")
+	case provider == providerForgejo && labelApproval:
+		// A Forgejo label event does not say which label changed, nor binds
+		// it to a commit: a Forgejo pull request is approved by a review.
+		return nil, errors.New("PREVIEWD_LABEL_APPROVAL is not supported with PREVIEWD_VCS_PROVIDER=forgejo: a Forgejo pull request is approved by an approving review")
 	}
-	if provider == providerGitLab {
+	// A forge with its own webhook credential key reads the secret from it,
+	// and only from it.
+	var hookCred string
+	switch provider {
+	case providerGitLab:
+		hookCred = forge.gitlabHookCredential
+	case providerForgejo:
+		hookCred = forge.forgejoHookCredential
+	}
+	if hookCred != "" {
 		if _, set := os.LookupEnv("PREVIEWD_WEBHOOK_SECRET_CREDENTIAL"); set {
-			return nil, fmt.Errorf("PREVIEWD_WEBHOOK_SECRET_CREDENTIAL contradicts PREVIEWD_VCS_PROVIDER=gitlab: " +
-				"the webhook secret is the credential named by PREVIEWD_GITLAB_WEBHOOK_SECRET_CREDENTIAL")
+			return nil, fmt.Errorf("PREVIEWD_WEBHOOK_SECRET_CREDENTIAL contradicts PREVIEWD_VCS_PROVIDER=%s: "+
+				"the webhook secret is the credential named by PREVIEWD_%s_WEBHOOK_SECRET_CREDENTIAL", provider, strings.ToUpper(provider))
 		}
-		webhookSecretCred = forge.gitlabHookCredential
+		webhookSecretCred = hookCred
 	}
 	plaintext, err := optIn("PREVIEWD_ALLOW_PLAINTEXT_WEBHOOKS")
 	if err != nil {
@@ -425,6 +490,27 @@ func Load() (*Config, error) {
 	cidrs, err := validate.CIDRs(os.Getenv("PREVIEWD_WEBHOOK_ALLOWED_CIDRS"))
 	if err != nil {
 		return nil, fmt.Errorf("invalid PREVIEWD_WEBHOOK_ALLOWED_CIDRS: %w", err)
+	}
+	triggerAPI, err := optIn("PREVIEWD_TRIGGER_API")
+	if err != nil {
+		return nil, err
+	}
+	triggerCred, err := credentialName("PREVIEWD_TRIGGER_TOKEN_CREDENTIAL", defaultTriggerCredential)
+	if err != nil {
+		return nil, err
+	}
+	triggerCIDRs, err := validate.CIDRs(os.Getenv("PREVIEWD_TRIGGER_ALLOWED_CIDRS"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid PREVIEWD_TRIGGER_ALLOWED_CIDRS: %w", err)
+	}
+	if !triggerAPI {
+		// A key of an API that is off is a misconfiguration to surface.
+		for _, k := range []string{"PREVIEWD_TRIGGER_TOKEN_CREDENTIAL", "PREVIEWD_TRIGGER_ALLOWED_CIDRS"} {
+			if _, set := os.LookupEnv(k); set {
+				return nil, fmt.Errorf("%s is set but the trigger API is off: set PREVIEWD_TRIGGER_API=1, or remove it", k)
+			}
+		}
+		triggerCred = ""
 	}
 
 	return &Config{
@@ -470,6 +556,9 @@ func Load() (*Config, error) {
 		ComposeEnabled:     composeEnabled,
 		ComposeMaxServices: composeServices,
 
+		ActivitySensing:    activity,
+		TraefikMetricsAddr: metricsAddr,
+
 		WebhookSecretCredential: webhookSecretCred,
 		VCSProvider:             provider,
 		GHESURL:                 forge.ghesURL,
@@ -481,10 +570,20 @@ func Load() (*Config, error) {
 		GitLabCAFile:                  forge.gitlabCAFile,
 		GitLabTokenCredential:         forge.gitlabTokenCredential,
 		GitLabWebhookSecretCredential: forge.gitlabHookCredential,
-		TLSCertFile:                   certFile,
-		TLSKeyCredential:              keyCred,
-		AllowPlaintextWebhooks:        plaintext,
-		WebhookAllowedCIDRs:           cidrs,
+
+		ForgejoURL:                     forge.forgejoURL,
+		ForgejoCAFile:                  forge.forgejoCAFile,
+		ForgejoTokenCredential:         forge.forgejoTokenCredential,
+		ForgejoWebhookSecretCredential: forge.forgejoHookCredential,
+
+		TLSCertFile:            certFile,
+		TLSKeyCredential:       keyCred,
+		AllowPlaintextWebhooks: plaintext,
+		WebhookAllowedCIDRs:    cidrs,
+
+		TriggerAPI:             triggerAPI,
+		TriggerTokenCredential: triggerCred,
+		TriggerAllowedCIDRs:    triggerCIDRs,
 	}, nil
 }
 
@@ -595,15 +694,33 @@ func boundedCount(name string, def, lo, hi int) (int, error) {
 // non-empty value is a configuration error.
 // feedbackSwitch reads PREVIEWD_FEEDBACK: on when unset or 1, off when
 // exactly 0, an error otherwise.
-func feedbackSwitch() (bool, error) {
-	switch v := os.Getenv("PREVIEWD_FEEDBACK"); v {
+func feedbackSwitch() (bool, error) { return onUnlessZero("PREVIEWD_FEEDBACK") }
+
+// onUnlessZero reads a switch that is on by default: on when unset or 1,
+// off when exactly 0, an error otherwise.
+func onUnlessZero(name string) (bool, error) {
+	switch v := os.Getenv(name); v {
 	case "", "1":
 		return true, nil
 	case "0":
 		return false, nil
 	default:
-		return false, fmt.Errorf("invalid PREVIEWD_FEEDBACK %q: set exactly 0 or 1, or leave unset", v)
+		return false, fmt.Errorf("invalid %s %q: set exactly 0 or 1, or leave unset", name, v)
 	}
+}
+
+// addrPort reads an IP:PORT literal, def when unset: an IP address (no host
+// name, no zone, not unspecified) and a non-zero port.
+func addrPort(name, def string) (netip.AddrPort, error) {
+	v := os.Getenv(name)
+	if v == "" {
+		v = def
+	}
+	a, err := netip.ParseAddrPort(v)
+	if err != nil || a.Port() == 0 || a.Addr().IsUnspecified() || a.Addr().Zone() != "" {
+		return netip.AddrPort{}, fmt.Errorf("invalid %s %q: want IP:PORT, an IP literal and a non-zero port", name, v)
+	}
+	return a, nil
 }
 
 // previewScheme reads PREVIEWD_PREVIEW_URL_SCHEME: http (default) or https.

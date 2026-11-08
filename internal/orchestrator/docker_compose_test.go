@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +20,8 @@ import (
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/api/types/volume"
 	"github.com/moby/moby/client"
+
+	"github.com/kenzo-uonh/previewd/internal/validate"
 )
 
 const (
@@ -39,6 +42,8 @@ type composeDaemon struct {
 	volumes    map[string]volume.Volume
 	volCreates []volume.CreateRequest
 	networks   map[string]network.Summary
+	netCreates []network.CreateRequest
+	connects   []network.ConnectRequest
 	// foreignVolume makes /volumes/create answer with a volume another owner
 	// made: the daemon returns the existing volume of that name.
 	foreignVolume *volume.Volume
@@ -221,6 +226,23 @@ func (d *composeDaemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		delete(d.containers, name)
 		w.WriteHeader(http.StatusNoContent)
 
+	case r.Method == http.MethodPost && p == "/networks/create":
+		var req network.CreateRequest
+		_ = json.Unmarshal(body, &req)
+		d.netCreates = append(d.netCreates, req)
+		if _, ok := d.networks[req.Name]; ok {
+			writeJSON(w, http.StatusConflict, map[string]string{"message": "network with name " + req.Name + " already exists"})
+			return
+		}
+		d.networks[req.Name] = network.Summary{Network: network.Network{Name: req.Name, ID: "net-" + req.Name, Internal: req.Internal, Labels: req.Labels}}
+		writeJSON(w, http.StatusCreated, network.CreateResponse{ID: "net-" + req.Name})
+	case r.Method == http.MethodGet && strings.HasPrefix(p, "/networks/"):
+		n, ok := d.networks[strings.TrimPrefix(p, "/networks/")]
+		if !ok {
+			notFound()
+			return
+		}
+		writeJSON(w, http.StatusOK, network.Inspect{Network: n.Network})
 	case r.Method == http.MethodGet && p == "/networks":
 		var items []network.Summary
 		for _, n := range d.networks {
@@ -228,6 +250,9 @@ func (d *composeDaemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, items)
 	case r.Method == http.MethodPost && strings.HasSuffix(p, "/connect"):
+		var req network.ConnectRequest
+		_ = json.Unmarshal(body, &req)
+		d.connects = append(d.connects, req)
 		w.WriteHeader(http.StatusOK)
 	case r.Method == http.MethodPost && strings.HasSuffix(p, "/disconnect"):
 		w.WriteHeader(http.StatusOK)
@@ -320,8 +345,8 @@ func TestDeployComposeStartsSidecarsBeforeThePrimaryOnTheEnvironmentNetwork(t *t
 	if pg.Image != pgImageID {
 		t.Errorf("postgres runs %q, want the image ID of the verified local image %s", pg.Image, pgImageID)
 	}
-	if got := pg.NetworkingConfig.EndpointsConfig[net].Aliases; !slices.Equal(got, []string{"postgres"}) {
-		t.Errorf("postgres aliases = %v, want its service name", got)
+	if got := pg.NetworkingConfig.EndpointsConfig[net].Aliases; !slices.Equal(got, []string{"postgres", "postgres.internal"}) {
+		t.Errorf("postgres aliases = %v, want its service name and canonical name", got)
 	}
 	if !slices.Contains(pg.Env, "POSTGRES_PASSWORD=pw") {
 		t.Errorf("postgres env = %v, want the compose environment", pg.Env)
@@ -628,6 +653,125 @@ func mapKeys[M ~map[K]V, K comparable, V any](m M) func(yield func(K) bool) {
 			if !yield(k) {
 				return
 			}
+		}
+	}
+}
+
+// Intra-preview DNS (V1.2 spec 3.2): every service of a compose environment,
+// the primary included, answers on the environment network to its service
+// name and to <service>.internal, and on that network only.
+func TestDeployComposeGivesEveryServiceItsInternalNames(t *testing.T) {
+	d := newComposeDaemon()
+	env := testComposeEnv(t)
+	if _, err := composeEngine(t, d).Deploy(t.Context(), env); err != nil {
+		t.Fatal(err)
+	}
+	net := networkName(env.ID)
+	for container, svc := range map[string]string{env.ID: "app", env.ID + "-postgres": "postgres", env.ID + "-redis": "redis"} {
+		c, ok := d.creates[container]
+		if !ok {
+			t.Fatalf("container %s was not created", container)
+		}
+		if got, want := c.NetworkingConfig.EndpointsConfig[net].Aliases, []string{svc, svc + ".internal"}; !slices.Equal(got, want) {
+			t.Errorf("%s aliases = %v, want %v", container, got, want)
+		}
+		if got := slices.Collect(mapKeys(c.NetworkingConfig.EndpointsConfig)); !slices.Equal(got, []string{net}) {
+			t.Errorf("%s is attached to %v, want only %s", container, got, net)
+		}
+	}
+	// The proxy joins the network under no alias: no service name resolves
+	// to it.
+	if len(d.connects) != 1 || d.connects[0].Container != "traefik-proxy" ||
+		(d.connects[0].EndpointConfig != nil && len(d.connects[0].EndpointConfig.Aliases) != 0) {
+		t.Errorf("proxy connects = %+v; want the proxy, under no alias", d.connects)
+	}
+}
+
+func TestServiceAliases(t *testing.T) {
+	if got := ServiceAliases("postgres"); !slices.Equal(got, []string{"postgres", "postgres.internal"}) {
+		t.Errorf("ServiceAliases = %v", got)
+	}
+	// Every compose service name is a DNS label (ParseCompose), so every
+	// canonical name is a valid DNS name.
+	for _, svc := range []string{"app", "db-1", "x"} {
+		if err := validate.DNSName(ServiceAliases(svc)[1]); err != nil {
+			t.Errorf("%s: %v", svc, err)
+		}
+	}
+}
+
+// The network the aliases live on stays internal: created with Internal (no
+// default gateway, no outbound route), and an existing network of that name
+// is reused only if it is internal.
+func TestProvisionNetworkIsInternal(t *testing.T) {
+	d := newComposeDaemon()
+	eng := composeEngine(t, d)
+	if err := eng.ProvisionNetwork(t.Context(), testEnv); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.netCreates) != 1 || !d.netCreates[0].Internal || d.netCreates[0].Name != networkName(testEnv) ||
+		d.netCreates[0].Driver != "bridge" || d.netCreates[0].Labels[LabelEnv] != testEnv {
+		t.Fatalf("network create = %+v; want an internal bridge owned by %s", d.netCreates, testEnv)
+	}
+	// Reused: it is the internal one created above.
+	if err := eng.ProvisionNetwork(t.Context(), testEnv); err != nil {
+		t.Errorf("reuse of the internal network: %v", err)
+	}
+	// Refused: a network of that name with a gateway.
+	d.networks[networkName(testEnv)] = network.Summary{Network: network.Network{Name: networkName(testEnv), Internal: false}}
+	if err := eng.ProvisionNetwork(t.Context(), testEnv); err == nil || !strings.Contains(err.Error(), "not internal") {
+		t.Errorf("a routable network was reused: %v", err)
+	}
+}
+
+// A compose file cannot publish a port to the host nor put a service on the
+// host's network: ports and expose are dropped before any request reaches
+// the engine (the environment network is internal, only the proxy reaches the
+// primary), and network_mode is refused.
+func TestComposeNeverPublishesNorUsesTheHostNetwork(t *testing.T) {
+	const published = `
+services:
+  app:
+    build: .
+    ports: ["0.0.0.0:80:8080", "8443:8443/tcp"]
+    expose: ["8080"]
+  postgres:
+    image: postgres:16@sha256:1111111111111111111111111111111111111111111111111111111111111111
+    ports:
+      - target: 5432
+        published: 5432
+        host_ip: 0.0.0.0
+`
+	spec, err := ParseCompose([]byte(published), testSidecarImages, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Primary.IgnoredPorts != 3 || spec.Sidecars[0].IgnoredPorts != 1 {
+		t.Errorf("ignored ports %d and %d, want 3 and 1", spec.Primary.IgnoredPorts, spec.Sidecars[0].IgnoredPorts)
+	}
+	d := newComposeDaemon()
+	env := testComposeEnv(t)
+	env.Compose = spec
+	if _, err := composeEngine(t, d).Deploy(t.Context(), env); err != nil {
+		t.Fatal(err)
+	}
+	for name, c := range d.creates {
+		if len(c.HostConfig.PortBindings) != 0 || c.HostConfig.PublishAllPorts || len(c.ExposedPorts) != 0 ||
+			c.HostConfig.NetworkMode.IsHost() || c.HostConfig.NetworkMode.NetworkName() != networkName(env.ID) {
+			t.Errorf("%s: bindings %v, publish-all %v, exposed %v, network %q",
+				name, c.HostConfig.PortBindings, c.HostConfig.PublishAllPorts, c.ExposedPorts, c.HostConfig.NetworkMode)
+		}
+	}
+
+	for name, file := range map[string]string{
+		"primary on the host network": "services:\n  app:\n    build: .\n    network_mode: host\n",
+		"sidecar on the host network": "services:\n  app:\n    build: .\n  postgres:\n    image: postgres:16@sha256:" + strings.Repeat("1", 64) + "\n    network_mode: host\n",
+		"sidecar in another's stack":  "services:\n  app:\n    build: .\n  postgres:\n    image: postgres:16@sha256:" + strings.Repeat("1", 64) + "\n    network_mode: service:app\n",
+		"networks key":                "services:\n  app:\n    build: .\n    networks: [host]\n",
+		"top-level networks":          "services:\n  app:\n    build: .\nnetworks:\n  default:\n    external: true\n    name: host\n",
+	} {
+		if _, err := ParseCompose([]byte(file), testSidecarImages, 3); !errors.Is(err, ErrCompose) {
+			t.Errorf("%s: %v, want ErrCompose", name, err)
 		}
 	}
 }

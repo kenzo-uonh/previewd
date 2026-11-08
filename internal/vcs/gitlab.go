@@ -352,23 +352,49 @@ func (g *GitLab) ResolveProject(ctx context.Context, path string) (string, error
 	}
 	ctx, cancel := context.WithTimeout(ctx, readTimeout)
 	defer cancel()
-	var p struct {
-		ID   *int64  `json:"id"`
-		Path *string `json:"path_with_namespace"`
-	}
-	if err := g.get(ctx, "/projects/"+url.PathEscape(path), maxProjectReplyBytes, &p); err != nil {
+	p, err := g.project(ctx, url.PathEscape(path))
+	if err != nil {
 		return "", fmt.Errorf("resolve project %s: %w", path, err)
 	}
-	if p.ID == nil || p.Path == nil || *p.ID < 1 || *p.Path != path {
+	if p.Path != path {
 		return "", fmt.Errorf("resolve project %s: the reply is not about that project", path)
 	}
-	return strconv.FormatInt(*p.ID, 10), nil
+	return strconv.FormatInt(p.ID, 10), nil
+}
+
+// glProjectReply is a project as GET /projects/:id_or_path reports it.
+type glProjectReply struct {
+	ID       int64
+	Path     string // path_with_namespace
+	CloneURL string // http_url_to_repo
+}
+
+// project reads the project addressed by ref (a numeric ID, or a path as
+// one encoded segment). The reply must be complete and valid.
+func (g *GitLab) project(ctx context.Context, ref string) (glProjectReply, error) {
+	var p struct {
+		ID       *int64  `json:"id"`
+		Path     *string `json:"path_with_namespace"`
+		CloneURL *string `json:"http_url_to_repo"`
+	}
+	if err := g.get(ctx, "/projects/"+ref, maxProjectReplyBytes, &p); err != nil {
+		return glProjectReply{}, err
+	}
+	if p.ID == nil || p.Path == nil || *p.ID < 1 || validate.GitLabProjectPath(*p.Path) != nil {
+		return glProjectReply{}, errors.New("the reply is not about a project")
+	}
+	out := glProjectReply{ID: *p.ID, Path: *p.Path}
+	if p.CloneURL != nil {
+		out.CloneURL = *p.CloneURL
+	}
+	return out, nil
 }
 
 type glMergeRequestReply struct {
 	IID             *uint32        `json:"iid"`
 	State           *string        `json:"state"`
 	SHA             *string        `json:"sha"`
+	SourceBranch    *string        `json:"source_branch"`
 	SourceProjectID *int64         `json:"source_project_id"`
 	TargetProjectID *int64         `json:"target_project_id"`
 	Author          *glAccountWire `json:"author"`

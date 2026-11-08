@@ -22,6 +22,10 @@ func TestSubcommandDispatch(t *testing.T) {
 		{[]string{"previewd", "doctor", "-no-such-flag"}, false, "previewd doctor"},
 		{[]string{"previewd", "backup"}, false, "previewd backup"},
 		{[]string{"previewd", "restore"}, false, "previewd restore"},
+		{[]string{"previewd", "list", "extra"}, false, "previewd list"},
+		{[]string{"previewd", "status"}, false, "previewd status"},
+		{[]string{"previewd", "init", "-out", "relative"}, false, "previewd init"},
+		{[]string{"previewd", "setup-credentials"}, false, "previewd setup-credentials"},
 		{[]string{"previewd", "no-such-command"}, true, "previewd doctor"}, // the usage lists them
 	} {
 		f, err := os.Create(filepath.Join(t.TempDir(), "stderr"))

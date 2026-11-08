@@ -1,0 +1,138 @@
+# previewd companion action (V1.2 spec 3.4): ask previewd to deploy this pull
+# request and wait until its preview runs. Works on GitHub Enterprise Server
+# and Forgejo Actions runners that can reach previewd; no third-party action,
+# no package install, no network call but to PREVIEWD_SERVER_URL.
+#
+# The webhook stays the primary path: previewd deploys a pull request on its
+# own when the forge delivers the event. This action nudges it (a missed or
+# unreachable webhook) and hands the pipeline the preview URL for the steps
+# that test against it. It sends the repository and the pull request number
+# only: previewd reads the branch and the commit from the forge, and its
+# deploy gate decides, as for a webhook, whether the head may run (a fork
+# needs an approver's approval of its exact commit). The trigger token
+# cannot approve anything.
+#
+# Runner leakage: the token travels on curl's standard input (--config -),
+# never on a command line (ps, /proc/<pid>/cmdline) nor in a file; the shell
+# never traces (no set -x); the token is never echoed. Store it as an
+# encrypted secret (PREVIEWD_TRIGGER_TOKEN) so the runner masks it.
+#
+# Usage:
+#   - uses: ./deployments/ci/github-action   # or a copy in your own repository
+#     id: preview
+#     with:
+#       server-url: https://previewd.corp.example:8443
+#       token: ${{ secrets.PREVIEWD_TRIGGER_TOKEN }}
+#   - run: ./e2e.sh "${{ steps.preview.outputs.preview_url }}"
+
+name: previewd deploy
+description: Trigger a previewd preview of this pull request and wait for its URL.
+
+inputs:
+  server-url:
+    description: previewd's API, https://host[:port] (PREVIEWD_SERVER_URL).
+    required: true
+  token:
+    description: The trigger token (previewd's PREVIEWD_TRIGGER_TOKEN_CREDENTIAL).
+    required: true
+  repository:
+    description: owner/repo of the pull request.
+    required: false
+    default: ${{ github.repository }}
+  pull-request:
+    description: The pull request number.
+    required: false
+    default: ${{ github.event.pull_request.number }}
+  timeout-seconds:
+    description: How long to wait for the preview to run.
+    required: false
+    default: "900"
+  ca-file:
+    description: CA bundle that signs previewd's certificate (the site CA), when the runner's store does not hold it.
+    required: false
+    default: ""
+
+outputs:
+  preview_url:
+    description: The URL of the running preview.
+    value: ${{ steps.deploy.outputs.preview_url }}
+  environment_id:
+    description: previewd's environment ID.
+    value: ${{ steps.deploy.outputs.environment_id }}
+
+runs:
+  using: composite
+  steps:
+    - id: deploy
+      shell: sh
+      env:
+        PREVIEWD_SERVER_URL: ${{ inputs.server-url }}
+        PREVIEWD_TRIGGER_TOKEN: ${{ inputs.token }}
+        PREVIEWD_REPOSITORY: ${{ inputs.repository }}
+        PREVIEWD_PULL_REQUEST: ${{ inputs.pull-request }}
+        PREVIEWD_TIMEOUT: ${{ inputs.timeout-seconds }}
+        PREVIEWD_CA_FILE: ${{ inputs.ca-file }}
+      run: |
+        set -eu
+        fail() { echo "previewd: $*" >&2; exit 1; }
+
+        case "$PREVIEWD_SERVER_URL" in https://*) ;; *) fail "server-url must be https://host[:port]" ;; esac  # airgap:allow a scheme check, not an endpoint
+        case "$PREVIEWD_PULL_REQUEST" in ''|*[!0-9]*) fail "pull-request must be a number (run on pull_request events)" ;; esac
+        case "$PREVIEWD_TIMEOUT" in ''|*[!0-9]*) fail "timeout-seconds must be a number" ;; esac
+        case "$PREVIEWD_REPOSITORY" in */*) ;; *) fail "repository must be owner/repo" ;; esac
+        case "$PREVIEWD_REPOSITORY" in *[!A-Za-z0-9._/-]*) fail "repository holds an unexpected character" ;; esac
+        [ -n "$PREVIEWD_TRIGGER_TOKEN" ] || fail "token is empty"
+        case "$PREVIEWD_TRIGGER_TOKEN" in *[!!-~]*) fail "the token holds a space or a control character" ;; esac
+        server=${PREVIEWD_SERVER_URL%/}
+
+        # api METHOD PATH [BODY]: one call; sets $out (the reply body) and
+        # $status (the HTTP status). The token reaches curl on stdin only.
+        api() {
+          reply=$(mktemp)
+          set -- "$@" ""
+          status=$(
+            printf 'header = "Authorization: Bearer %s"\n' "$PREVIEWD_TRIGGER_TOKEN" |
+              curl --config - --silent --show-error --proto '=https' --tlsv1.2 --max-time 30 \
+                ${PREVIEWD_CA_FILE:+--cacert "$PREVIEWD_CA_FILE"} \
+                --request "$1" --header 'Content-Type: application/json' \
+                ${3:+--data "$3"} --output "$reply" --write-out '%{http_code}' "$server$2"
+          ) || { rm -f "$reply"; fail "cannot reach $server"; }
+          out=$(cat "$reply")
+          rm -f "$reply"
+        }
+        # field NAME: a string field of the JSON reply on stdin.
+        field() { sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p"; }
+
+        body=$(printf '{"repository":"%s","pull_request":%s}' "$PREVIEWD_REPOSITORY" "$PREVIEWD_PULL_REQUEST")
+        api POST /api/v1/trigger "$body"
+        case "$status" in
+          200|202) ;;
+          409) fail "pull request $PREVIEWD_REPOSITORY#$PREVIEWD_PULL_REQUEST is not open" ;;
+          *) fail "trigger refused: HTTP $status" ;;
+        esac
+        env_id=$(printf '%s' "$out" | field environment_id)
+        case "$env_id" in ''|*[!a-z0-9-]*) fail "unexpected reply from previewd" ;; esac
+        echo "previewd: environment $env_id ($(printf '%s' "$out" | field status))"
+
+        deadline=$(( $(date +%s) + PREVIEWD_TIMEOUT ))
+        while :; do
+          api GET "/api/v1/status/$env_id"
+          state=$(printf '%s' "$out" | field state)
+          case "$status:$state" in
+            200:running)
+              url=$(printf '%s' "$out" | field preview_url)
+              echo "previewd: running at $url"
+              echo "preview_url=$url" >> "$GITHUB_OUTPUT"
+              echo "environment_id=$env_id" >> "$GITHUB_OUTPUT"
+              exit 0 ;;
+            200:failed) fail "the deploy failed at $(printf '%s' "$out" | field failure)" ;;
+            200:removed|200:removing|200:superseded) fail "the environment is $state" ;;
+            200:*|404:*|429:*) ;;
+            *) fail "status refused: HTTP $status" ;;
+          esac
+          [ "$(date +%s)" -lt "$deadline" ] || fail "timed out after ${PREVIEWD_TIMEOUT}s ($state)"
+          if [ "$state" = awaiting-approval ]; then
+            echo "previewd: awaiting an approver's approval of the head commit"
+          fi
+          sleep 10
+        done

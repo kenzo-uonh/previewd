@@ -506,6 +506,7 @@ type pullRequestReply struct {
 	Number int64  `json:"number"`
 	State  string `json:"state"`
 	Head   struct {
+		Ref  string `json:"ref"`
 		SHA  string `json:"sha"`
 		Repo *struct {
 			FullName string `json:"full_name"`
@@ -514,6 +515,7 @@ type pullRequestReply struct {
 	Base struct {
 		Repo struct {
 			FullName string `json:"full_name"`
+			CloneURL string `json:"clone_url"`
 		} `json:"repo"`
 	} `json:"base"`
 	User   accountReply `json:"user"`

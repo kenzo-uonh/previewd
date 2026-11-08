@@ -322,8 +322,14 @@ func (r *doctorRun) forgeProbe() (rawURL, caFile string, err error) {
 			return "", "", fmt.Errorf("PREVIEWD_GITLAB_URL: %w", err)
 		}
 		return base + "/api/v4/version", r.setting("PREVIEWD_GITLAB_CA_FILE"), nil
+	case "forgejo":
+		base, err := validate.ForgejoURL(r.setting("PREVIEWD_FORGEJO_URL"))
+		if err != nil {
+			return "", "", fmt.Errorf("PREVIEWD_FORGEJO_URL: %w", err)
+		}
+		return base + "/api/v1/version", r.setting("PREVIEWD_FORGEJO_CA_FILE"), nil
 	default:
-		return "", "", fmt.Errorf("PREVIEWD_VCS_PROVIDER %s: want github or gitlab", validate.Quote(provider))
+		return "", "", fmt.Errorf("PREVIEWD_VCS_PROVIDER %s: want github, gitlab or forgejo", validate.Quote(provider))
 	}
 }
 

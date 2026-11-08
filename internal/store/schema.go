@@ -78,6 +78,10 @@ var schemaAllowlist = map[string]map[string]string{
 		"seq":        "INTEGER", // its seq: every other commit is revoked at it (new_head)
 		"prior_seq":  "INTEGER", // newest accepted deploy seq of another commit: commit_sha is revoked at it
 	},
+	"activity": {
+		"preview_id":     "TEXT",    // environment ID: envid.Generate output, a DNS label
+		"last_active_at": "INTEGER", // Unix milliseconds of the latest HTTP request routed to it, coalesced per minute
+	},
 	"audit_events": {
 		"id":          "INTEGER", // chain position, from 1
 		"at":          "INTEGER", // Unix milliseconds
